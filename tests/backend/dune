@@ -1,0 +1,4 @@
+(test
+ (name test_risk_management_integration)
+ (libraries core types math pool monitoring daemons claims_engine alcotest alcotest-lwt lwt lwt.unix)
+ (preprocess (pps lwt_ppx ppx_sexp_conv)))

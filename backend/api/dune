@@ -1,0 +1,5 @@
+(library
+ (name api_server)
+ (public_name tonsurance.api_server)
+ (libraries core types math pricing_engine risk_model pool claims_engine monitoring dream lwt lwt.unix yojson logs logs.lwt)
+ (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))

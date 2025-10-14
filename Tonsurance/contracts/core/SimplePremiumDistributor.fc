@@ -1,0 +1,264 @@
+;; SimplePremiumDistributor Contract - Phase 1
+;; Routes premiums to 4 parties in async messages
+;; Distribution: Primary LPs: 50%, Secondary Stakers: 30%, Protocol: 15%, Reserve: 5%
+;; Upgraded in Phase 2 to 8-party distribution
+
+#include "../imports/stdlib.fc";
+
+;; Storage structure
+global slice owner_address;
+global slice primary_vault_address;
+global slice secondary_vault_address;
+global slice protocol_treasury_address;
+global slice reserve_fund_address;
+global int total_premiums_distributed;
+global int distribution_count;
+
+;; Distribution percentages (in basis points)
+const int SHARE_PRIMARY = 4500;      ;; 45%
+const int SHARE_SECONDARY = 2000;    ;; 20%
+const int SHARE_PROTOCOL = 2500;     ;; 25%
+const int SHARE_RESERVE = 1000;      ;; 10%
+const int BASIS_POINTS = 10000;
+
+() load_data() impure {
+    slice ds = get_data().begin_parse();
+    owner_address = ds~load_msg_addr();
+
+    ;; Load vault addresses from first reference cell
+    slice vaults_cell = ds~load_ref().begin_parse();
+    primary_vault_address = vaults_cell~load_msg_addr();
+    secondary_vault_address = vaults_cell~load_msg_addr();
+
+    ;; Load treasury addresses from second reference cell
+    slice treasuries_cell = ds~load_ref().begin_parse();
+    protocol_treasury_address = treasuries_cell~load_msg_addr();
+    reserve_fund_address = treasuries_cell~load_msg_addr();
+
+    total_premiums_distributed = ds~load_coins();
+    distribution_count = ds~load_uint(64);
+}
+
+() save_data() impure {
+    ;; Store vault addresses in first reference cell
+    cell vaults = begin_cell()
+        .store_slice(primary_vault_address)
+        .store_slice(secondary_vault_address)
+        .end_cell();
+
+    ;; Store treasury addresses in second reference cell
+    cell treasuries = begin_cell()
+        .store_slice(protocol_treasury_address)
+        .store_slice(reserve_fund_address)
+        .end_cell();
+
+    set_data(begin_cell()
+        .store_slice(owner_address)
+        .store_ref(vaults)
+        .store_ref(treasuries)
+        .store_coins(total_premiums_distributed)
+        .store_uint(distribution_count, 64)
+        .end_cell());
+}
+
+() check_owner(slice sender_address) impure {
+    throw_unless(403, equal_slices_bits(sender_address, owner_address));
+}
+
+;; Distribute premium to 4 parties
+() distribute_premium(int premium_amount, int policy_id) impure {
+    throw_unless(400, premium_amount > 0);
+
+    ;; Calculate shares
+    int primary_share = muldiv(premium_amount, SHARE_PRIMARY, BASIS_POINTS);
+    int secondary_share = muldiv(premium_amount, SHARE_SECONDARY, BASIS_POINTS);
+    int protocol_share = muldiv(premium_amount, SHARE_PROTOCOL, BASIS_POINTS);
+    int reserve_share = muldiv(premium_amount, SHARE_RESERVE, BASIS_POINTS);
+
+    ;; Send to Primary Vault (async)
+    cell msg_primary = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(primary_vault_address)
+        .store_coins(primary_share)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(0x03, 32)  ;; op: receive_premium_share
+        .store_coins(primary_share)
+        .store_uint(policy_id, 64)
+        .end_cell();
+    send_raw_message(msg_primary, 1);
+
+    ;; Send to Secondary Vault (async)
+    cell msg_secondary = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(secondary_vault_address)
+        .store_coins(secondary_share)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(0x03, 32)  ;; op: receive_premium_share
+        .store_coins(secondary_share)
+        .store_uint(policy_id, 64)
+        .end_cell();
+    send_raw_message(msg_secondary, 1);
+
+    ;; Send to Protocol Treasury (async)
+    cell msg_protocol = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(protocol_treasury_address)
+        .store_coins(protocol_share)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(0x04, 32)  ;; op: receive_protocol_share
+        .store_coins(protocol_share)
+        .store_uint(policy_id, 64)
+        .end_cell();
+    send_raw_message(msg_protocol, 1);
+
+    ;; Send to Reserve Fund (async)
+    cell msg_reserve = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(reserve_fund_address)
+        .store_coins(reserve_share)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(0x05, 32)  ;; op: receive_reserve_share
+        .store_coins(reserve_share)
+        .store_uint(policy_id, 64)
+        .end_cell();
+    send_raw_message(msg_reserve, 1);
+
+    ;; Update stats
+    total_premiums_distributed += premium_amount;
+    distribution_count += 1;
+    save_data();
+
+    ;; Emit event
+    emit_log(0x30, begin_cell()
+        .store_uint(policy_id, 64)
+        .store_coins(premium_amount)
+        .store_coins(primary_share)
+        .store_coins(secondary_share)
+        .store_coins(protocol_share)
+        .store_coins(reserve_share)
+        .end_cell().begin_parse());
+}
+
+;; Admin functions to update addresses
+() set_primary_vault(slice sender_address, slice new_address) impure {
+    check_owner(sender_address);
+    primary_vault_address = new_address;
+    save_data();
+}
+
+() set_secondary_vault(slice sender_address, slice new_address) impure {
+    check_owner(sender_address);
+    secondary_vault_address = new_address;
+    save_data();
+}
+
+() set_protocol_treasury(slice sender_address, slice new_address) impure {
+    check_owner(sender_address);
+    protocol_treasury_address = new_address;
+    save_data();
+}
+
+() set_reserve_fund(slice sender_address, slice new_address) impure {
+    check_owner(sender_address);
+    reserve_fund_address = new_address;
+    save_data();
+}
+
+;; Get methods
+slice get_primary_vault() method_id {
+    load_data();
+    return primary_vault_address;
+}
+
+slice get_secondary_vault() method_id {
+    load_data();
+    return secondary_vault_address;
+}
+
+slice get_protocol_treasury() method_id {
+    load_data();
+    return protocol_treasury_address;
+}
+
+slice get_reserve_fund() method_id {
+    load_data();
+    return reserve_fund_address;
+}
+
+int get_total_premiums_distributed() method_id {
+    load_data();
+    return total_premiums_distributed;
+}
+
+int get_distribution_count() method_id {
+    load_data();
+    return distribution_count;
+}
+
+(int, int, int, int) get_distribution_percentages() method_id {
+    return (SHARE_PRIMARY, SHARE_SECONDARY, SHARE_PROTOCOL, SHARE_RESERVE);
+}
+
+;; Calculate expected distribution for given premium
+(int, int, int, int) calculate_distribution(int premium_amount) method_id {
+    int primary_share = muldiv(premium_amount, SHARE_PRIMARY, BASIS_POINTS);
+    int secondary_share = muldiv(premium_amount, SHARE_SECONDARY, BASIS_POINTS);
+    int protocol_share = muldiv(premium_amount, SHARE_PROTOCOL, BASIS_POINTS);
+    int reserve_share = muldiv(premium_amount, SHARE_RESERVE, BASIS_POINTS);
+
+    return (primary_share, secondary_share, protocol_share, reserve_share);
+}
+
+;; Recv internal
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) {
+        return ();
+    }
+
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) {
+        return ();
+    }
+    slice sender_address = cs~load_msg_addr();
+
+    load_data();
+
+    int op = in_msg_body~load_uint(32);
+
+    if (op == 0x01) {  ;; distribute_premium
+        int premium_amount = in_msg_body~load_coins();
+        int policy_id = in_msg_body~load_uint(64);
+        distribute_premium(premium_amount, policy_id);
+        return ();
+    }
+
+    if (op == 0x10) {  ;; set_primary_vault
+        slice new_address = in_msg_body~load_msg_addr();
+        set_primary_vault(sender_address, new_address);
+        return ();
+    }
+
+    if (op == 0x11) {  ;; set_secondary_vault
+        slice new_address = in_msg_body~load_msg_addr();
+        set_secondary_vault(sender_address, new_address);
+        return ();
+    }
+
+    if (op == 0x12) {  ;; set_protocol_treasury
+        slice new_address = in_msg_body~load_msg_addr();
+        set_protocol_treasury(sender_address, new_address);
+        return ();
+    }
+
+    if (op == 0x13) {  ;; set_reserve_fund
+        slice new_address = in_msg_body~load_msg_addr();
+        set_reserve_fund(sender_address, new_address);
+        return ();
+    }
+
+    throw(0xffff);
+}
+
+;; Note: emit_log() is now implemented in stdlib.fc
+;; SimplePremiumDistributor uses event logging for premium distribution operations

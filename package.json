@@ -1,0 +1,68 @@
+{
+  "name": "tonsurance-monorepo",
+  "version": "1.0.0",
+  "description": "Cross-chain stablecoin insurance protocol on TON blockchain",
+  "private": true,
+  "workspaces": [
+    "services",
+    "frontend"
+  ],
+  "scripts": {
+    "build": "npm run build:backend && npm run build:contracts && npm run build:services && npm run build:frontend",
+    "build:backend": "cd backend && dune build",
+    "build:contracts": "npx blueprint build",
+    "build:services": "cd services && npm run build",
+    "build:frontend": "cd frontend && npm run build",
+    "test": "npm run test:contracts && npm run test:services",
+    "test:contracts": "npx blueprint test",
+    "test:services": "cd services && npm test",
+    "test:backend": "cd backend && dune test",
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev:services": "cd services && npm run dev",
+    "start:pricing-keeper": "cd services && npm run start:pricing",
+    "start:bridge-keeper": "cd services && npm run start:bridge",
+    "start:api": "cd services && npm run start:api",
+    "start:ws": "cd services && npm run start:ws",
+    "lint": "eslint . --ext .ts,.tsx",
+    "format": "prettier --write \"**/*.{ts,tsx,js,json,md}\"",
+    "docker:build": "docker-compose -f infra/docker/docker-compose.production.yml build",
+    "docker:up": "docker-compose -f infra/docker/docker-compose.production.yml up -d",
+    "docker:down": "docker-compose -f infra/docker/docker-compose.production.yml down"
+  },
+  "dependencies": {
+    "@ton/core": "^0.62.0",
+    "@ton/ton": "^15.4.0",
+    "@ton/crypto": "^3.3.0",
+    "@ton/blueprint": "^0.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.9",
+    "typescript": "^5.5.2",
+    "eslint": "^8.57.0",
+    "prettier": "^3.3.2",
+    "@typescript-eslint/eslint-plugin": "^7.15.0",
+    "@typescript-eslint/parser": "^7.15.0",
+    "jest": "^29.7.0",
+    "@types/jest": "^29.5.12"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HobanSearch/Tonsurance"
+  },
+  "keywords": [
+    "ton",
+    "blockchain",
+    "insurance",
+    "defi",
+    "stablecoin",
+    "cross-chain",
+    "ocaml",
+    "typescript"
+  ],
+  "author": "Tonsurance Team",
+  "license": "MIT"
+}

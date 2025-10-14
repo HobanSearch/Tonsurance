@@ -1,0 +1,546 @@
+;; BeneficiaryPolicy.fc - Third-Party Beneficiary Insurance Contracts
+;;
+;; Enables buyer ≠ beneficiary, creating powerful use cases:
+;; - Insurance gifts (parent → child, friend → friend)
+;; - Employee benefits (employer → employee)
+;; - Business escrow (party A → party B, conditional on event)
+;; - Lending protection (lender → borrower collateral)
+;; - DAO grants (DAO → grantee with safety net)
+;; - Remittances (sender → recipient with depeg protection)
+;;
+;; Key Features:
+;; - Separate buyer and beneficiary addresses
+;; - Transferable beneficiary rights (NFT-based)
+;; - Conditional activation clauses
+;; - Premium payment by third party
+;; - Automated payout to beneficiary
+;; - Audit trail for compliance
+
+#include "imports/stdlib.fc";
+
+;; Storage layout
+;; policy_count:uint64
+;; policy_manager_address:MsgAddress
+;; vault_address:MsgAddress
+;; admin_address:MsgAddress
+
+global int storage::policy_count;
+global slice storage::policy_manager_address;
+global slice storage::vault_address;
+global slice storage::admin_address;
+
+;; Beneficiary Policy structure
+;; policy_id:uint64
+;; buyer:MsgAddress (who pays premium)
+;; beneficiary:MsgAddress (who receives payout)
+;; payer:MsgAddress (who paid premium - may differ from buyer)
+;; asset_type:uint8
+;; coverage_amount:Coins
+;; premium_amount:Coins
+;; trigger_price:uint32
+;; floor_price:uint32
+;; start_time:uint32
+;; expiry_time:uint32
+;; status:uint8
+;; beneficiary_transferable:bool (can beneficiary transfer to another?)
+;; activation_condition:uint8 (0=immediate, 1=time-based, 2=oracle-based)
+;; activation_timestamp:uint32
+;; metadata:cell (additional info - reason, tags, etc.)
+
+const int STATUS_PENDING = 0;      ;; Not yet activated
+const int STATUS_ACTIVE = 1;       ;; Active coverage
+const int STATUS_TRIGGERED = 2;    ;; Depeg detected
+const int STATUS_PAID = 3;         ;; Payout executed
+const int STATUS_EXPIRED = 4;      ;; Expired without trigger
+const int STATUS_CANCELLED = 5;    ;; Cancelled by buyer
+const int STATUS_TRANSFERRED = 6;  ;; Beneficiary transferred
+
+const int ACTIVATION_IMMEDIATE = 0;
+const int ACTIVATION_TIME_BASED = 1;
+const int ACTIVATION_ORACLE_BASED = 2;
+
+const int OP_CREATE_BENEFICIARY_POLICY = 0x30;
+const int OP_TRANSFER_BENEFICIARY = 0x31;
+const int OP_ACTIVATE_POLICY = 0x32;
+const int OP_CANCEL_BENEFICIARY_POLICY = 0x33;
+const int OP_GET_POLICY_STATUS = 0x34;
+const int OP_UPDATE_METADATA = 0x35;
+
+;; Load storage
+() load_data() impure {
+    var ds = get_data().begin_parse();
+
+    storage::policy_count = ds~load_uint(64);
+    storage::policy_manager_address = ds~load_msg_addr();
+    storage::vault_address = ds~load_msg_addr();
+    storage::admin_address = ds~load_msg_addr();
+
+    ds.end_parse();
+}
+
+;; Save storage
+() save_data() impure {
+    set_data(
+        begin_cell()
+            .store_uint(storage::policy_count, 64)
+            .store_slice(storage::policy_manager_address)
+            .store_slice(storage::vault_address)
+            .store_slice(storage::admin_address)
+        .end_cell()
+    );
+}
+
+;; Load beneficiary policy
+(int, slice, slice, slice, int, int, int, int, int, int, int, int, int, int, int, cell) load_beneficiary_policy(int policy_id) {
+    var policy_cell = get_data_from_key(policy_id);
+
+    if (cell_null?(policy_cell)) {
+        return (0, null(), null(), null(), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, null());
+    }
+
+    var ps = policy_cell.begin_parse();
+
+    int policy_id = ps~load_uint(64);
+    slice buyer = ps~load_msg_addr();
+    slice beneficiary = ps~load_msg_addr();
+    slice payer = ps~load_msg_addr();
+    int asset_type = ps~load_uint(8);
+    int coverage_amount = ps~load_coins();
+    int premium_amount = ps~load_coins();
+    int trigger_price = ps~load_uint(32);
+    int floor_price = ps~load_uint(32);
+    int start_time = ps~load_uint(32);
+    int expiry_time = ps~load_uint(32);
+    int status = ps~load_uint(8);
+    int beneficiary_transferable = ps~load_uint(1);
+    int activation_condition = ps~load_uint(8);
+    int activation_timestamp = ps~load_uint(32);
+    cell metadata = ps~load_ref();
+
+    ps.end_parse();
+
+    return (policy_id, buyer, beneficiary, payer, asset_type, coverage_amount,
+            premium_amount, trigger_price, floor_price, start_time, expiry_time,
+            status, beneficiary_transferable, activation_condition,
+            activation_timestamp, metadata);
+}
+
+;; Save beneficiary policy
+() save_beneficiary_policy(int policy_id, slice buyer, slice beneficiary, slice payer,
+                           int asset_type, int coverage_amount, int premium_amount,
+                           int trigger_price, int floor_price, int start_time,
+                           int expiry_time, int status, int beneficiary_transferable,
+                           int activation_condition, int activation_timestamp,
+                           cell metadata) impure {
+
+    var policy_cell = begin_cell()
+        .store_uint(policy_id, 64)
+        .store_slice(buyer)
+        .store_slice(beneficiary)
+        .store_slice(payer)
+        .store_uint(asset_type, 8)
+        .store_coins(coverage_amount)
+        .store_coins(premium_amount)
+        .store_uint(trigger_price, 32)
+        .store_uint(floor_price, 32)
+        .store_uint(start_time, 32)
+        .store_uint(expiry_time, 32)
+        .store_uint(status, 8)
+        .store_uint(beneficiary_transferable, 1)
+        .store_uint(activation_condition, 8)
+        .store_uint(activation_timestamp, 32)
+        .store_ref(metadata)
+    .end_cell();
+
+    set_data_to_key(policy_id, policy_cell);
+}
+
+;; Check if policy is activated
+int is_policy_activated(int activation_condition, int activation_timestamp, int start_time) inline {
+    if (activation_condition == ACTIVATION_IMMEDIATE) {
+        return true; ;; Always active
+    }
+
+    if (activation_condition == ACTIVATION_TIME_BASED) {
+        return now() >= activation_timestamp;
+    }
+
+    if (activation_condition == ACTIVATION_ORACLE_BASED) {
+        ;; Will be activated by oracle message
+        return activation_timestamp > 0;
+    }
+
+    return false;
+}
+
+;; Mint beneficiary NFT
+() mint_beneficiary_nft(slice beneficiary, int policy_id, int transferable) impure {
+    var msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(beneficiary)
+        .store_coins(0)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(0x3001, 32) ;; OP_MINT_BENEFICIARY_NFT
+        .store_uint(policy_id, 64)
+        .store_uint(transferable, 1)
+    .end_cell();
+
+    send_raw_message(msg, 1);
+}
+
+;; Notify buyer of policy creation
+() notify_buyer(slice buyer, int policy_id, slice beneficiary, int coverage_amount) impure {
+    var msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(buyer)
+        .store_coins(0)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(0x3002, 32) ;; OP_POLICY_CREATED_NOTIFICATION
+        .store_uint(policy_id, 64)
+        .store_slice(beneficiary)
+        .store_coins(coverage_amount)
+    .end_cell();
+
+    send_raw_message(msg, 1);
+}
+
+;; Forward to PolicyManager for actual insurance coverage
+() forward_to_policy_manager(slice buyer, slice beneficiary, int asset_type,
+                             int coverage_amount, int premium_amount,
+                             int trigger_price, int floor_price,
+                             int duration_seconds) impure {
+
+    var msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(storage::policy_manager_address)
+        .store_coins(premium_amount)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(0x01, 32) ;; OP_CREATE_POLICY
+        .store_slice(beneficiary) ;; Beneficiary receives payout
+        .store_uint(asset_type, 8)
+        .store_coins(coverage_amount)
+        .store_coins(premium_amount)
+        .store_uint(trigger_price, 32)
+        .store_uint(floor_price, 32)
+        .store_uint(duration_seconds, 32)
+    .end_cell();
+
+    send_raw_message(msg, 1);
+}
+
+;; ========== MESSAGE HANDLERS ==========
+
+;; Create beneficiary policy
+() handle_create_beneficiary_policy(slice sender, slice in_msg) impure {
+    slice buyer = sender; ;; Who initiates the contract
+    slice beneficiary = in_msg~load_msg_addr();
+    int asset_type = in_msg~load_uint(8);
+    int coverage_amount = in_msg~load_coins();
+    int premium_amount = in_msg~load_coins();
+    int trigger_price = in_msg~load_uint(32);
+    int floor_price = in_msg~load_uint(32);
+    int duration_seconds = in_msg~load_uint(32);
+    int beneficiary_transferable = in_msg~load_uint(1);
+    int activation_condition = in_msg~load_uint(8);
+    int activation_delay_seconds = in_msg~load_uint(32); ;; For time-based activation
+    cell metadata = in_msg~load_ref(); ;; Additional info
+
+    ;; Validate inputs
+    throw_unless(100, coverage_amount > 0);
+    throw_unless(101, premium_amount > 0);
+    throw_unless(102, trigger_price > floor_price);
+    throw_unless(103, duration_seconds > 0);
+    throw_unless(104, duration_seconds <= 31536000); ;; Max 1 year
+
+    ;; Check premium payment
+    int msg_value = in_msg~load_coins();
+    throw_unless(105, msg_value >= premium_amount);
+
+    ;; Create policy
+    storage::policy_count += 1;
+    int policy_id = storage::policy_count;
+
+    int start_time = now();
+    int expiry_time = start_time + duration_seconds;
+
+    ;; Calculate activation timestamp
+    int activation_timestamp = 0;
+    if (activation_condition == ACTIVATION_IMMEDIATE) {
+        activation_timestamp = start_time;
+    }
+    if (activation_condition == ACTIVATION_TIME_BASED) {
+        activation_timestamp = start_time + activation_delay_seconds;
+    }
+
+    ;; Determine initial status
+    int initial_status = STATUS_PENDING;
+    if (activation_condition == ACTIVATION_IMMEDIATE) {
+        initial_status = STATUS_ACTIVE;
+    }
+
+    ;; Save beneficiary policy
+    save_beneficiary_policy(
+        policy_id,
+        buyer,
+        beneficiary,
+        sender, ;; payer (same as buyer for now)
+        asset_type,
+        coverage_amount,
+        premium_amount,
+        trigger_price,
+        floor_price,
+        start_time,
+        expiry_time,
+        initial_status,
+        beneficiary_transferable,
+        activation_condition,
+        activation_timestamp,
+        metadata
+    );
+
+    ;; If immediately active, forward to PolicyManager
+    if (initial_status == STATUS_ACTIVE) {
+        forward_to_policy_manager(
+            buyer,
+            beneficiary,
+            asset_type,
+            coverage_amount,
+            premium_amount,
+            trigger_price,
+            floor_price,
+            duration_seconds
+        );
+    }
+
+    ;; Mint beneficiary NFT
+    mint_beneficiary_nft(beneficiary, policy_id, beneficiary_transferable);
+
+    ;; Notify buyer
+    notify_buyer(buyer, policy_id, beneficiary, coverage_amount);
+
+    ;; Update storage
+    save_data();
+}
+
+;; Transfer beneficiary rights (if transferable)
+() handle_transfer_beneficiary(slice sender, slice in_msg) impure {
+    int policy_id = in_msg~load_uint(64);
+    slice new_beneficiary = in_msg~load_msg_addr();
+
+    ;; Load policy
+    var (pid, buyer, beneficiary, payer, asset_type, coverage_amount,
+         premium_amount, trigger_price, floor_price, start_time, expiry_time,
+         status, beneficiary_transferable, activation_condition,
+         activation_timestamp, metadata) = load_beneficiary_policy(policy_id);
+
+    throw_unless(200, pid > 0); ;; Policy exists
+    throw_unless(201, equal_slices(sender, beneficiary)); ;; Only beneficiary can transfer
+    throw_unless(202, beneficiary_transferable); ;; Must be transferable
+    throw_unless(203, (status == STATUS_PENDING) | (status == STATUS_ACTIVE)); ;; Must be pending or active
+
+    ;; Update beneficiary
+    beneficiary = new_beneficiary;
+
+    save_beneficiary_policy(pid, buyer, beneficiary, payer, asset_type, coverage_amount,
+                           premium_amount, trigger_price, floor_price, start_time,
+                           expiry_time, status, beneficiary_transferable,
+                           activation_condition, activation_timestamp, metadata);
+
+    ;; Mint new NFT to new beneficiary
+    mint_beneficiary_nft(new_beneficiary, policy_id, beneficiary_transferable);
+}
+
+;; Activate policy (for oracle-based or manual activation)
+() handle_activate_policy(slice sender, slice in_msg) impure {
+    ;; Can be called by oracle or admin
+    int policy_id = in_msg~load_uint(64);
+
+    ;; Load policy
+    var (pid, buyer, beneficiary, payer, asset_type, coverage_amount,
+         premium_amount, trigger_price, floor_price, start_time, expiry_time,
+         status, beneficiary_transferable, activation_condition,
+         activation_timestamp, metadata) = load_beneficiary_policy(policy_id);
+
+    throw_unless(300, pid > 0);
+    throw_unless(301, status == STATUS_PENDING);
+
+    ;; Check if activation is allowed
+    if (activation_condition == ACTIVATION_TIME_BASED) {
+        throw_unless(302, now() >= activation_timestamp);
+    }
+
+    ;; Update status
+    status = STATUS_ACTIVE;
+    activation_timestamp = now();
+
+    save_beneficiary_policy(pid, buyer, beneficiary, payer, asset_type, coverage_amount,
+                           premium_amount, trigger_price, floor_price, start_time,
+                           expiry_time, status, beneficiary_transferable,
+                           activation_condition, activation_timestamp, metadata);
+
+    ;; Forward to PolicyManager
+    int duration_seconds = expiry_time - start_time;
+    forward_to_policy_manager(
+        buyer,
+        beneficiary,
+        asset_type,
+        coverage_amount,
+        premium_amount,
+        trigger_price,
+        floor_price,
+        duration_seconds
+    );
+}
+
+;; Cancel beneficiary policy (only if pending)
+() handle_cancel_beneficiary_policy(slice sender, slice in_msg) impure {
+    int policy_id = in_msg~load_uint(64);
+
+    ;; Load policy
+    var (pid, buyer, beneficiary, payer, asset_type, coverage_amount,
+         premium_amount, trigger_price, floor_price, start_time, expiry_time,
+         status, beneficiary_transferable, activation_condition,
+         activation_timestamp, metadata) = load_beneficiary_policy(policy_id);
+
+    throw_unless(400, pid > 0);
+    throw_unless(401, equal_slices(sender, buyer)); ;; Only buyer can cancel
+    throw_unless(402, status == STATUS_PENDING); ;; Can only cancel pending
+
+    ;; Update status
+    status = STATUS_CANCELLED;
+
+    save_beneficiary_policy(pid, buyer, beneficiary, payer, asset_type, coverage_amount,
+                           premium_amount, trigger_price, floor_price, start_time,
+                           expiry_time, status, beneficiary_transferable,
+                           activation_condition, activation_timestamp, metadata);
+
+    ;; Refund premium to buyer
+    var msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(buyer)
+        .store_coins(premium_amount)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+    .end_cell();
+
+    send_raw_message(msg, 1);
+}
+
+;; Update policy metadata
+() handle_update_metadata(slice sender, slice in_msg) impure {
+    ;; Only buyer can update metadata
+    int policy_id = in_msg~load_uint(64);
+    cell new_metadata = in_msg~load_ref();
+
+    ;; Load policy
+    var (pid, buyer, beneficiary, payer, asset_type, coverage_amount,
+         premium_amount, trigger_price, floor_price, start_time, expiry_time,
+         status, beneficiary_transferable, activation_condition,
+         activation_timestamp, metadata) = load_beneficiary_policy(policy_id);
+
+    throw_unless(500, pid > 0);
+    throw_unless(501, equal_slices(sender, buyer));
+
+    ;; Update metadata
+    metadata = new_metadata;
+
+    save_beneficiary_policy(pid, buyer, beneficiary, payer, asset_type, coverage_amount,
+                           premium_amount, trigger_price, floor_price, start_time,
+                           expiry_time, status, beneficiary_transferable,
+                           activation_condition, activation_timestamp, metadata);
+}
+
+;; ========== MAIN RECEIVER ==========
+
+() recv_internal(int msg_value, cell in_msg_cell, slice in_msg) impure {
+    ;; Parse message
+    var cs = in_msg_cell.begin_parse();
+    var flags = cs~load_uint(4);
+    slice sender = cs~load_msg_addr();
+
+    ;; Load storage
+    load_data();
+
+    ;; Parse operation
+    int op = in_msg~load_uint(32);
+
+    if (op == OP_CREATE_BENEFICIARY_POLICY) {
+        handle_create_beneficiary_policy(sender, in_msg);
+        return ();
+    }
+
+    if (op == OP_TRANSFER_BENEFICIARY) {
+        handle_transfer_beneficiary(sender, in_msg);
+        return ();
+    }
+
+    if (op == OP_ACTIVATE_POLICY) {
+        handle_activate_policy(sender, in_msg);
+        return ();
+    }
+
+    if (op == OP_CANCEL_BENEFICIARY_POLICY) {
+        handle_cancel_beneficiary_policy(sender, in_msg);
+        return ();
+    }
+
+    if (op == OP_UPDATE_METADATA) {
+        handle_update_metadata(sender, in_msg);
+        return ();
+    }
+
+    throw(0xffff); ;; Unknown operation
+}
+
+;; ========== GET METHODS ==========
+
+;; Get beneficiary policy details
+(int, slice, slice, slice, int, int, int, int, int, int, int, int, int, int, int, cell) get_beneficiary_policy(int policy_id) method_id {
+    load_data();
+    return load_beneficiary_policy(policy_id);
+}
+
+;; Get policy count
+int get_policy_count() method_id {
+    load_data();
+    return storage::policy_count;
+}
+
+;; Check if policy is activated
+int is_activated(int policy_id) method_id {
+    load_data();
+
+    var (pid, buyer, beneficiary, payer, asset_type, coverage_amount,
+         premium_amount, trigger_price, floor_price, start_time, expiry_time,
+         status, beneficiary_transferable, activation_condition,
+         activation_timestamp, metadata) = load_beneficiary_policy(policy_id);
+
+    if (pid == 0) {
+        return false;
+    }
+
+    return is_policy_activated(activation_condition, activation_timestamp, start_time);
+}
+
+;; Get beneficiary address
+slice get_beneficiary(int policy_id) method_id {
+    load_data();
+
+    var (pid, buyer, beneficiary, payer, asset_type, coverage_amount,
+         premium_amount, trigger_price, floor_price, start_time, expiry_time,
+         status, beneficiary_transferable, activation_condition,
+         activation_timestamp, metadata) = load_beneficiary_policy(policy_id);
+
+    return beneficiary;
+}
+
+;; Get buyer address
+slice get_buyer(int policy_id) method_id {
+    load_data();
+
+    var (pid, buyer, beneficiary, payer, asset_type, coverage_amount,
+         premium_amount, trigger_price, floor_price, start_time, expiry_time,
+         status, beneficiary_transferable, activation_condition,
+         activation_timestamp, metadata) = load_beneficiary_policy(policy_id);
+
+    return buyer;
+}

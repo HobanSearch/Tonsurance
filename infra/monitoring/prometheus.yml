@@ -1,0 +1,53 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'tonsurance-production'
+    environment: 'prod'
+
+scrape_configs:
+  # OCaml Backend Metrics
+  - job_name: 'ocaml-backend'
+    static_configs:
+      - targets: ['ocaml-backend:8080']
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+
+  # PricingOracleKeeper Metrics
+  - job_name: 'pricing-oracle-keeper'
+    static_configs:
+      - targets: ['pricing-oracle-keeper:3001']
+    metrics_path: '/metrics'
+    scrape_interval: 5s
+
+  # BridgeHealthKeeper Metrics
+  - job_name: 'bridge-health-keeper'
+    static_configs:
+      - targets: ['bridge-health-keeper:3002']
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+
+  # PostgreSQL Exporter
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres:5432']
+    metrics_path: '/metrics'
+
+  # Redis Exporter
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis:6379']
+    metrics_path: '/metrics'
+
+  # Node Exporter (System metrics)
+  - job_name: 'node'
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+rule_files:
+  - '/etc/prometheus/alerts/*.yml'

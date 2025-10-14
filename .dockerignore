@@ -1,0 +1,70 @@
+# Git
+.git
+.gitignore
+
+# Build artifacts
+_build/
+*.exe
+*.a
+*.o
+*.so
+*.dylib
+
+# OCaml
+*.cmi
+*.cmo
+*.cma
+*.cmx
+*.cmxa
+*.native
+*.byte
+
+# Logs
+logs/
+*.log
+
+# Environment
+.env
+.env.local
+.env.production
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Tests
+test/
+*.test
+
+# Config
+config/
+
+# Node modules (if any)
+node_modules/
+
+# Data
+data/
+*.db
+*.sqlite
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.yml
+Dockerfile
+.dockerignore

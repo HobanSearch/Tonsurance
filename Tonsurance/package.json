@@ -1,0 +1,52 @@
+{
+    "name": "Tonsurance",
+    "version": "0.0.1",
+    "scripts": {
+        "bp": "blueprint",
+        "start": "blueprint run",
+        "build": "blueprint build",
+        "test": "jest --verbose",
+        "test:unit": "jest tests/unit --verbose",
+        "test:unit:contracts": "jest tests/unit/contracts --verbose",
+        "test:unit:services": "jest tests/unit/services --verbose",
+        "test:integration": "jest tests/integration --verbose",
+        "test:e2e": "jest tests/e2e --verbose",
+        "test:watch": "jest --watch",
+        "test:coverage": "jest --coverage",
+        "coverage:merge": "nyc merge coverage coverage/merged/coverage.json",
+        "coverage:check": "nyc check-coverage --lines 90 --functions 90 --branches 85",
+        "mock:polymarket": "ts-node tests/mocks/polymarket-server.ts",
+        "api:start": "ts-node api/server.ts",
+        "keepers:start": "ts-node scripts/startKeepers.ts",
+        "deploy:phase4": "npx blueprint run deployPhase4Complete --testnet",
+        "release": "blueprint pack && npm publish --access public"
+    },
+    "dependencies": {
+        "@ton/core": "~0",
+        "@ton/ton": ">=15.3.1 <16.0.0",
+        "@ton/crypto": "^3.3.0",
+        "axios": "^1.6.0",
+        "express": "^4.18.0",
+        "ws": "^8.14.0",
+        "dotenv": "^16.3.1"
+    },
+    "devDependencies": {
+        "@ton/blueprint": ">=0.40.0",
+        "@ton/sandbox": ">=0.37.0",
+        "@ton/test-utils": ">=0.11.0",
+        "@types/jest": "^30.0.0",
+        "@types/node": "^22.17.2",
+        "@types/express": "^4.17.0",
+        "@types/ws": "^8.5.8",
+        "jest": "^30.0.5",
+        "prettier": "^3.6.2",
+        "ts-jest": "^29.4.1",
+        "ts-node": "^10.9.2",
+        "typescript": "^5.9.2",
+        "@ton/tolk-js": ">=1.0.0",
+        "@tact-lang/compiler": ">=1.6.13 <2.0.0",
+        "@ton-community/func-js": ">=0.10.0",
+        "nock": "^13.5.0",
+        "nyc": "^15.1.0"
+    }
+}

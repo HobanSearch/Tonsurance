@@ -1,0 +1,165 @@
+version: '3.8'
+
+services:
+  # PostgreSQL with TimescaleDB
+  postgres:
+    image: timescale/timescaledb:latest-pg15
+    container_name: tonsurance-postgres
+    environment:
+      POSTGRES_USER: tonsurance
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tonsurance_dev}
+      POSTGRES_DB: tonsurance
+      TIMESCALEDB_TELEMETRY: 'off'
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tonsurance"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - tonsurance-network
+
+  # Redis cache
+  redis:
+    image: redis:7-alpine
+    container_name: tonsurance-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - tonsurance-network
+
+  # RabbitMQ message queue
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: tonsurance-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: tonsurance
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-tonsurance_dev}
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # Management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - tonsurance-network
+
+  # API Server
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tonsurance-api
+    environment:
+      API_PORT: 8080
+      API_HOST: 0.0.0.0
+      DATABASE_URL: postgresql://tonsurance:${POSTGRES_PASSWORD:-tonsurance_dev}@postgres:5432/tonsurance
+      REDIS_URL: redis://redis:6379
+      RABBITMQ_URL: amqp://tonsurance:${RABBITMQ_PASSWORD:-tonsurance_dev}@rabbitmq:5672
+      TON_MAINNET: ${TON_MAINNET:-false}
+      TON_ENDPOINT: ${TON_ENDPOINT:-https://testnet.toncenter.com/api/v2/jsonRPC}
+      TON_API_KEY: ${TON_API_KEY}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - tonsurance-network
+
+  # Risk Management Daemon
+  risk-daemon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tonsurance-risk-daemon
+    command: ["./risk_management_daemon"]
+    environment:
+      DATABASE_URL: postgresql://tonsurance:${POSTGRES_PASSWORD:-tonsurance_dev}@postgres:5432/tonsurance
+      REDIS_URL: redis://redis:6379
+      RISK_MONITOR_INTERVAL: ${RISK_MONITOR_INTERVAL:-60}
+      REBALANCER_INTERVAL: ${REBALANCER_INTERVAL:-300}
+      ARBITRAGE_INTERVAL: ${ARBITRAGE_INTERVAL:-900}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - tonsurance-network
+
+  # Prometheus (monitoring)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: tonsurance-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    networks:
+      - tonsurance-network
+
+  # Grafana (dashboards)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: tonsurance-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_INSTALL_PLUGINS: grafana-clock-panel
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./config/grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+    networks:
+      - tonsurance-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  tonsurance-network:
+    driver: bridge

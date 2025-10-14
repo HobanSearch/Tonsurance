@@ -1,0 +1,5 @@
+(library
+ (name daemons)
+ (public_name tonsurance.daemons)
+ (libraries core types math pool monitoring claims_engine integration lwt lwt.unix logs logs.lwt)
+ (preprocess (pps lwt_ppx ppx_sexp_conv)))

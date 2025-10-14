@@ -1,0 +1,5 @@
+(library
+ (name pool)
+ (public_name tonsurance.pool)
+ (libraries core types math risk_model lwt lwt.unix)
+ (preprocess (pps lwt_ppx ppx_sexp_conv)))

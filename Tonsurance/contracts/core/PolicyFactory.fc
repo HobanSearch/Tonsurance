@@ -1,0 +1,338 @@
+;; PolicyFactory Contract - Core Insurance
+;; Creates policies with fixed APR pricing
+;; Coverage types: 1=USDT depeg, 2=Protocol exploit, 3=Bridge hack, 4=Rug pull
+
+#include "../imports/stdlib.fc";
+
+;; Storage structure
+;; owner_address: slice
+;; next_policy_id: int
+;; total_policies_created: int
+;; active_policies_count: int
+;; treasury_address: slice
+;; paused: int (0 = active, 1 = paused)
+;; policies_dict: cell (dictionary of policy_id -> policy_data)
+
+global slice owner_address;
+global int next_policy_id;
+global int total_policies_created;
+global int active_policies_count;
+global slice treasury_address;
+global int paused;
+global cell policies_dict;
+
+() load_data() impure {
+    slice ds = get_data().begin_parse();
+    owner_address = ds~load_msg_addr();
+    next_policy_id = ds~load_uint(64);
+    total_policies_created = ds~load_uint(64);
+    active_policies_count = ds~load_uint(64);
+    treasury_address = ds~load_msg_addr();
+    paused = ds~load_uint(1);
+    policies_dict = ds~load_dict();
+}
+
+() save_data() impure {
+    set_data(begin_cell()
+        .store_slice(owner_address)
+        .store_uint(next_policy_id, 64)
+        .store_uint(total_policies_created, 64)
+        .store_uint(active_policies_count, 64)
+        .store_slice(treasury_address)
+        .store_uint(paused, 1)
+        .store_dict(policies_dict)
+        .end_cell());
+}
+
+;; Access control
+() check_owner(slice sender_address) impure {
+    throw_unless(403, equal_slices_bits(sender_address, owner_address));
+}
+
+() check_not_paused() impure {
+    throw_if(423, paused);
+}
+
+;; Premium calculation
+;; Base rates (APR in basis points):
+;; 1 = USDT depeg: 80 bps (0.8%)
+;; 2 = Protocol: 200 bps (2%)
+;; 3 = Bridge: 200 bps (2%)
+;; 4 = Rug pull: 500 bps (5%)
+int calculate_premium(int coverage_type, int coverage_amount, int duration_days) inline {
+    int base_rate = 0;
+
+    if (coverage_type == 1) {
+        base_rate = 80;  ;; 0.8%
+    } elseif (coverage_type == 2) {
+        base_rate = 200; ;; 2%
+    } elseif (coverage_type == 3) {
+        base_rate = 200; ;; 2%
+    } elseif (coverage_type == 4) {
+        base_rate = 500; ;; 5%
+    } else {
+        throw(402);  ;; Invalid coverage type
+    }
+
+    ;; Time multiplier
+    int time_multiplier = 1000;  ;; Default 1.0x for 90 days
+    if (duration_days == 30) {
+        time_multiplier = 1200;  ;; 1.2x premium (shorter term = higher rate)
+    } elseif (duration_days == 180) {
+        time_multiplier = 900;   ;; 0.9x discount (longer term = lower rate)
+    }
+
+    ;; Calculate: (amount * rate * days / 365 / 10000) * time_multiplier / 1000
+    int premium = muldiv(coverage_amount, base_rate * duration_days, 365 * 10000);
+    premium = muldiv(premium, time_multiplier, 1000);
+
+    return premium;
+}
+
+;; Validate policy parameters
+() validate_policy_params(int coverage_type, int coverage_amount, int duration_days) impure {
+    ;; Coverage amount bounds
+    throw_unless(400, coverage_amount >= 10000000000);   ;; Min $10 (in nanoTON at $5/TON = 2 TON)
+    throw_unless(401, coverage_amount <= 1000000000000); ;; Max $1000 (200 TON)
+
+    ;; Valid coverage type
+    throw_unless(402, (coverage_type >= 1) & (coverage_type <= 4));
+
+    ;; Valid duration
+    throw_unless(403,
+        (duration_days == 30) | (duration_days == 90) | (duration_days == 180)
+    );
+}
+
+;; Create policy
+() create_policy(
+    int msg_value,
+    slice user_address,
+    int coverage_type,
+    int coverage_amount,
+    int duration_days
+) impure {
+    check_not_paused();
+
+    ;; Validate inputs
+    validate_policy_params(coverage_type, coverage_amount, duration_days);
+
+    ;; Calculate expected premium
+    int calculated_premium = calculate_premium(coverage_type, coverage_amount, duration_days);
+
+    ;; Verify user paid enough (msg_value should >= calculated_premium + 0.05 TON for gas)
+    int min_payment = calculated_premium + 50000000;  ;; Premium + 0.05 TON gas
+    throw_unless(404, msg_value >= min_payment);
+
+    ;; Create policy data
+    int policy_id = next_policy_id;
+    int start_time = now();
+    int end_time = start_time + (duration_days * 86400);
+
+    ;; Store policy in separate cell (to be managed by ClaimsProcessor)
+    cell policy_data = begin_cell()
+        .store_uint(policy_id, 64)
+        .store_slice(user_address)
+        .store_uint(coverage_type, 8)
+        .store_coins(coverage_amount)
+        .store_uint(start_time, 32)
+        .store_uint(end_time, 32)
+        .store_uint(1, 1)  ;; active flag
+        .store_uint(0, 1)  ;; claimed flag
+        .store_coins(calculated_premium)
+        .end_cell();
+
+    ;; Store policy in dictionary
+    policies_dict~udict_set(64, policy_id, policy_data.begin_parse());
+
+    ;; Forward premium to treasury
+    cell msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(treasury_address)
+        .store_coins(calculated_premium)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(0x01, 32)  ;; op: receive_premium
+        .store_uint(policy_id, 64)
+        .store_coins(calculated_premium)
+        .store_ref(policy_data)
+        .end_cell();
+
+    send_raw_message(msg, 1);
+
+    ;; Update counters
+    next_policy_id += 1;
+    total_policies_created += 1;
+    active_policies_count += 1;
+
+    save_data();
+
+    ;; Refund excess payment to user
+    int excess = msg_value - calculated_premium - 50000000;
+    if (excess > 0) {
+        cell refund_msg = begin_cell()
+            .store_uint(0x18, 6)
+            .store_slice(user_address)
+            .store_coins(excess)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .end_cell();
+        send_raw_message(refund_msg, 1);
+    }
+
+    ;; Emit PolicyCreated event for audit trail
+    emit_log(
+        0x01,  ;; PolicyCreated event
+        begin_cell()
+            .store_uint(policy_id, 64)
+            .store_slice(user_address)
+            .store_uint(coverage_type, 8)
+            .store_coins(coverage_amount)
+            .store_uint(duration_days, 16)
+            .store_coins(calculated_premium)
+            .end_cell().begin_parse()
+    );
+}
+
+;; Mark policy as claimed (called by ClaimsProcessor)
+() mark_policy_claimed(int policy_id) impure {
+    ;; Only ClaimsProcessor or owner can call this
+    ;; In production, should verify sender is ClaimsProcessor
+
+    active_policies_count -= 1;
+    save_data();
+}
+
+;; Admin functions
+() pause_contract(slice sender_address) impure {
+    check_owner(sender_address);
+    paused = 1;
+    save_data();
+}
+
+() unpause_contract(slice sender_address) impure {
+    check_owner(sender_address);
+    paused = 0;
+    save_data();
+}
+
+() set_treasury_address(slice sender_address, slice new_treasury) impure {
+    check_owner(sender_address);
+    treasury_address = new_treasury;
+    save_data();
+}
+
+() set_price_oracle_address(slice sender_address, slice new_oracle) impure {
+    check_owner(sender_address);
+    ;; Price oracle address would be stored if needed in future
+    ;; For now, this is a placeholder that just validates owner
+    ;; In production, add price_oracle_address to storage
+}
+
+;; Get methods
+int get_next_policy_id() method_id {
+    load_data();
+    return next_policy_id;
+}
+
+int get_total_policies_created() method_id {
+    load_data();
+    return total_policies_created;
+}
+
+int get_active_policies_count() method_id {
+    load_data();
+    return active_policies_count;
+}
+
+slice get_treasury_address() method_id {
+    load_data();
+    return treasury_address;
+}
+
+int get_paused() method_id {
+    load_data();
+    return paused;
+}
+
+int calculate_premium_external(int coverage_type, int coverage_amount, int duration_days) method_id {
+    return calculate_premium(coverage_type, coverage_amount, duration_days);
+}
+
+(int, int, int, int, int, int) get_policy_data(int policy_id) method_id {
+    load_data();
+
+    (slice policy_slice, int found) = policies_dict.udict_get?(64, policy_id);
+    throw_unless(404, found);
+
+    ;; Parse policy data
+    int stored_policy_id = policy_slice~load_uint(64);
+    slice user_address = policy_slice~load_msg_addr();
+    int coverage_type = policy_slice~load_uint(8);
+    int coverage_amount = policy_slice~load_coins();
+    int start_time = policy_slice~load_uint(32);
+    int end_time = policy_slice~load_uint(32);
+    int active = policy_slice~load_uint(1);
+    int claimed = policy_slice~load_uint(1);
+    int premium = policy_slice~load_coins();
+
+    ;; Calculate duration from end_time - start_time
+    int duration = (end_time - start_time) / 86400;  ;; Convert seconds to days
+
+    return (coverage_type, coverage_amount, premium, start_time, duration, active);
+}
+
+;; Recv internal
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) {
+        return ();
+    }
+
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) {  ;; Bounce message
+        return ();
+    }
+    slice sender_address = cs~load_msg_addr();
+
+    load_data();
+
+    int op = in_msg_body~load_uint(32);
+
+    if (op == 0x01) {  ;; create_policy
+        int coverage_type = in_msg_body~load_uint(8);
+        int coverage_amount = in_msg_body~load_coins();
+        int duration_days = in_msg_body~load_uint(16);
+
+        create_policy(msg_value, sender_address, coverage_type, coverage_amount, duration_days);
+        return ();
+    }
+
+    if (op == 0x02) {  ;; mark_policy_claimed
+        int policy_id = in_msg_body~load_uint(64);
+        mark_policy_claimed(policy_id);
+        return ();
+    }
+
+    if (op == 0x10) {  ;; pause_contract
+        pause_contract(sender_address);
+        return ();
+    }
+
+    if (op == 0x11) {  ;; unpause_contract
+        unpause_contract(sender_address);
+        return ();
+    }
+
+    if (op == 0x12) {  ;; set_treasury_address
+        slice new_treasury = in_msg_body~load_msg_addr();
+        set_treasury_address(sender_address, new_treasury);
+        return ();
+    }
+
+    if (op == 0x13) {  ;; set_price_oracle_address
+        slice new_oracle = in_msg_body~load_msg_addr();
+        set_price_oracle_address(sender_address, new_oracle);
+        return ();
+    }
+
+    throw(0xffff);  ;; Unknown operation
+}

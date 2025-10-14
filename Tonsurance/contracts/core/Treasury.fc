@@ -1,0 +1,295 @@
+;; Treasury Contract - Protocol Treasury
+;; Holds premiums and reserves
+;; Manages payouts to Claims Processor
+;; Routes premium shares to vaults
+
+#include "../imports/stdlib.fc";
+
+;; Storage structure
+global slice owner_address;
+global int total_premiums_collected;
+global int total_payouts_made;
+global int reserve_balance;
+global slice claims_processor_address;
+global slice premium_distributor_address;
+global slice staking_pool_address;
+
+() load_data() impure {
+    slice ds = get_data().begin_parse();
+    owner_address = ds~load_msg_addr();
+    total_premiums_collected = ds~load_coins();
+    total_payouts_made = ds~load_coins();
+    reserve_balance = ds~load_coins();
+    claims_processor_address = ds~load_msg_addr();
+
+    ;; Load remaining addresses from reference cell
+    slice addresses_ref = ds~load_ref().begin_parse();
+    premium_distributor_address = addresses_ref~load_msg_addr();
+    staking_pool_address = addresses_ref~load_msg_addr();
+}
+
+() save_data() impure {
+    ;; Store extra addresses in reference cell to avoid overflow
+    cell addresses_ref = begin_cell()
+        .store_slice(premium_distributor_address)
+        .store_slice(staking_pool_address)
+        .end_cell();
+
+    set_data(begin_cell()
+        .store_slice(owner_address)
+        .store_coins(total_premiums_collected)
+        .store_coins(total_payouts_made)
+        .store_coins(reserve_balance)
+        .store_slice(claims_processor_address)
+        .store_ref(addresses_ref)
+        .end_cell());
+}
+
+() check_owner(slice sender_address) impure {
+    throw_unless(403, equal_slices_bits(sender_address, owner_address));
+}
+
+;; Receive premium from PolicyFactory
+() receive_premium(int policy_id, int amount, cell policy_data) impure {
+    total_premiums_collected += amount;
+    save_data();
+
+    ;; Forward to Premium Distributor for distribution
+    cell msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(premium_distributor_address)
+        .store_coins(amount)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(0x01, 32)  ;; op: distribute_premium
+        .store_coins(amount)
+        .store_uint(policy_id, 64)
+        .end_cell();
+
+    send_raw_message(msg, 1);
+
+    ;; Emit event
+    emit_log(0x50, begin_cell()
+        .store_uint(policy_id, 64)
+        .store_coins(amount)
+        .store_coins(total_premiums_collected)
+        .end_cell().begin_parse());
+}
+
+;; Receive protocol share (from Premium Distributor)
+() receive_protocol_share(int amount, int policy_id) impure {
+    ;; Split protocol share:
+    ;; - 60% to staking pool (for staker rewards)
+    ;; - 40% to reserve
+
+    int staker_amount = muldiv(amount, 60, 100);
+    int reserve_amount = amount - staker_amount;
+
+    ;; Send to staking pool
+    cell msg_staking = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(staking_pool_address)
+        .store_coins(staker_amount)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(0x06, 32)  ;; op: distribute_fees
+        .store_coins(staker_amount)
+        .end_cell();
+
+    send_raw_message(msg_staking, 1);
+
+    ;; Add to reserve
+    reserve_balance += reserve_amount;
+    save_data();
+
+    emit_log(0x51, begin_cell()
+        .store_uint(policy_id, 64)
+        .store_coins(staker_amount)
+        .store_coins(reserve_amount)
+        .end_cell().begin_parse());
+}
+
+;; Receive reserve share (from Premium Distributor)
+() receive_reserve_share(int amount, int policy_id) impure {
+    reserve_balance += amount;
+    save_data();
+
+    emit_log(0x52, begin_cell()
+        .store_uint(policy_id, 64)
+        .store_coins(amount)
+        .store_coins(reserve_balance)
+        .end_cell().begin_parse());
+}
+
+;; Process payout (called by ClaimsProcessor)
+() process_payout(slice sender_address, slice recipient, int amount) impure {
+    throw_unless(403, equal_slices_bits(sender_address, claims_processor_address));
+
+    ;; Check sufficient reserve
+    throw_unless(400, reserve_balance >= amount);
+
+    reserve_balance -= amount;
+    total_payouts_made += amount;
+    save_data();
+
+    ;; Send payout to recipient
+    cell msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(recipient)
+        .store_coins(amount)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .end_cell();
+
+    send_raw_message(msg, 1);
+
+    emit_log(0x53, begin_cell()
+        .store_slice(recipient)
+        .store_coins(amount)
+        .store_coins(total_payouts_made)
+        .end_cell().begin_parse());
+}
+
+;; Emergency withdraw (admin only)
+() emergency_withdraw(slice sender_address, slice to_address, int amount) impure {
+    check_owner(sender_address);
+
+    int available = get_balance().pair_first() - 100000000;  ;; Reserve gas
+    throw_unless(400, amount <= available);
+
+    cell msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(to_address)
+        .store_coins(amount)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .end_cell();
+
+    send_raw_message(msg, 1);
+}
+
+;; Admin functions
+() set_claims_processor(slice sender_address, slice new_address) impure {
+    check_owner(sender_address);
+    claims_processor_address = new_address;
+    save_data();
+}
+
+() set_premium_distributor(slice sender_address, slice new_address) impure {
+    check_owner(sender_address);
+    premium_distributor_address = new_address;
+    save_data();
+}
+
+() set_staking_pool(slice sender_address, slice new_address) impure {
+    check_owner(sender_address);
+    staking_pool_address = new_address;
+    save_data();
+}
+
+;; Get methods
+int get_total_premiums_collected() method_id {
+    load_data();
+    return total_premiums_collected;
+}
+
+int get_total_payouts_made() method_id {
+    load_data();
+    return total_payouts_made;
+}
+
+int get_reserve_balance() method_id {
+    load_data();
+    return reserve_balance;
+}
+
+slice get_claims_processor() method_id {
+    load_data();
+    return claims_processor_address;
+}
+
+(int, int, int) get_treasury_stats() method_id {
+    load_data();
+    return (total_premiums_collected, total_payouts_made, reserve_balance);
+}
+
+;; Recv internal
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) {
+        ;; Plain transfer adds to reserve
+        load_data();
+        reserve_balance += msg_value;
+        save_data();
+        return ();
+    }
+
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) {
+        return ();
+    }
+    slice sender_address = cs~load_msg_addr();
+
+    load_data();
+
+    int op = in_msg_body~load_uint(32);
+
+    if (op == 0x01) {  ;; receive_premium
+        int policy_id = in_msg_body~load_uint(64);
+        int amount = in_msg_body~load_coins();
+        cell policy_data = in_msg_body~load_ref();
+        receive_premium(policy_id, amount, policy_data);
+        return ();
+    }
+
+    if (op == 0x04) {  ;; receive_protocol_share
+        int amount = in_msg_body~load_coins();
+        int policy_id = in_msg_body~load_uint(64);
+        receive_protocol_share(amount, policy_id);
+        return ();
+    }
+
+    if (op == 0x05) {  ;; receive_reserve_share
+        int amount = in_msg_body~load_coins();
+        int policy_id = in_msg_body~load_uint(64);
+        receive_reserve_share(amount, policy_id);
+        return ();
+    }
+
+    if (op == 0x06) {  ;; process_payout
+        slice recipient = in_msg_body~load_msg_addr();
+        int amount = in_msg_body~load_coins();
+        process_payout(sender_address, recipient, amount);
+        return ();
+    }
+
+    if (op == 0x10) {  ;; set_claims_processor
+        slice new_address = in_msg_body~load_msg_addr();
+        set_claims_processor(sender_address, new_address);
+        return ();
+    }
+
+    if (op == 0x11) {  ;; set_premium_distributor
+        slice new_address = in_msg_body~load_msg_addr();
+        set_premium_distributor(sender_address, new_address);
+        return ();
+    }
+
+    if (op == 0x12) {  ;; set_staking_pool
+        slice new_address = in_msg_body~load_msg_addr();
+        set_staking_pool(sender_address, new_address);
+        return ();
+    }
+
+    if (op == 0x20) {  ;; emergency_withdraw
+        slice to_address = in_msg_body~load_msg_addr();
+        int amount = in_msg_body~load_coins();
+        emergency_withdraw(sender_address, to_address, amount);
+        return ();
+    }
+
+    throw(0xffff);
+}
+
+;; Note: emit_log() is now implemented in stdlib.fc
+;; Treasury uses the following event IDs for audit trail:
+;; 0x50: PremiumReceived
+;; 0x51: PayoutMade
+;; 0x52: ReserveWithdrawn
+;; 0x53: ReserveDeposited

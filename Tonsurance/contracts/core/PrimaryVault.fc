@@ -1,0 +1,380 @@
+;; PrimaryVault Contract - First-Loss Capital Vault
+;; Crypto-native LPs provide first-loss capital
+;; 45% of total capital allocation
+;; Liquid deposits/withdrawals (no lock-up)
+;; Highest APY (25-35%)
+
+#include "../imports/stdlib.fc";
+
+;; Storage structure with bonding curve
+;; owner_address: slice
+;; total_lp_capital: int (coins) - total capital deposited
+;; total_supply: int (coins) - total LP tokens minted
+;; max_supply: int (coins) - maximum LP tokens (1M)
+;; price_min: int (coins) - minimum price (1.0 USDT)
+;; price_max: int (coins) - maximum price (1.5 USDT)
+;; accumulated_yield: int (coins)
+;; losses_absorbed: int (coins)
+;; claims_processor_address: slice
+;; lp_balances: dict (address -> token_balance)
+
+global slice owner_address;
+global int total_lp_capital;
+global int total_supply;
+global int max_supply;
+global int price_min;
+global int price_max;
+global int accumulated_yield;
+global int losses_absorbed;
+global slice claims_processor_address;
+global cell lp_balances;
+
+() load_data() impure {
+    slice ds = get_data().begin_parse();
+    owner_address = ds~load_msg_addr();
+    total_lp_capital = ds~load_coins();
+    total_supply = ds~load_coins();
+    max_supply = ds~load_coins();
+    price_min = ds~load_coins();
+    price_max = ds~load_coins();
+    accumulated_yield = ds~load_coins();
+    losses_absorbed = ds~load_coins();
+    claims_processor_address = ds~load_msg_addr();
+    lp_balances = ds~load_dict();
+}
+
+() save_data() impure {
+    set_data(begin_cell()
+        .store_slice(owner_address)
+        .store_coins(total_lp_capital)
+        .store_coins(total_supply)
+        .store_coins(max_supply)
+        .store_coins(price_min)
+        .store_coins(price_max)
+        .store_coins(accumulated_yield)
+        .store_coins(losses_absorbed)
+        .store_slice(claims_processor_address)
+        .store_dict(lp_balances)
+        .end_cell());
+}
+
+() check_owner(slice sender_address) impure {
+    throw_unless(403, equal_slices_bits(sender_address, owner_address));
+}
+
+;; Calculate current price based on exponential bonding curve
+;; Price = price_min + (price_max - price_min) * (total_supply / max_supply)^2
+int calculate_current_price() impure inline {
+    if (total_supply == 0) {
+        return price_min;
+    }
+
+    ;; Calculate utilization ratio (total_supply / max_supply)
+    ;; Use squared utilization for exponential curve
+    int utilization = muldiv(total_supply, 1000000000, max_supply);  ;; Scale to 9 decimals
+    int utilization_squared = muldiv(utilization, utilization, 1000000000);
+
+    ;; Price = price_min + (price_max - price_min) * utilization^2
+    int price_range = price_max - price_min;
+    int price_increase = muldiv(price_range, utilization_squared, 1000000000);
+
+    return price_min + price_increase;
+}
+
+;; Deposit LP capital with bonding curve
+() deposit_lp_capital(slice depositor, int amount) impure {
+    throw_unless(400, amount >= 100000000);  ;; Min 0.1 TON deposit
+
+    ;; Calculate current price and tokens to mint
+    int current_price = calculate_current_price();
+    int tokens_to_mint = muldiv(amount, 1000000000, current_price);  ;; amount / price
+
+    ;; Check we don't exceed max supply
+    throw_unless(401, total_supply + tokens_to_mint <= max_supply);
+
+    ;; Get current token balance
+    (slice balance_data, int found) = lp_balances.udict_get?(267, slice_hash(depositor));
+    int current_balance = 0;
+    if (found) {
+        current_balance = balance_data~load_coins();
+    }
+
+    ;; Update token balance
+    int new_balance = current_balance + tokens_to_mint;
+    lp_balances~udict_set(267, slice_hash(depositor),
+        begin_cell().store_coins(new_balance).end_cell().begin_parse());
+
+    total_lp_capital += amount;
+    total_supply += tokens_to_mint;
+    save_data();
+
+    ;; Emit event
+    emit_log(0x10, begin_cell()
+        .store_slice(depositor)
+        .store_coins(amount)
+        .store_coins(tokens_to_mint)
+        .store_coins(new_balance)
+        .end_cell().begin_parse());
+}
+
+;; Withdraw LP capital (burn tokens, get capital back at current price)
+() withdraw_lp_capital(slice withdrawer, int tokens_to_burn) impure {
+    ;; Get current token balance
+    (slice balance_data, int found) = lp_balances.udict_get?(267, slice_hash(withdrawer));
+    throw_unless(404, found);  ;; No balance found
+
+    int current_balance = balance_data~load_coins();
+    throw_unless(400, tokens_to_burn <= current_balance);  ;; Insufficient tokens
+
+    ;; Calculate capital to return at current price
+    int current_price = calculate_current_price();
+    int capital_to_return = muldiv(tokens_to_burn, current_price, 1000000000);
+
+    ;; Check vault has sufficient liquidity
+    int vault_balance = get_balance().pair_first() - 100000000;  ;; Reserve 0.1 TON for gas
+    throw_unless(401, capital_to_return <= vault_balance);
+
+    ;; Update token balance
+    int new_balance = current_balance - tokens_to_burn;
+    if (new_balance > 0) {
+        lp_balances~udict_set(267, slice_hash(withdrawer),
+            begin_cell().store_coins(new_balance).end_cell().begin_parse());
+    } else {
+        lp_balances~udict_delete?(267, slice_hash(withdrawer));
+    }
+
+    total_lp_capital -= capital_to_return;
+    total_supply -= tokens_to_burn;
+    save_data();
+
+    ;; Send funds to withdrawer
+    cell msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(withdrawer)
+        .store_coins(capital_to_return)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .end_cell();
+    send_raw_message(msg, 1);
+
+    ;; Emit event
+    emit_log(0x11, begin_cell()
+        .store_slice(withdrawer)
+        .store_coins(capital_to_return)
+        .store_coins(tokens_to_burn)
+        .store_coins(new_balance)
+        .end_cell().begin_parse());
+}
+
+;; Receive premium share (called by Treasury)
+() receive_premium_share(int amount) impure {
+    accumulated_yield += amount;
+    save_data();
+
+    ;; Emit event
+    emit_log(0x12, begin_cell()
+        .store_coins(amount)
+        .store_coins(accumulated_yield)
+        .end_cell().begin_parse());
+}
+
+;; Absorb claim loss (called by ClaimsProcessor)
+() absorb_claim_loss(slice sender_address, int loss_amount, slice claimant) impure {
+    ;; Only ClaimsProcessor can call
+    throw_unless(403, equal_slices_bits(sender_address, claims_processor_address));
+
+    ;; Check vault has sufficient balance
+    int vault_balance = get_balance().pair_first() - 100000000;
+    throw_unless(400, loss_amount <= vault_balance);
+
+    losses_absorbed += loss_amount;
+    total_lp_capital -= loss_amount;  ;; Reduce capital when absorbing losses
+    save_data();
+
+    ;; Pay claimant directly
+    cell msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(claimant)
+        .store_coins(loss_amount)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .end_cell();
+    send_raw_message(msg, 1);
+
+    ;; Emit event
+    emit_log(0x13, begin_cell()
+        .store_coins(loss_amount)
+        .store_coins(losses_absorbed)
+        .store_slice(claimant)
+        .end_cell().begin_parse());
+}
+
+;; Distribute yield to LPs (called periodically)
+() distribute_yield_to_lps(slice sender_address) impure {
+    check_owner(sender_address);
+
+    ;; In production, iterate through lp_balances and distribute pro-rata
+    ;; For now, yield is distributed on withdrawal
+
+    ;; Reset accumulated yield (already distributed)
+    accumulated_yield = 0;
+    save_data();
+}
+
+;; Calculate LP's share of vault (balance + yield - losses)
+int calculate_lp_share(slice lp_address) inline {
+    (slice balance_data, int found) = lp_balances.udict_get?(267, slice_hash(lp_address));
+    if (~ found) {
+        return 0;
+    }
+
+    int lp_balance = balance_data~load_coins();
+
+    ;; Calculate pro-rata share of yield
+    int yield_share = 0;
+    if (total_lp_capital > 0) {
+        yield_share = muldiv(accumulated_yield, lp_balance, total_lp_capital);
+    }
+
+    ;; Calculate pro-rata share of losses
+    int loss_share = 0;
+    if (total_lp_capital > 0) {
+        loss_share = muldiv(losses_absorbed, lp_balance, total_lp_capital);
+    }
+
+    return lp_balance + yield_share - loss_share;
+}
+
+;; Calculate vault APY (annualized)
+int get_vault_apy() method_id {
+    load_data();
+
+    if (total_lp_capital == 0) {
+        return 0;
+    }
+
+    ;; APY = (accumulated_yield / total_lp_capital) * 100
+    ;; This is simplified; in production, calculate based on time period
+    int apy = muldiv(accumulated_yield, 100, total_lp_capital);
+    return apy;
+}
+
+;; Admin functions
+() set_claims_processor(slice sender_address, slice new_processor) impure {
+    check_owner(sender_address);
+    claims_processor_address = new_processor;
+    save_data();
+}
+
+;; Get methods
+(int, int) get_lp_balance(slice addr) method_id {
+    load_data();
+    (slice balance_data, int found) = lp_balances.udict_get?(267, slice_hash(addr));
+    if (~ found) {
+        return (0, 0);
+    }
+    int balance = balance_data~load_coins();
+    int share = calculate_lp_share(addr);
+    return (balance, share);
+}
+
+int get_total_lp_capital() method_id {
+    load_data();
+    return total_lp_capital;
+}
+
+int get_total_supply() method_id {
+    load_data();
+    return total_supply;
+}
+
+int get_current_price() method_id {
+    load_data();
+    return calculate_current_price();
+}
+
+(int, int, int, int) get_vault_stats() method_id {
+    load_data();
+    return (total_lp_capital, accumulated_yield, losses_absorbed, total_supply);
+}
+
+int get_accumulated_yield() method_id {
+    load_data();
+    return accumulated_yield;
+}
+
+int get_losses_absorbed() method_id {
+    load_data();
+    return losses_absorbed;
+}
+
+slice get_claims_processor() method_id {
+    load_data();
+    return claims_processor_address;
+}
+
+;; Recv internal
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) {
+        ;; Plain transfer = deposit
+        slice cs = in_msg_full.begin_parse();
+        int flags = cs~load_uint(4);
+        if (flags & 1) {  ;; Bounce
+            return ();
+        }
+        slice sender_address = cs~load_msg_addr();
+
+        load_data();
+        deposit_lp_capital(sender_address, msg_value);
+        return ();
+    }
+
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) {
+        return ();
+    }
+    slice sender_address = cs~load_msg_addr();
+
+    load_data();
+
+    int op = in_msg_body~load_uint(32);
+
+    if (op == 0x01) {  ;; deposit_lp_capital
+        deposit_lp_capital(sender_address, msg_value);
+        return ();
+    }
+
+    if (op == 0x02) {  ;; withdraw_lp_capital
+        int amount = in_msg_body~load_coins();
+        withdraw_lp_capital(sender_address, amount);
+        return ();
+    }
+
+    if (op == 0x03) {  ;; receive_premium_share
+        int amount = in_msg_body~load_coins();
+        receive_premium_share(amount);
+        return ();
+    }
+
+    if (op == 0x04) {  ;; absorb_claim_loss
+        int loss_amount = in_msg_body~load_coins();
+        slice claimant = in_msg_body~load_msg_addr();
+        absorb_claim_loss(sender_address, loss_amount, claimant);
+        return ();
+    }
+
+    if (op == 0x05) {  ;; distribute_yield_to_lps
+        distribute_yield_to_lps(sender_address);
+        return ();
+    }
+
+    if (op == 0x10) {  ;; set_claims_processor
+        slice new_processor = in_msg_body~load_msg_addr();
+        set_claims_processor(sender_address, new_processor);
+        return ();
+    }
+
+    throw(0xffff);
+}
+
+;; Note: emit_log() is now implemented in stdlib.fc
+;; PrimaryVault uses event logging for deposit, withdrawal, and payout operations

@@ -1,0 +1,470 @@
+;; PolicyManager.fc - Core Insurance Policy Management Contract
+;;
+;; Manages the full lifecycle of parametric insurance policies:
+;; - Policy creation and minting
+;; - Trigger monitoring
+;; - Payout calculations
+;; - Settlement execution
+;;
+;; Key Features:
+;; - Three-party structure (buyer, beneficiary, vault)
+;; - NFT-based policy ownership
+;; - Parametric triggers (oracle-based)
+;; - Linear payout formula between trigger and floor
+;; - 4-hour confirmation period for sustained depegs
+
+#include "imports/stdlib.fc";
+
+;; Storage layout
+;; policy_count:uint64
+;; vault_address:MsgAddress
+;; oracle_address:MsgAddress
+;; min_confirmation_period:uint32 (seconds)
+
+global int storage::policy_count;
+global slice storage::vault_address;
+global slice storage::oracle_address;
+global int storage::min_confirmation_period;
+
+;; Policy structure (stored in separate cells)
+;; policy_id:uint64
+;; buyer:MsgAddress
+;; beneficiary:MsgAddress
+;; asset_type:uint8 (0=USDC, 1=USDT, 2=DAI, 3=FRAX, 4=BUSD)
+;; coverage_amount:Coins (in nanotons equivalent)
+;; premium_amount:Coins
+;; trigger_price:uint32 (in basis points, e.g., 9700 = $0.97)
+;; floor_price:uint32 (in basis points)
+;; start_time:uint32
+;; expiry_time:uint32
+;; status:uint8 (0=active, 1=triggered, 2=paid, 3=expired, 4=cancelled)
+;; trigger_timestamp:uint32 (when trigger first detected)
+;; confirmed:bool
+
+const int STATUS_ACTIVE = 0;
+const int STATUS_TRIGGERED = 1;
+const int STATUS_PAID = 2;
+const int STATUS_EXPIRED = 3;
+const int STATUS_CANCELLED = 4;
+
+const int ASSET_USDC = 0;
+const int ASSET_USDT = 1;
+const int ASSET_DAI = 2;
+const int ASSET_FRAX = 3;
+const int ASSET_BUSD = 4;
+
+const int BASIS_POINTS = 10000; ;; 100.00%
+const int FOUR_HOURS = 14400; ;; 4 hours in seconds
+
+const int OP_CREATE_POLICY = 0x01;
+const int OP_CHECK_TRIGGER = 0x02;
+const int OP_EXECUTE_PAYOUT = 0x03;
+const int OP_CANCEL_POLICY = 0x04;
+const int OP_UPDATE_ORACLE = 0x05;
+
+;; Load storage
+() load_data() impure {
+    var ds = get_data().begin_parse();
+
+    storage::policy_count = ds~load_uint(64);
+    storage::vault_address = ds~load_msg_addr();
+    storage::oracle_address = ds~load_msg_addr();
+    storage::min_confirmation_period = ds~load_uint(32);
+
+    ds.end_parse();
+}
+
+;; Save storage
+() save_data() impure {
+    set_data(
+        begin_cell()
+            .store_uint(storage::policy_count, 64)
+            .store_slice(storage::vault_address)
+            .store_slice(storage::oracle_address)
+            .store_uint(storage::min_confirmation_period, 32)
+        .end_cell()
+    );
+}
+
+;; Calculate policy storage address
+slice get_policy_address(int policy_id) {
+    return begin_cell()
+        .store_uint(policy_id, 64)
+        .end_cell()
+        .begin_parse();
+}
+
+;; Load policy from storage
+(int, slice, slice, int, int, int, int, int, int, int, int, int, int) load_policy(int policy_id) {
+    var policy_cell = get_data_from_key(policy_id);
+
+    if (cell_null?(policy_cell)) {
+        return (0, null(), null(), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    }
+
+    var ps = policy_cell.begin_parse();
+
+    int policy_id = ps~load_uint(64);
+    slice buyer = ps~load_msg_addr();
+    slice beneficiary = ps~load_msg_addr();
+    int asset_type = ps~load_uint(8);
+    int coverage_amount = ps~load_coins();
+    int premium_amount = ps~load_coins();
+    int trigger_price = ps~load_uint(32);
+    int floor_price = ps~load_uint(32);
+    int start_time = ps~load_uint(32);
+    int expiry_time = ps~load_uint(32);
+    int status = ps~load_uint(8);
+    int trigger_timestamp = ps~load_uint(32);
+    int confirmed = ps~load_uint(1);
+
+    ps.end_parse();
+
+    return (policy_id, buyer, beneficiary, asset_type, coverage_amount, premium_amount,
+            trigger_price, floor_price, start_time, expiry_time, status,
+            trigger_timestamp, confirmed);
+}
+
+;; Save policy to storage
+() save_policy(int policy_id, slice buyer, slice beneficiary, int asset_type,
+               int coverage_amount, int premium_amount, int trigger_price,
+               int floor_price, int start_time, int expiry_time, int status,
+               int trigger_timestamp, int confirmed) impure {
+
+    var policy_cell = begin_cell()
+        .store_uint(policy_id, 64)
+        .store_slice(buyer)
+        .store_slice(beneficiary)
+        .store_uint(asset_type, 8)
+        .store_coins(coverage_amount)
+        .store_coins(premium_amount)
+        .store_uint(trigger_price, 32)
+        .store_uint(floor_price, 32)
+        .store_uint(start_time, 32)
+        .store_uint(expiry_time, 32)
+        .store_uint(status, 8)
+        .store_uint(trigger_timestamp, 32)
+        .store_uint(confirmed, 1)
+    .end_cell();
+
+    set_data_to_key(policy_id, policy_cell);
+}
+
+;; Calculate payout amount based on current price
+;; Formula: payout = coverage × (trigger - current) / (trigger - floor)
+;; Clamped between 0 and coverage_amount
+int calculate_payout(int coverage_amount, int trigger_price, int floor_price, int current_price) {
+    ;; If price >= trigger, no payout
+    if (current_price >= trigger_price) {
+        return 0;
+    }
+
+    ;; If price <= floor, full payout
+    if (current_price <= floor_price) {
+        return coverage_amount;
+    }
+
+    ;; Linear interpolation
+    ;; payout_ratio = (trigger - current) / (trigger - floor)
+    int numerator = (trigger_price - current_price) * coverage_amount;
+    int denominator = trigger_price - floor_price;
+
+    return numerator / denominator;
+}
+
+;; Check if policy is expired
+int is_expired(int expiry_time) inline {
+    return now() > expiry_time;
+}
+
+;; Check if trigger is confirmed (sustained for min period)
+int is_trigger_confirmed(int trigger_timestamp, int min_confirmation_period) inline {
+    if (trigger_timestamp == 0) {
+        return false;
+    }
+    return (now() - trigger_timestamp) >= min_confirmation_period;
+}
+
+;; Mint policy NFT to beneficiary
+() mint_policy_nft(slice beneficiary, int policy_id) impure {
+    ;; Send NFT mint message to beneficiary
+    var msg = begin_cell()
+        .store_uint(0x18, 6)  ;; nobounce
+        .store_slice(beneficiary)
+        .store_coins(0)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(0x1234, 32) ;; OP_MINT_NFT
+        .store_uint(policy_id, 64)
+    .end_cell();
+
+    send_raw_message(msg, 1);
+}
+
+;; Send premium to vault
+() transfer_premium_to_vault(int premium_amount) impure {
+    var msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(storage::vault_address)
+        .store_coins(premium_amount)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(0x5678, 32) ;; OP_RECEIVE_PREMIUM
+    .end_cell();
+
+    send_raw_message(msg, 1);
+}
+
+;; Request payout from vault
+() request_payout_from_vault(int policy_id, slice beneficiary, int payout_amount) impure {
+    var msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(storage::vault_address)
+        .store_coins(0)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(0x9ABC, 32) ;; OP_REQUEST_PAYOUT
+        .store_uint(policy_id, 64)
+        .store_slice(beneficiary)
+        .store_coins(payout_amount)
+    .end_cell();
+
+    send_raw_message(msg, 1);
+}
+
+;; ========== MESSAGE HANDLERS ==========
+
+;; Create new insurance policy
+() handle_create_policy(slice sender, slice in_msg) impure {
+    slice buyer = sender;
+    slice beneficiary = in_msg~load_msg_addr();
+    int asset_type = in_msg~load_uint(8);
+    int coverage_amount = in_msg~load_coins();
+    int premium_amount = in_msg~load_coins();
+    int trigger_price = in_msg~load_uint(32);
+    int floor_price = in_msg~load_uint(32);
+    int duration_seconds = in_msg~load_uint(32);
+
+    ;; Validate inputs
+    throw_unless(100, coverage_amount > 0);
+    throw_unless(101, premium_amount > 0);
+    throw_unless(102, trigger_price > floor_price);
+    throw_unless(103, trigger_price < BASIS_POINTS); ;; Must be < $1.00
+    throw_unless(104, floor_price > 0);
+    throw_unless(105, duration_seconds > 0);
+    throw_unless(106, duration_seconds <= 31536000); ;; Max 1 year
+
+    ;; Check premium payment received
+    int msg_value = in_msg~load_coins();
+    throw_unless(107, msg_value >= premium_amount);
+
+    ;; Create policy
+    storage::policy_count += 1;
+    int policy_id = storage::policy_count;
+
+    int start_time = now();
+    int expiry_time = start_time + duration_seconds;
+
+    ;; Save policy
+    save_policy(
+        policy_id,
+        buyer,
+        beneficiary,
+        asset_type,
+        coverage_amount,
+        premium_amount,
+        trigger_price,
+        floor_price,
+        start_time,
+        expiry_time,
+        STATUS_ACTIVE,
+        0, ;; trigger_timestamp
+        false ;; confirmed
+    );
+
+    ;; Mint NFT to beneficiary
+    mint_policy_nft(beneficiary, policy_id);
+
+    ;; Transfer premium to vault
+    transfer_premium_to_vault(premium_amount);
+
+    ;; Update storage
+    save_data();
+}
+
+;; Check trigger condition (called by oracle or keeper)
+() handle_check_trigger(slice sender, slice in_msg) impure {
+    ;; Only oracle can trigger
+    throw_unless(200, equal_slices(sender, storage::oracle_address));
+
+    int policy_id = in_msg~load_uint(64);
+    int current_price = in_msg~load_uint(32); ;; in basis points
+
+    ;; Load policy
+    var (pid, buyer, beneficiary, asset_type, coverage_amount, premium_amount,
+         trigger_price, floor_price, start_time, expiry_time, status,
+         trigger_timestamp, confirmed) = load_policy(policy_id);
+
+    throw_unless(201, pid > 0); ;; Policy exists
+    throw_unless(202, status == STATUS_ACTIVE); ;; Must be active
+    throw_unless(203, ~ is_expired(expiry_time)); ;; Not expired
+
+    ;; Check if trigger condition met
+    if (current_price < trigger_price) {
+        if (trigger_timestamp == 0) {
+            ;; First time trigger detected
+            trigger_timestamp = now();
+            status = STATUS_TRIGGERED;
+        }
+
+        ;; Check if confirmed (sustained for 4 hours)
+        if (is_trigger_confirmed(trigger_timestamp, storage::min_confirmation_period)) {
+            confirmed = true;
+        }
+
+        ;; Save updated policy
+        save_policy(pid, buyer, beneficiary, asset_type, coverage_amount, premium_amount,
+                   trigger_price, floor_price, start_time, expiry_time, status,
+                   trigger_timestamp, confirmed);
+    } else {
+        ;; Price recovered, reset trigger
+        if (trigger_timestamp > 0) {
+            trigger_timestamp = 0;
+            status = STATUS_ACTIVE;
+            confirmed = false;
+
+            save_policy(pid, buyer, beneficiary, asset_type, coverage_amount, premium_amount,
+                       trigger_price, floor_price, start_time, expiry_time, status,
+                       trigger_timestamp, confirmed);
+        }
+    }
+}
+
+;; Execute payout (called after confirmation period)
+() handle_execute_payout(slice sender, slice in_msg) impure {
+    int policy_id = in_msg~load_uint(64);
+    int current_price = in_msg~load_uint(32);
+
+    ;; Load policy
+    var (pid, buyer, beneficiary, asset_type, coverage_amount, premium_amount,
+         trigger_price, floor_price, start_time, expiry_time, status,
+         trigger_timestamp, confirmed) = load_policy(policy_id);
+
+    throw_unless(300, pid > 0); ;; Policy exists
+    throw_unless(301, status == STATUS_TRIGGERED); ;; Must be triggered
+    throw_unless(302, confirmed); ;; Must be confirmed
+    throw_unless(303, ~ is_expired(expiry_time)); ;; Not expired
+
+    ;; Calculate payout
+    int payout_amount = calculate_payout(coverage_amount, trigger_price, floor_price, current_price);
+
+    throw_unless(304, payout_amount > 0); ;; Must have payout
+
+    ;; Request payout from vault
+    request_payout_from_vault(policy_id, beneficiary, payout_amount);
+
+    ;; Update policy status
+    status = STATUS_PAID;
+    save_policy(pid, buyer, beneficiary, asset_type, coverage_amount, premium_amount,
+               trigger_price, floor_price, start_time, expiry_time, status,
+               trigger_timestamp, confirmed);
+}
+
+;; Cancel policy (only before expiry, returns partial premium)
+() handle_cancel_policy(slice sender, slice in_msg) impure {
+    int policy_id = in_msg~load_uint(64);
+
+    ;; Load policy
+    var (pid, buyer, beneficiary, asset_type, coverage_amount, premium_amount,
+         trigger_price, floor_price, start_time, expiry_time, status,
+         trigger_timestamp, confirmed) = load_policy(policy_id);
+
+    throw_unless(400, pid > 0);
+    throw_unless(401, equal_slices(sender, buyer)); ;; Only buyer can cancel
+    throw_unless(402, status == STATUS_ACTIVE);
+    throw_unless(403, ~ is_expired(expiry_time));
+
+    ;; Cancel policy
+    status = STATUS_CANCELLED;
+    save_policy(pid, buyer, beneficiary, asset_type, coverage_amount, premium_amount,
+               trigger_price, floor_price, start_time, expiry_time, status,
+               trigger_timestamp, confirmed);
+}
+
+;; ========== MAIN RECEIVER ==========
+
+() recv_internal(int msg_value, cell in_msg_cell, slice in_msg) impure {
+    ;; Parse message
+    var cs = in_msg_cell.begin_parse();
+    var flags = cs~load_uint(4);
+    slice sender = cs~load_msg_addr();
+
+    ;; Load storage
+    load_data();
+
+    ;; Parse operation
+    int op = in_msg~load_uint(32);
+
+    if (op == OP_CREATE_POLICY) {
+        handle_create_policy(sender, in_msg);
+        return ();
+    }
+
+    if (op == OP_CHECK_TRIGGER) {
+        handle_check_trigger(sender, in_msg);
+        return ();
+    }
+
+    if (op == OP_EXECUTE_PAYOUT) {
+        handle_execute_payout(sender, in_msg);
+        return ();
+    }
+
+    if (op == OP_CANCEL_POLICY) {
+        handle_cancel_policy(sender, in_msg);
+        return ();
+    }
+
+    throw(0xffff); ;; Unknown operation
+}
+
+;; ========== GET METHODS ==========
+
+;; Get policy details
+(int, slice, slice, int, int, int, int, int, int, int, int, int, int) get_policy(int policy_id) method_id {
+    load_data();
+    return load_policy(policy_id);
+}
+
+;; Get policy count
+int get_policy_count() method_id {
+    load_data();
+    return storage::policy_count;
+}
+
+;; Calculate expected payout for a policy at given price
+int calculate_expected_payout(int policy_id, int current_price) method_id {
+    load_data();
+
+    var (pid, buyer, beneficiary, asset_type, coverage_amount, premium_amount,
+         trigger_price, floor_price, start_time, expiry_time, status,
+         trigger_timestamp, confirmed) = load_policy(policy_id);
+
+    if (pid == 0) {
+        return 0;
+    }
+
+    return calculate_payout(coverage_amount, trigger_price, floor_price, current_price);
+}
+
+;; Check if policy is active
+int is_policy_active(int policy_id) method_id {
+    load_data();
+
+    var (pid, buyer, beneficiary, asset_type, coverage_amount, premium_amount,
+         trigger_price, floor_price, start_time, expiry_time, status,
+         trigger_timestamp, confirmed) = load_policy(policy_id);
+
+    if (pid == 0) {
+        return false;
+    }
+
+    return (status == STATUS_ACTIVE) & (~ is_expired(expiry_time));
+}

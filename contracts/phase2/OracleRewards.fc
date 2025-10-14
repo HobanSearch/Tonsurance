@@ -1,0 +1,337 @@
+;; OracleRewards Contract - Oracle Compensation System
+;; Receives 3% of premiums from AdvancedPremiumDistributor
+;; Distributes rewards to price oracle keepers
+;; Rewards based on update frequency and accuracy
+;; Penalty mechanism for stale/inaccurate data
+
+#include "../imports/stdlib.fc";
+
+;; Storage structure
+global slice owner_address;
+global slice premium_distributor_address;
+global cell oracle_registry;  ;; oracle_address_hash -> (total_earned, update_count, accuracy_score)
+global cell pending_rewards;  ;; oracle_address_hash -> pending_amount
+global int total_rewards_distributed;
+global int total_rewards_pending;
+global int min_update_interval;  ;; Minimum time between updates to earn reward
+global int accuracy_threshold;  ;; Minimum accuracy score (basis points)
+
+;; Reward parameters
+const int REWARD_PER_UPDATE = 100000000;  ;; 0.1 TON base reward
+const int ACCURACY_BONUS_MULTIPLIER = 2;  ;; 2x bonus for high accuracy
+const int STALE_DATA_PENALTY = 5000;  ;; 50% penalty for stale data (basis points)
+const int BASIS_POINTS = 10000;
+
+() load_data() impure {
+    slice ds = get_data().begin_parse();
+    owner_address = ds~load_msg_addr();
+    premium_distributor_address = ds~load_msg_addr();
+    oracle_registry = ds~load_dict();
+    pending_rewards = ds~load_dict();
+    total_rewards_distributed = ds~load_coins();
+    total_rewards_pending = ds~load_coins();
+    min_update_interval = ds~load_uint(32);
+    accuracy_threshold = ds~load_uint(16);
+}
+
+() save_data() impure {
+    set_data(begin_cell()
+        .store_slice(owner_address)
+        .store_slice(premium_distributor_address)
+        .store_dict(oracle_registry)
+        .store_dict(pending_rewards)
+        .store_coins(total_rewards_distributed)
+        .store_coins(total_rewards_pending)
+        .store_uint(min_update_interval, 32)
+        .store_uint(accuracy_threshold, 16)
+        .end_cell());
+}
+
+() check_owner(slice sender_address) impure {
+    throw_unless(403, equal_slices_bits(sender_address, owner_address));
+}
+
+() check_distributor(slice sender_address) impure {
+    throw_unless(403, equal_slices_bits(sender_address, premium_distributor_address));
+}
+
+;; Receive oracle fee share from Premium Distributor
+() distribute_oracle_fee(slice sender_address, int amount) impure {
+    check_distributor(sender_address);
+
+    ;; Add to pending rewards pool
+    total_rewards_pending += amount;
+    save_data();
+
+    ;; Emit event
+    emit_log(0x90, begin_cell()
+        .store_coins(amount)
+        .store_coins(total_rewards_pending)
+        .end_cell().begin_parse());
+}
+
+;; Register oracle keeper
+() register_oracle(slice sender_address, slice oracle_address) impure {
+    check_owner(sender_address);
+
+    int oracle_hash = slice_hash(oracle_address);
+
+    ;; Initialize oracle stats
+    oracle_registry~udict_set(267, oracle_hash,
+        begin_cell()
+            .store_coins(0)  ;; total_earned
+            .store_uint(0, 32)  ;; update_count
+            .store_uint(10000, 16)  ;; accuracy_score (100% default)
+            .store_uint(0, 32)  ;; last_update_time
+            .end_cell().begin_parse());
+
+    save_data();
+
+    emit_log(0x91, begin_cell()
+        .store_slice(oracle_address)
+        .end_cell().begin_parse());
+}
+
+;; Record oracle update and calculate reward
+() record_oracle_update(
+    slice sender_address,
+    slice oracle_address,
+    int accuracy_score,
+    int is_stale
+) impure {
+    throw_unless(403, equal_slices_bits(sender_address, oracle_address));
+
+    int oracle_hash = slice_hash(oracle_address);
+    (slice oracle_data, int found) = oracle_registry.udict_get?(267, oracle_hash);
+    throw_unless(404, found);
+
+    ;; Parse current stats
+    int total_earned = oracle_data~load_coins();
+    int update_count = oracle_data~load_uint(32);
+    int prev_accuracy = oracle_data~load_uint(16);
+    int last_update_time = oracle_data~load_uint(32);
+
+    ;; Check update interval
+    int time_since_last = now() - last_update_time;
+    throw_unless(410, time_since_last >= min_update_interval);
+
+    ;; Calculate reward
+    int base_reward = REWARD_PER_UPDATE;
+    int final_reward = base_reward;
+
+    ;; Accuracy bonus
+    if (accuracy_score >= accuracy_threshold) {
+        final_reward = muldiv(final_reward, ACCURACY_BONUS_MULTIPLIER, 1);
+    }
+
+    ;; Stale data penalty
+    if (is_stale) {
+        final_reward = muldiv(final_reward, BASIS_POINTS - STALE_DATA_PENALTY, BASIS_POINTS);
+    }
+
+    ;; Check sufficient pending rewards
+    throw_unless(411, total_rewards_pending >= final_reward);
+
+    ;; Update oracle stats
+    update_count += 1;
+    total_earned += final_reward;
+
+    oracle_registry~udict_set(267, oracle_hash,
+        begin_cell()
+            .store_coins(total_earned)
+            .store_uint(update_count, 32)
+            .store_uint(accuracy_score, 16)
+            .store_uint(now(), 32)
+            .end_cell().begin_parse());
+
+    ;; Add to pending rewards for oracle
+    (slice pending_data, int has_pending) = pending_rewards.udict_get?(267, oracle_hash);
+    int pending_amount = 0;
+    if (has_pending) {
+        pending_amount = pending_data~load_coins();
+    }
+    pending_amount += final_reward;
+
+    pending_rewards~udict_set(267, oracle_hash,
+        begin_cell().store_coins(pending_amount).end_cell().begin_parse());
+
+    total_rewards_pending -= final_reward;
+    save_data();
+
+    emit_log(0x92, begin_cell()
+        .store_slice(oracle_address)
+        .store_coins(final_reward)
+        .store_uint(accuracy_score, 16)
+        .store_uint(is_stale, 1)
+        .end_cell().begin_parse());
+}
+
+;; Claim pending rewards
+() claim_rewards(slice sender_address, slice oracle_address) impure {
+    int oracle_hash = slice_hash(oracle_address);
+
+    ;; Check sender is oracle
+    throw_unless(403, equal_slices_bits(sender_address, oracle_address));
+
+    ;; Get pending rewards
+    (slice pending_data, int found) = pending_rewards.udict_get?(267, oracle_hash);
+    throw_unless(404, found);
+
+    int pending_amount = pending_data~load_coins();
+    throw_unless(400, pending_amount > 0);
+
+    ;; Clear pending rewards
+    pending_rewards~udict_delete?(267, oracle_hash);
+
+    total_rewards_distributed += pending_amount;
+    save_data();
+
+    ;; Send payment
+    cell msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(oracle_address)
+        .store_coins(pending_amount)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(0x09, 32)  ;; op: oracle_reward_claimed
+        .store_coins(pending_amount)
+        .end_cell();
+
+    send_raw_message(msg, 1);
+
+    emit_log(0x93, begin_cell()
+        .store_slice(oracle_address)
+        .store_coins(pending_amount)
+        .end_cell().begin_parse());
+}
+
+;; Admin: Set premium distributor
+() set_premium_distributor(slice sender_address, slice new_address) impure {
+    check_owner(sender_address);
+    premium_distributor_address = new_address;
+    save_data();
+}
+
+;; Admin: Set min update interval
+() set_min_update_interval(slice sender_address, int new_interval) impure {
+    check_owner(sender_address);
+    min_update_interval = new_interval;
+    save_data();
+}
+
+;; Admin: Set accuracy threshold
+() set_accuracy_threshold(slice sender_address, int new_threshold) impure {
+    check_owner(sender_address);
+    throw_unless(400, (new_threshold >= 0) & (new_threshold <= 10000));
+    accuracy_threshold = new_threshold;
+    save_data();
+}
+
+;; Get methods
+(int, int, int) get_oracle_stats(slice oracle_address) method_id {
+    load_data();
+    int oracle_hash = slice_hash(oracle_address);
+    (slice oracle_data, int found) = oracle_registry.udict_get?(267, oracle_hash);
+
+    if (~ found) {
+        return (0, 0, 0);
+    }
+
+    int total_earned = oracle_data~load_coins();
+    int update_count = oracle_data~load_uint(32);
+    int accuracy_score = oracle_data~load_uint(16);
+
+    return (total_earned, update_count, accuracy_score);
+}
+
+int get_pending_rewards(slice oracle_address) method_id {
+    load_data();
+    int oracle_hash = slice_hash(oracle_address);
+    (slice pending_data, int found) = pending_rewards.udict_get?(267, oracle_hash);
+
+    if (~ found) {
+        return 0;
+    }
+
+    return pending_data~load_coins();
+}
+
+(int, int) get_rewards_summary() method_id {
+    load_data();
+    return (total_rewards_distributed, total_rewards_pending);
+}
+
+int get_min_update_interval() method_id {
+    load_data();
+    return min_update_interval;
+}
+
+int get_accuracy_threshold() method_id {
+    load_data();
+    return accuracy_threshold;
+}
+
+;; Recv internal
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) {
+        return ();
+    }
+
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) {
+        return ();
+    }
+    slice sender_address = cs~load_msg_addr();
+
+    load_data();
+
+    int op = in_msg_body~load_uint(32);
+
+    if (op == 0x04) {  ;; distribute_oracle_fee
+        int amount = in_msg_body~load_coins();
+        distribute_oracle_fee(sender_address, amount);
+        return ();
+    }
+
+    if (op == 0x01) {  ;; register_oracle
+        slice oracle_address = in_msg_body~load_msg_addr();
+        register_oracle(sender_address, oracle_address);
+        return ();
+    }
+
+    if (op == 0x02) {  ;; record_oracle_update
+        slice oracle_address = in_msg_body~load_msg_addr();
+        int accuracy_score = in_msg_body~load_uint(16);
+        int is_stale = in_msg_body~load_uint(1);
+        record_oracle_update(sender_address, oracle_address, accuracy_score, is_stale);
+        return ();
+    }
+
+    if (op == 0x03) {  ;; claim_rewards
+        claim_rewards(sender_address, sender_address);
+        return ();
+    }
+
+    if (op == 0x10) {  ;; set_premium_distributor
+        slice new_address = in_msg_body~load_msg_addr();
+        set_premium_distributor(sender_address, new_address);
+        return ();
+    }
+
+    if (op == 0x11) {  ;; set_min_update_interval
+        int new_interval = in_msg_body~load_uint(32);
+        set_min_update_interval(sender_address, new_interval);
+        return ();
+    }
+
+    if (op == 0x12) {  ;; set_accuracy_threshold
+        int new_threshold = in_msg_body~load_uint(16);
+        set_accuracy_threshold(sender_address, new_threshold);
+        return ();
+    }
+
+    throw(0xffff);
+}
+
+;; Note: emit_log() is now implemented in stdlib.fc
+;; OracleRewards uses event logging for oracle reward operations

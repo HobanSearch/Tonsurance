@@ -1,0 +1,5 @@
+(library
+ (name integration)
+ (public_name tonsurance.integration)
+ (libraries core types math caqti caqti-lwt caqti-driver-postgresql lwt lwt.unix cohttp cohttp-lwt-unix yojson logs logs.lwt)
+ (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))

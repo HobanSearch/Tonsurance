@@ -1,0 +1,507 @@
+;; MultiTrancheVault.fc - Multi-Tranche Capital Structure with Loss Waterfall
+;;
+;; Manages 6 tranches of capital with different risk/return profiles:
+;; - Tranche 1 (BTC Senior): 6% yield, most senior (last loss)
+;; - Tranche 2 (Stable Senior): 10% yield
+;; - Tranche 3 (Opportunistic): 15% yield
+;; - Tranche 4 (RWA): 12% yield
+;; - Tranche 5 (DeFi Yield): 16% yield
+;; - Tranche 6 (Natural Hedge): 20% yield, most junior (first loss)
+;;
+;; Key Features:
+;; - Loss waterfall (junior tranches absorb losses first)
+;; - NAV calculation per tranche
+;; - LP token minting/burning
+;; - Premium collection from PolicyManager
+;; - Payout execution with waterfall
+;; - Yield distribution
+
+#include "imports/stdlib.fc";
+
+;; Storage layout
+;; total_capital:Coins
+;; total_coverage_sold:Coins
+;; policy_manager_address:MsgAddress
+;; oracle_address:MsgAddress
+;; admin_address:MsgAddress
+
+global int storage::total_capital;
+global int storage::total_coverage_sold;
+global slice storage::policy_manager_address;
+global slice storage::oracle_address;
+global slice storage::admin_address;
+
+;; Tranche structure (stored in separate cells per tranche)
+;; tranche_id:uint8 (1-6)
+;; name:string
+;; target_yield:uint32 (basis points annually, e.g., 600 = 6%)
+;; total_deposits:Coins
+;; total_lp_tokens:uint128
+;; accumulated_losses:Coins
+;; accumulated_yields:Coins
+;; last_yield_update:uint32
+
+const int NUM_TRANCHES = 6;
+
+const int TRANCHE_BTC_SENIOR = 1;
+const int TRANCHE_STABLE_SENIOR = 2;
+const int TRANCHE_OPPORTUNISTIC = 3;
+const int TRANCHE_RWA = 4;
+const int TRANCHE_DEFI_YIELD = 5;
+const int TRANCHE_NATURAL_HEDGE = 6;
+
+;; Target yields (basis points annually)
+const int YIELD_BTC_SENIOR = 600;        ;; 6%
+const int YIELD_STABLE_SENIOR = 1000;    ;; 10%
+const int YIELD_OPPORTUNISTIC = 1500;    ;; 15%
+const int YIELD_RWA = 1200;              ;; 12%
+const int YIELD_DEFI_YIELD = 1600;       ;; 16%
+const int YIELD_NATURAL_HEDGE = 2000;    ;; 20%
+
+const int BASIS_POINTS = 10000;
+const int SECONDS_PER_YEAR = 31536000;
+
+const int OP_DEPOSIT = 0x10;
+const int OP_WITHDRAW = 0x11;
+const int OP_RECEIVE_PREMIUM = 0x12;
+const int OP_REQUEST_PAYOUT = 0x13;
+const int OP_DISTRIBUTE_YIELD = 0x14;
+const int OP_UPDATE_NAV = 0x15;
+
+;; Load storage
+() load_data() impure {
+    var ds = get_data().begin_parse();
+
+    storage::total_capital = ds~load_coins();
+    storage::total_coverage_sold = ds~load_coins();
+    storage::policy_manager_address = ds~load_msg_addr();
+    storage::oracle_address = ds~load_msg_addr();
+    storage::admin_address = ds~load_msg_addr();
+
+    ds.end_parse();
+}
+
+;; Save storage
+() save_data() impure {
+    set_data(
+        begin_cell()
+            .store_coins(storage::total_capital)
+            .store_coins(storage::total_coverage_sold)
+            .store_slice(storage::policy_manager_address)
+            .store_slice(storage::oracle_address)
+            .store_slice(storage::admin_address)
+        .end_cell()
+    );
+}
+
+;; Load tranche data
+(int, int, int, int, int, int, int) load_tranche(int tranche_id) {
+    var tranche_cell = get_data_from_key(tranche_id);
+
+    if (cell_null?(tranche_cell)) {
+        return (0, 0, 0, 0, 0, 0, 0);
+    }
+
+    var ts = tranche_cell.begin_parse();
+
+    int target_yield = ts~load_uint(32);
+    int total_deposits = ts~load_coins();
+    int total_lp_tokens = ts~load_uint(128);
+    int accumulated_losses = ts~load_coins();
+    int accumulated_yields = ts~load_coins();
+    int last_yield_update = ts~load_uint(32);
+
+    ts.end_parse();
+
+    return (tranche_id, target_yield, total_deposits, total_lp_tokens,
+            accumulated_losses, accumulated_yields, last_yield_update);
+}
+
+;; Save tranche data
+() save_tranche(int tranche_id, int target_yield, int total_deposits,
+                int total_lp_tokens, int accumulated_losses,
+                int accumulated_yields, int last_yield_update) impure {
+
+    var tranche_cell = begin_cell()
+        .store_uint(target_yield, 32)
+        .store_coins(total_deposits)
+        .store_uint(total_lp_tokens, 128)
+        .store_coins(accumulated_losses)
+        .store_coins(accumulated_yields)
+        .store_uint(last_yield_update, 32)
+    .end_cell();
+
+    set_data_to_key(tranche_id, tranche_cell);
+}
+
+;; Get target yield for tranche
+int get_target_yield(int tranche_id) inline {
+    if (tranche_id == TRANCHE_BTC_SENIOR) { return YIELD_BTC_SENIOR; }
+    if (tranche_id == TRANCHE_STABLE_SENIOR) { return YIELD_STABLE_SENIOR; }
+    if (tranche_id == TRANCHE_OPPORTUNISTIC) { return YIELD_OPPORTUNISTIC; }
+    if (tranche_id == TRANCHE_RWA) { return YIELD_RWA; }
+    if (tranche_id == TRANCHE_DEFI_YIELD) { return YIELD_DEFI_YIELD; }
+    if (tranche_id == TRANCHE_NATURAL_HEDGE) { return YIELD_NATURAL_HEDGE; }
+    return 0;
+}
+
+;; Calculate NAV per LP token
+;; NAV = (total_deposits - accumulated_losses + accumulated_yields) / total_lp_tokens
+int calculate_nav_per_token(int tranche_id) {
+    var (tid, target_yield, total_deposits, total_lp_tokens,
+         accumulated_losses, accumulated_yields, last_yield_update) = load_tranche(tranche_id);
+
+    if (total_lp_tokens == 0) {
+        return 1000000000; ;; 1.0 in nanotons (initial NAV)
+    }
+
+    int net_value = total_deposits - accumulated_losses + accumulated_yields;
+
+    ;; NAV per token (scaled by 1e9)
+    return (net_value * 1000000000) / total_lp_tokens;
+}
+
+;; Calculate accrued yield since last update
+int calculate_accrued_yield(int tranche_id) {
+    var (tid, target_yield, total_deposits, total_lp_tokens,
+         accumulated_losses, accumulated_yields, last_yield_update) = load_tranche(tranche_id);
+
+    int time_elapsed = now() - last_yield_update;
+
+    ;; Accrued = deposits × yield_rate × (time / year)
+    ;; = deposits × (target_yield / BASIS_POINTS) × (time_elapsed / SECONDS_PER_YEAR)
+    int accrued = (total_deposits * target_yield * time_elapsed) / (BASIS_POINTS * SECONDS_PER_YEAR);
+
+    return accrued;
+}
+
+;; Apply loss waterfall (junior tranches absorb first)
+() apply_loss_waterfall(int total_loss) impure {
+    int remaining_loss = total_loss;
+
+    ;; Apply losses from junior (6) to senior (1)
+    int tranche_id = TRANCHE_NATURAL_HEDGE;
+
+    while ((remaining_loss > 0) & (tranche_id >= TRANCHE_BTC_SENIOR)) {
+        var (tid, target_yield, total_deposits, total_lp_tokens,
+             accumulated_losses, accumulated_yields, last_yield_update) = load_tranche(tranche_id);
+
+        ;; Available capital in this tranche
+        int available = total_deposits - accumulated_losses;
+
+        if (available > 0) {
+            int loss_to_apply = min(remaining_loss, available);
+
+            accumulated_losses += loss_to_apply;
+            remaining_loss -= loss_to_apply;
+
+            ;; Save updated tranche
+            save_tranche(tranche_id, target_yield, total_deposits, total_lp_tokens,
+                        accumulated_losses, accumulated_yields, last_yield_update);
+        }
+
+        tranche_id -= 1;
+    }
+
+    ;; If still remaining loss, vault is insolvent (should never happen with proper reserves)
+    throw_if(500, remaining_loss > 0);
+}
+
+;; Mint LP tokens to depositor
+() mint_lp_tokens(slice depositor, int tranche_id, int lp_amount) impure {
+    var msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(depositor)
+        .store_coins(0)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(0xABCD, 32) ;; OP_MINT_LP
+        .store_uint(tranche_id, 8)
+        .store_uint(lp_amount, 128)
+    .end_cell();
+
+    send_raw_message(msg, 1);
+}
+
+;; Send withdrawal to user
+() send_withdrawal(slice user, int amount) impure {
+    var msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(user)
+        .store_coins(amount)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+    .end_cell();
+
+    send_raw_message(msg, 1);
+}
+
+;; Send payout to beneficiary
+() send_payout(slice beneficiary, int amount) impure {
+    var msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(beneficiary)
+        .store_coins(amount)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(0xEF01, 32) ;; OP_INSURANCE_PAYOUT
+    .end_cell();
+
+    send_raw_message(msg, 1);
+}
+
+;; ========== MESSAGE HANDLERS ==========
+
+;; Handle deposit to tranche
+() handle_deposit(slice sender, slice in_msg) impure {
+    int tranche_id = in_msg~load_uint(8);
+    int deposit_amount = in_msg~load_coins();
+
+    ;; Validate tranche
+    throw_unless(100, (tranche_id >= 1) & (tranche_id <= NUM_TRANCHES));
+    throw_unless(101, deposit_amount > 0);
+
+    ;; Load tranche
+    var (tid, target_yield, total_deposits, total_lp_tokens,
+         accumulated_losses, accumulated_yields, last_yield_update) = load_tranche(tranche_id);
+
+    ;; Initialize tranche if first deposit
+    if (tid == 0) {
+        target_yield = get_target_yield(tranche_id);
+        last_yield_update = now();
+    }
+
+    ;; Calculate NAV per token
+    int nav_per_token = calculate_nav_per_token(tranche_id);
+
+    ;; Calculate LP tokens to mint
+    ;; lp_tokens = deposit_amount / (nav_per_token / 1e9)
+    int lp_to_mint = (deposit_amount * 1000000000) / nav_per_token;
+
+    ;; Update tranche
+    total_deposits += deposit_amount;
+    total_lp_tokens += lp_to_mint;
+
+    save_tranche(tranche_id, target_yield, total_deposits, total_lp_tokens,
+                accumulated_losses, accumulated_yields, last_yield_update);
+
+    ;; Update vault totals
+    storage::total_capital += deposit_amount;
+    save_data();
+
+    ;; Mint LP tokens to depositor
+    mint_lp_tokens(sender, tranche_id, lp_to_mint);
+}
+
+;; Handle withdrawal from tranche
+() handle_withdraw(slice sender, slice in_msg) impure {
+    int tranche_id = in_msg~load_uint(8);
+    int lp_tokens_to_burn = in_msg~load_uint(128);
+
+    throw_unless(200, lp_tokens_to_burn > 0);
+
+    ;; Load tranche
+    var (tid, target_yield, total_deposits, total_lp_tokens,
+         accumulated_losses, accumulated_yields, last_yield_update) = load_tranche(tranche_id);
+
+    throw_unless(201, tid > 0); ;; Tranche exists
+    throw_unless(202, lp_tokens_to_burn <= total_lp_tokens); ;; Sufficient LP tokens
+
+    ;; Calculate NAV per token
+    int nav_per_token = calculate_nav_per_token(tranche_id);
+
+    ;; Calculate withdrawal amount
+    ;; withdrawal = lp_tokens × (nav_per_token / 1e9)
+    int withdrawal_amount = (lp_tokens_to_burn * nav_per_token) / 1000000000;
+
+    ;; Update tranche
+    total_lp_tokens -= lp_tokens_to_burn;
+    total_deposits -= withdrawal_amount;
+
+    save_tranche(tranche_id, target_yield, total_deposits, total_lp_tokens,
+                accumulated_losses, accumulated_yields, last_yield_update);
+
+    ;; Update vault totals
+    storage::total_capital -= withdrawal_amount;
+    save_data();
+
+    ;; Send withdrawal
+    send_withdrawal(sender, withdrawal_amount);
+}
+
+;; Receive premium from PolicyManager
+() handle_receive_premium(slice sender, slice in_msg) impure {
+    ;; Only PolicyManager can send premiums
+    throw_unless(300, equal_slices(sender, storage::policy_manager_address));
+
+    int premium_amount = in_msg~load_coins();
+    int coverage_amount = in_msg~load_coins();
+
+    ;; Update totals
+    storage::total_capital += premium_amount;
+    storage::total_coverage_sold += coverage_amount;
+
+    save_data();
+}
+
+;; Process payout request from PolicyManager
+() handle_request_payout(slice sender, slice in_msg) impure {
+    ;; Only PolicyManager can request payouts
+    throw_unless(400, equal_slices(sender, storage::policy_manager_address));
+
+    int policy_id = in_msg~load_uint(64);
+    slice beneficiary = in_msg~load_msg_addr();
+    int payout_amount = in_msg~load_coins();
+
+    throw_unless(401, payout_amount > 0);
+    throw_unless(402, payout_amount <= storage::total_capital); ;; Sufficient capital
+
+    ;; Apply loss waterfall
+    apply_loss_waterfall(payout_amount);
+
+    ;; Update totals
+    storage::total_capital -= payout_amount;
+    save_data();
+
+    ;; Send payout to beneficiary
+    send_payout(beneficiary, payout_amount);
+}
+
+;; Distribute yield to tranche
+() handle_distribute_yield(slice sender, slice in_msg) impure {
+    ;; Only admin can trigger yield distribution
+    throw_unless(500, equal_slices(sender, storage::admin_address));
+
+    int tranche_id = in_msg~load_uint(8);
+
+    ;; Load tranche
+    var (tid, target_yield, total_deposits, total_lp_tokens,
+         accumulated_losses, accumulated_yields, last_yield_update) = load_tranche(tranche_id);
+
+    throw_unless(501, tid > 0);
+
+    ;; Calculate accrued yield
+    int accrued_yield = calculate_accrued_yield(tranche_id);
+
+    ;; Update tranche
+    accumulated_yields += accrued_yield;
+    last_yield_update = now();
+
+    save_tranche(tranche_id, target_yield, total_deposits, total_lp_tokens,
+                accumulated_losses, accumulated_yields, last_yield_update);
+}
+
+;; Update NAV for all tranches (called periodically)
+() handle_update_nav(slice sender, slice in_msg) impure {
+    ;; Only admin can trigger NAV update
+    throw_unless(600, equal_slices(sender, storage::admin_address));
+
+    ;; Update yield for all tranches
+    int tranche_id = TRANCHE_BTC_SENIOR;
+
+    while (tranche_id <= TRANCHE_NATURAL_HEDGE) {
+        var (tid, target_yield, total_deposits, total_lp_tokens,
+             accumulated_losses, accumulated_yields, last_yield_update) = load_tranche(tranche_id);
+
+        if (tid > 0) {
+            ;; Calculate and add accrued yield
+            int accrued_yield = calculate_accrued_yield(tranche_id);
+
+            accumulated_yields += accrued_yield;
+            last_yield_update = now();
+
+            save_tranche(tranche_id, target_yield, total_deposits, total_lp_tokens,
+                        accumulated_losses, accumulated_yields, last_yield_update);
+        }
+
+        tranche_id += 1;
+    }
+}
+
+;; ========== MAIN RECEIVER ==========
+
+() recv_internal(int msg_value, cell in_msg_cell, slice in_msg) impure {
+    ;; Parse message
+    var cs = in_msg_cell.begin_parse();
+    var flags = cs~load_uint(4);
+    slice sender = cs~load_msg_addr();
+
+    ;; Load storage
+    load_data();
+
+    ;; Parse operation
+    int op = in_msg~load_uint(32);
+
+    if (op == OP_DEPOSIT) {
+        handle_deposit(sender, in_msg);
+        return ();
+    }
+
+    if (op == OP_WITHDRAW) {
+        handle_withdraw(sender, in_msg);
+        return ();
+    }
+
+    if (op == OP_RECEIVE_PREMIUM) {
+        handle_receive_premium(sender, in_msg);
+        return ();
+    }
+
+    if (op == OP_REQUEST_PAYOUT) {
+        handle_request_payout(sender, in_msg);
+        return ();
+    }
+
+    if (op == OP_DISTRIBUTE_YIELD) {
+        handle_distribute_yield(sender, in_msg);
+        return ();
+    }
+
+    if (op == OP_UPDATE_NAV) {
+        handle_update_nav(sender, in_msg);
+        return ();
+    }
+
+    throw(0xffff); ;; Unknown operation
+}
+
+;; ========== GET METHODS ==========
+
+;; Get tranche details
+(int, int, int, int, int, int, int) get_tranche(int tranche_id) method_id {
+    load_data();
+    return load_tranche(tranche_id);
+}
+
+;; Get NAV per LP token
+int get_nav_per_token(int tranche_id) method_id {
+    load_data();
+    return calculate_nav_per_token(tranche_id);
+}
+
+;; Get total vault capital
+int get_total_capital() method_id {
+    load_data();
+    return storage::total_capital;
+}
+
+;; Get total coverage sold
+int get_total_coverage_sold() method_id {
+    load_data();
+    return storage::total_coverage_sold;
+}
+
+;; Calculate vault utilization ratio (coverage / capital)
+int get_utilization_ratio() method_id {
+    load_data();
+
+    if (storage::total_capital == 0) {
+        return 0;
+    }
+
+    ;; Return as basis points (10000 = 100%)
+    return (storage::total_coverage_sold * BASIS_POINTS) / storage::total_capital;
+}
+
+;; Get accrued yield for tranche
+int get_accrued_yield(int tranche_id) method_id {
+    load_data();
+    return calculate_accrued_yield(tranche_id);
+}

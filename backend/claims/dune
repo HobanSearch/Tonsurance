@@ -1,0 +1,5 @@
+(library
+ (name claims_engine)
+ (public_name tonsurance.claims_engine)
+ (libraries core types math pool lwt lwt.unix logs logs.lwt)
+ (preprocess (pps lwt_ppx ppx_sexp_conv)))
