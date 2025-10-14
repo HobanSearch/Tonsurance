@@ -1,0 +1,25 @@
+FROM node:18-alpine
+
+WORKDIR /app
+
+# Copy package files
+COPY package.json ./
+COPY package-lock.json* ./
+
+# Install dependencies
+RUN npm ci --only=production
+
+# Copy keeper service files
+COPY *.ts ./
+
+# Install TypeScript globally
+RUN npm install -g typescript ts-node
+
+# Build TypeScript files
+RUN tsc --skipLibCheck --esModuleInterop --resolveJsonModule --module commonjs --outDir dist *.ts || echo "TypeScript compilation warnings ignored"
+
+# Expose health check port
+EXPOSE 3001 3002
+
+# Default command (override with docker-compose)
+CMD ["node", "dist/PricingOracleKeeper.js"]

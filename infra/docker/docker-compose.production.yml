@@ -4,8 +4,8 @@ services:
   # OCaml Backend - Oracle Aggregator & Pricing Engine
   ocaml-backend:
     build:
-      context: .
-      dockerfile: Dockerfile.ocaml
+      context: ../../backend
+      dockerfile: ../infra/docker/Dockerfile.ocaml
     container_name: tonsurance-ocaml
     restart: unless-stopped
     ports:
@@ -28,8 +28,8 @@ services:
   # PricingOracleKeeper - Bridges OCaml to TON contracts
   pricing-oracle-keeper:
     build:
-      context: ./Tonsurance
-      dockerfile: Dockerfile.keeper
+      context: ../../services
+      dockerfile: ../infra/docker/Dockerfile.keeper
     container_name: tonsurance-pricing-keeper
     restart: unless-stopped
     depends_on:
@@ -56,8 +56,8 @@ services:
   # BridgeHealthKeeper - Monitors cross-chain bridges
   bridge-health-keeper:
     build:
-      context: ./Tonsurance
-      dockerfile: Dockerfile.keeper
+      context: ../../services
+      dockerfile: ../infra/docker/Dockerfile.keeper
     container_name: tonsurance-bridge-keeper
     restart: unless-stopped
     depends_on:
@@ -82,7 +82,7 @@ services:
   # Frontend - React + Vite
   frontend:
     build:
-      context: ./Tonsurance/frontend
+      context: ../../frontend
       dockerfile: Dockerfile
       args:
         - VITE_TON_RPC_URL=${TON_RPC_URL}

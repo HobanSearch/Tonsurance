@@ -26,9 +26,19 @@ COPY tonsurance.opam dune-project ./
 # Install OCaml dependencies
 RUN opam install . --deps-only -y
 
-# Copy source code
-COPY lib ./lib
-COPY test ./test
+# Copy source code (all subdirectories from backend)
+COPY api ./api
+COPY integration ./integration
+COPY types ./types
+COPY pricing ./pricing
+COPY risk ./risk
+COPY escrow ./escrow
+COPY monitoring ./monitoring
+COPY claims ./claims
+COPY daemons ./daemons
+COPY pool ./pool
+COPY math ./math
+COPY float ./float
 
 # Build the project
 RUN eval $(opam env) && dune build --release
@@ -54,8 +64,8 @@ RUN addgroup -g 1000 tonsurance && \
 WORKDIR /app
 
 # Copy built executables from builder
-COPY --from=builder /app/_build/default/lib/api/api_server.exe ./tonsurance_api_server
-COPY --from=builder /app/_build/default/lib/daemons/risk_management_daemon.exe ./risk_management_daemon
+COPY --from=builder /app/_build/default/api/api_server.exe ./tonsurance_api_server
+COPY --from=builder /app/_build/default/daemons/risk_management_daemon.exe ./risk_management_daemon
 
 # Create logs directory
 RUN mkdir -p /app/logs && chown -R tonsurance:tonsurance /app
