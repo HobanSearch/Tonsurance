@@ -1,10 +1,11 @@
 import { useState, useEffect } from 'react';
 import { useTonAddress } from '@tonconnect/ui-react';
-import { toNano, fromNano } from '@ton/core';
+import { toNano } from '@ton/core';
 import { useContracts } from '../hooks/useContracts';
-import { TerminalWindow, TerminalOutput, RetroButton, InfoPanel } from '../components/terminal';
+import { TerminalWindow, RetroButton, InfoPanel } from '../components/terminal';
 import { BeneficiarySelector } from '../components/BeneficiarySelector';
-import { ChainSelector, Blockchain, Stablecoin } from '../components/ChainSelector';
+import type { Blockchain, Stablecoin } from '../components/ChainSelector';
+import { ChainSelector } from '../components/ChainSelector';
 import { BridgeHealthIndicator } from '../components/BridgeHealthIndicator';
 
 type CoverageType = 'depeg' | 'smart_contract' | 'oracle' | 'bridge';
@@ -25,7 +26,7 @@ interface PremiumQuote {
 
 export const MultiChainInsurance = () => {
   const userAddress = useTonAddress();
-  const { contracts, sender, isConfigured } = useContracts();
+  const { contracts, sender } = useContracts();
 
   // Chain and asset selection
   const [selectedChain, setSelectedChain] = useState<Blockchain>('ethereum');

@@ -1,4 +1,4 @@
-import { InputHTMLAttributes } from 'react';
+import type { InputHTMLAttributes } from 'react';
 
 interface CommandPromptProps extends Omit<InputHTMLAttributes<HTMLInputElement>, 'type'> {
   prompt?: string;

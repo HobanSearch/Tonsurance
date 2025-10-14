@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useTonAddress } from '@tonconnect/ui-react';
-import { toNano, fromNano } from '@ton/core';
+import { toNano } from '@ton/core';
 import { useContracts } from '../hooks/useContracts';
 import { TerminalWindow, TerminalOutput, RetroButton, InfoPanel } from '../components/terminal';
 
@@ -29,7 +29,6 @@ export const HedgedInsurance = () => {
   const [durationDays, setDurationDays] = useState<string>('30');
   const [quote, setQuote] = useState<SwingQuote | null>(null);
   const [isLoading, setIsLoading] = useState(false);
-  const [isCalculating, setIsCalculating] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<Date>(new Date());
 
   const coverageTypes = {
@@ -70,13 +69,13 @@ export const HedgedInsurance = () => {
     const multipliers: Record<number, number> = { 1: 1, 2: 1.8, 3: 2.5, 4: 3.0 };
     const multiplier = multipliers[selectedCoverageTypes.length] || 1;
 
+    const basePremium = amount * baseApr * (days / 365) * multiplier;
     const totalPremium = basePremium; // No hedge costs charged to user
     const fixedPremium = amount * baseApr * (days / 365) * 2.5; // Core insurance equivalent
     const savings = fixedPremium - totalPremium;
 
     // Try to fetch real hedge prices from PricingOracle for display purposes only
     if (isConfigured && contracts.pricingOracle) {
-      setIsCalculating(true);
       try {
         const hedgePrices = await contracts.pricingOracle.getHedgePrices(
           coverageTypeToEnum(selectedCoverageTypes[0])
@@ -123,8 +122,6 @@ export const HedgedInsurance = () => {
         console.error('Error fetching hedge prices:', error);
         // Fallback to mock calculation
         useMockCalculation();
-      } finally {
-        setIsCalculating(false);
       }
     } else {
       useMockCalculation();

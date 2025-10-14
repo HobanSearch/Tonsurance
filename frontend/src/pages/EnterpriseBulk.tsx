@@ -2,8 +2,9 @@ import { useState } from 'react';
 import { useTonAddress } from '@tonconnect/ui-react';
 import { toNano } from '@ton/core';
 import { useContracts } from '../hooks/useContracts';
-import { TerminalWindow, TerminalOutput, RetroButton, InfoPanel } from '../components/terminal';
-import { ChainSelector, Blockchain, Stablecoin } from '../components/ChainSelector';
+import { TerminalWindow, RetroButton, InfoPanel } from '../components/terminal';
+import type { Blockchain, Stablecoin } from '../components/ChainSelector';
+import { ChainSelector } from '../components/ChainSelector';
 
 interface EmployeeRow {
   id: string;
@@ -25,7 +26,7 @@ interface BulkQuote {
 
 export const EnterpriseBulk = () => {
   const userAddress = useTonAddress();
-  const { contracts, sender, isConfigured } = useContracts();
+  const { contracts, sender } = useContracts();
 
   // Chain and asset
   const [selectedChain, setSelectedChain] = useState<Blockchain>('ethereum');

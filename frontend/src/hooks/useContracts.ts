@@ -12,7 +12,8 @@ import {
   hedgeCoordinator,
   areContractsConfigured
 } from '../lib/contracts';
-import { Sender, SenderArguments, Address } from '@ton/core';
+import type { Sender, SenderArguments } from '@ton/core';
+import { Address } from '@ton/core';
 
 export const useContracts = () => {
   const [tonConnectUI] = useTonConnectUI();
