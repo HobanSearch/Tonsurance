@@ -1,0 +1,37 @@
+# Large model files (exclude from git)
+models/
+adapters/
+*.safetensors
+*.bin
+*.gguf
+*.pth
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Environment
+.env
+*.log
+
+# Build artifacts
+_build/
+*.cmi
+*.cmo
+*.cmx
+*.o
+*.a
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

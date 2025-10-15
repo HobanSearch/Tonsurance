@@ -1,0 +1,49 @@
+(library
+ (name tonny_lib)
+ (modules
+  compliance_filter
+  ollama_client
+  pricing_integration
+  conversation_state
+  quote_cache
+  telegram_webhook)
+ (libraries
+  core
+  lwt
+  lwt.unix
+  cohttp-lwt-unix
+  yojson
+  str
+  types
+  collateral_manager
+  bridge_monitor
+  pricing_engine))
+
+(library
+ (name tonny_commands)
+ (modules start help quote buy policies claim bridges tonny)
+ (libraries
+  core
+  lwt
+  lwt.unix
+  types
+  tonny_lib
+  pricing_engine
+  collateral_manager
+  bridge_monitor))
+
+(executable
+ (name tonny_bot)
+ (modules tonny_bot)
+ (libraries
+  core
+  lwt
+  lwt.unix
+  cohttp-lwt-unix
+  types
+  tonny_lib
+  tonny_commands
+  collateral_manager
+  bridge_monitor
+  pricing_engine)
+ (preprocess (pps ppx_jane ppx_deriving_yojson)))

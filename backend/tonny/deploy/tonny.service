@@ -1,0 +1,32 @@
+[Unit]
+Description=Tonny MLX Model Server
+After=network.target
+
+[Service]
+Type=simple
+User=tonny
+Group=tonny
+WorkingDirectory=/opt/tonny
+Environment="PATH=/opt/anaconda3/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/opt/anaconda3/bin/python3 /opt/tonny/tonny_server.py --model-path /opt/tonny/models/tonny-7b-merged --port 8888 --host 0.0.0.0
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tonny-server
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/tonny/logs
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=8G
+CPUQuota=400%
+
+[Install]
+WantedBy=multi-user.target
