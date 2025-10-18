@@ -29,7 +29,7 @@ let sats_to_btc (sats: btc_sats) : float =
 (** Safe arithmetic operations *)
 
 let safe_div (num: float) (denom: float) : float option =
-  if Float.abs denom < Float.epsilon
+  if Float.(abs denom < epsilon_float)
   then None
   else Some (num /. denom)
 
@@ -39,11 +39,11 @@ let safe_div_exn (num: float) (denom: float) : float =
   | None -> failwith "Division by zero"
 
 let safe_log (x: float) : float option =
-  if x <= 0.0 then None
+  if Float.(x <= 0.0) then None
   else Some (Float.log x)
 
 let safe_sqrt (x: float) : float option =
-  if x < 0.0 then None
+  if Float.(x < 0.0) then None
   else Some (Float.sqrt x)
 
 (** Statistical functions *)
@@ -90,7 +90,7 @@ let skewness (values: float list) : float =
   let n = Float.of_int (List.length values) in
   let m = mean values in
   let s = std_dev values in
-  if s < Float.epsilon then 0.0
+  if Float.(s < epsilon_float) then 0.0
   else
     let sum_cubed = List.fold values ~init:0.0 ~f:(fun acc x ->
       acc +. ((x -. m) /. s) ** 3.0
@@ -101,7 +101,7 @@ let kurtosis (values: float list) : float =
   let n = Float.of_int (List.length values) in
   let m = mean values in
   let s = std_dev values in
-  if s < Float.epsilon then 0.0
+  if Float.(s < epsilon_float) then 0.0
   else
     let sum_fourth = List.fold values ~init:0.0 ~f:(fun acc x ->
       acc +. ((x -. m) /. s) ** 4.0
@@ -161,7 +161,7 @@ let covariance_matrix (data: float list list) : float list list =
             )
         in
         let n_samples = Float.of_int (List.length series_i) in
-        if n_samples > 0.0 then cov /. n_samples else 0.0
+        if Float.(n_samples > 0.0) then cov /. n_samples else 0.0
       )
     )
 
@@ -173,7 +173,7 @@ let correlation_matrix (data: float list list) : float list list =
     let std_i = List.nth_exn std_devs i in
     List.mapi row ~f:(fun j cov ->
       let std_j = List.nth_exn std_devs j in
-      if std_i < Float.epsilon || std_j < Float.epsilon then
+      if Float.(std_i < epsilon_float || std_j < epsilon_float) then
         0.0
       else
         cov /. (std_i *. std_j)
@@ -217,10 +217,10 @@ let cholesky_decomposition (matrix: float list list) : float list list option =
 
           if i = j then begin
             let diag_value = (List.nth_exn (List.nth_exn matrix i) i) -. !sum in
-            if diag_value < 0.0 then failwith "Matrix not positive definite";
+            if Float.(diag_value < 0.0) then failwith "Matrix not positive definite";
             result.(i).(j) <- Float.sqrt diag_value
           end else begin
-            if Float.abs result.(j).(j) < Float.epsilon then
+            if Float.(abs result.(j).(j) < epsilon_float) then
               failwith "Division by zero in Cholesky";
             result.(i).(j) <- ((List.nth_exn (List.nth_exn matrix i) j) -. !sum) /. result.(j).(j)
           end
@@ -264,29 +264,31 @@ let present_value ~future_value ~rate ~periods : float =
   future_value /. ((1.0 +. rate) ** Float.of_int periods)
 
 let annuity_pv ~payment ~rate ~periods : float =
-  if Float.abs rate < Float.epsilon then
+  if Float.(abs rate < epsilon_float) then
     payment *. Float.of_int periods
   else
     payment *. (1.0 -. (1.0 +. rate) ** Float.neg (Float.of_int periods)) /. rate
 
 let annuity_fv ~payment ~rate ~periods : float =
-  if Float.abs rate < Float.epsilon then
+  if Float.(abs rate < epsilon_float) then
     payment *. Float.of_int periods
   else
     payment *. (((1.0 +. rate) ** Float.of_int periods) -. 1.0) /. rate
 
 let compound_annual_growth_rate ~start_value ~end_value ~years : float option =
-  if start_value <= 0.0 || end_value <= 0.0 || years <= 0.0 then None
+  if Float.(start_value <= 0.0 || end_value <= 0.0 || years <= 0.0) then None
   else
     Some (((end_value /. start_value) ** (1.0 /. years)) -. 1.0)
 
 (** Black-Scholes option pricing *)
 
 let normal_cdf (x: float) : float =
-  0.5 *. (1.0 +. Float.erf (x /. Float.sqrt 2.0))
+  (* Approximation using tanh for erf *)
+  let erf_approx z = Float.tanh (z *. Float.sqrt (Float.pi /. 2.0)) in
+  0.5 *. (1.0 +. erf_approx (x /. Float.sqrt 2.0))
 
 let black_scholes ~spot ~strike ~time_to_expiry ~rate ~volatility ~call_option : float =
-  if time_to_expiry <= 0.0 then
+  if Float.(time_to_expiry <= 0.0) then
     if call_option then
       Float.max (spot -. strike) 0.0
     else
@@ -358,13 +360,13 @@ let relative_strength_index ~prices ~period : float list =
       if List.length changes < period then List.rev acc
       else
         let window = List.take changes period in
-        let gains = List.filter window ~f:(fun x -> x > 0.0) in
-        let losses = List.filter window ~f:(fun x -> x < 0.0) |> List.map ~f:Float.abs in
+        let gains = List.filter window ~f:(fun x -> Float.(x > 0.0)) in
+        let losses = List.filter window ~f:(fun x -> Float.(x < 0.0)) |> List.map ~f:Float.abs in
 
         let avg_gain = if List.is_empty gains then 0.0 else mean gains in
         let avg_loss = if List.is_empty losses then 0.0 else mean losses in
 
-        let rs = if avg_loss < Float.epsilon then 100.0 else avg_gain /. avg_loss in
+        let rs = if Float.(avg_loss < epsilon_float) then 100.0 else avg_gain /. avg_loss in
         let rsi = 100.0 -. (100.0 /. (1.0 +. rs)) in
 
         go (List.tl_exn changes) (rsi :: acc)
@@ -377,7 +379,7 @@ let sharpe_ratio ~returns ~risk_free_rate : float =
   let excess_returns = List.map returns ~f:(fun r -> r -. risk_free_rate) in
   let mean_excess = mean excess_returns in
   let std_excess = std_dev excess_returns in
-  if std_excess < Float.epsilon then 0.0
+  if Float.(std_excess < epsilon_float) then 0.0
   else mean_excess /. std_excess
 
 let sortino_ratio ~returns ~risk_free_rate : float =
@@ -385,17 +387,17 @@ let sortino_ratio ~returns ~risk_free_rate : float =
   let mean_excess = mean excess_returns in
 
   (* Only consider downside deviation *)
-  let downside_returns = List.filter excess_returns ~f:(fun r -> r < 0.0) in
+  let downside_returns = List.filter excess_returns ~f:(fun r -> Float.(r < 0.0)) in
   let downside_std = std_dev downside_returns in
 
-  if downside_std < Float.epsilon then 0.0
+  if Float.(downside_std < epsilon_float) then 0.0
   else mean_excess /. downside_std
 
 let max_drawdown (values: float list) : float =
   if List.is_empty values then 0.0
   else
     let _, _, max_dd = List.fold values ~init:(Float.neg_infinity, 0.0, 0.0)
-      ~f:(fun (peak, current_dd, max_dd) value ->
+      ~f:(fun (peak, _current_dd, max_dd) value ->
         let new_peak = Float.max peak value in
         let drawdown = (new_peak -. value) /. new_peak in
         let new_max_dd = Float.max max_dd drawdown in
@@ -411,13 +413,13 @@ let calmar_ratio ~returns ~risk_free_rate : float =
     (last *. (1.0 +. r)) :: acc
   ) |> List.rev) in
 
-  if mdd < Float.epsilon then 0.0
+  if Float.(mdd < epsilon_float) then 0.0
   else (total_return -. risk_free_rate) /. mdd
 
 (** Interpolation *)
 
 let linear_interpolation ~x ~x0 ~x1 ~y0 ~y1 : float =
-  if Float.abs (x1 -. x0) < Float.epsilon then y0
+  if Float.(abs (x1 -. x0) < epsilon_float) then y0
   else
     y0 +. ((x -. x0) /. (x1 -. x0)) *. (y1 -. y0)
 
@@ -429,7 +431,7 @@ let clamp ~value ~min_val ~max_val : float =
 let weighted_average (values: (float * float) list) : float =
   (* values = (value, weight) pairs *)
   let total_weight = List.fold values ~init:0.0 ~f:(fun acc (_, w) -> acc +. w) in
-  if total_weight < Float.epsilon then 0.0
+  if Float.(total_weight < epsilon_float) then 0.0
   else
     let weighted_sum = List.fold values ~init:0.0 ~f:(fun acc (v, w) -> acc +. (v *. w)) in
     weighted_sum /. total_weight
@@ -438,11 +440,11 @@ let normalize (values: float list) : float list =
   let min_val = List.fold values ~init:Float.infinity ~f:Float.min in
   let max_val = List.fold values ~init:Float.neg_infinity ~f:Float.max in
   let range = max_val -. min_val in
-  if range < Float.epsilon then List.map values ~f:(fun _ -> 0.5)
+  if Float.(range < epsilon_float) then List.map values ~f:(fun _ -> 0.5)
   else List.map values ~f:(fun x -> (x -. min_val) /. range)
 
 let z_score (values: float list) : float list =
   let m = mean values in
   let s = std_dev values in
-  if s < Float.epsilon then List.map values ~f:(fun _ -> 0.0)
+  if Float.(s < epsilon_float) then List.map values ~f:(fun _ -> 0.0)
   else List.map values ~f:(fun x -> (x -. m) /. s)

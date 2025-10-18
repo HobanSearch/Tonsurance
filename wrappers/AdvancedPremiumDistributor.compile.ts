@@ -2,5 +2,5 @@ import { CompilerConfig } from '@ton/blueprint';
 
 export const compile: CompilerConfig = {
     lang: 'func',
-    targets: ['contracts/phase2/AdvancedPremiumDistributor.fc'],
+    targets: ['contracts/core/AdvancedPremiumDistributor.fc'],
 };

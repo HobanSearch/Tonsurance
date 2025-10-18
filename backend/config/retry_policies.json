@@ -1,0 +1,103 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Retry policies and backoff strategies for all services",
+  "version": "1.0.0",
+
+  "http_client": {
+    "retry_attempts": 3,
+    "retry_delays_seconds": [1.0, 2.0, 4.0],
+    "backoff_strategy": "exponential",
+    "description": "Standard HTTP client retry with exponential backoff"
+  },
+
+  "oracle_aggregator": {
+    "retry_attempts": 3,
+    "timeout_per_attempt_seconds": 10.0,
+    "backoff_base_seconds": 1.0,
+    "backoff_max_seconds": 16.0,
+    "description": "Oracle aggregator: 1, 2, 4, 8, 16 seconds max backoff"
+  },
+
+  "chainlink_client": {
+    "retry_attempts": 3,
+    "backoff_base_seconds": 0.5,
+    "backoff_max_seconds": 8.0,
+    "description": "Chainlink oracle with shorter backoff"
+  },
+
+  "binance_futures": {
+    "retry_attempts": 3,
+    "retry_delays_seconds": [1.0, 2.0, 4.0],
+    "description": "Binance API retry policy"
+  },
+
+  "chain_event_client": {
+    "retry_attempts": 3,
+    "retry_delays_seconds": [1.0, 2.0, 4.0],
+    "timeout_seconds": 15.0,
+    "description": "Chain event monitoring retry"
+  },
+
+  "escrow_oracle": {
+    "retry_attempts": 3,
+    "retry_delays_seconds": [1.0, 2.0, 4.0],
+    "default_timeout_seconds": 10.0,
+    "description": "Escrow oracle client retry"
+  },
+
+  "pricing_oracle_keeper": {
+    "max_consecutive_failures": 5,
+    "backoff_base_seconds": 1.0,
+    "backoff_max_seconds": 16.0,
+    "description": "Pricing oracle keeper with failure tracking"
+  },
+
+  "async_helpers": {
+    "initial_backoff_seconds": 1,
+    "max_backoff_seconds": 16,
+    "max_retry_age_seconds": 3600,
+    "description": "On-chain async helper retry (1, 2, 4, 8, 16 seconds), 1 hour max"
+  },
+
+  "etl_pipeline": {
+    "retry_delay_seconds": 300.0,
+    "max_retries": 3,
+    "description": "ETL failures retry after 5 minutes"
+  },
+
+  "integration_daemon": {
+    "vault_sync_retry_attempts": 3,
+    "event_poll_retry_attempts": 3,
+    "timeout_seconds": 30,
+    "description": "Integration daemon retry policies"
+  },
+
+  "rate_limiting": {
+    "max_burst_size": 10,
+    "refill_rate_per_second": 1.0,
+    "wait_timeout_seconds": 30.0,
+    "description": "Token bucket rate limiter configuration"
+  },
+
+  "circuit_breaker": {
+    "failure_threshold": 5,
+    "success_threshold": 2,
+    "timeout_seconds": 60.0,
+    "description": "Circuit breaker: opens after 5 failures, resets after 2 successes"
+  },
+
+  "dispute_resolution": {
+    "timeout_days": 7,
+    "timeout_seconds": 604800,
+    "description": "7 days for dispute resolution (604,800 seconds)"
+  },
+
+  "notes": [
+    "Exponential backoff doubles delay: 1s, 2s, 4s, 8s, 16s",
+    "Most services use 3 retry attempts as standard",
+    "Circuit breakers prevent cascading failures",
+    "Rate limiters use token bucket algorithm",
+    "Adjust retry counts based on service criticality",
+    "Long-running operations (ETL) have longer retry delays"
+  ]
+}

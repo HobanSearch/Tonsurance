@@ -1,15 +1,17 @@
 import { TonConnectUIProvider } from '@tonconnect/ui-react';
 import { BrowserRouter as Router, Routes, Route, Link, useLocation } from 'react-router-dom';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { WalletConnect } from './components/WalletConnect';
 import { PolicyPurchase } from './pages/PolicyPurchase';
 import { VaultStaking } from './pages/VaultStaking';
 import { Claims } from './pages/Claims';
 import { HedgedInsurance } from './pages/HedgedInsurance';
 import { Analytics } from './pages/Analytics';
+import { RiskDashboard } from './pages/RiskDashboard';
 import { Home } from './pages/Home';
 import { MultiChainInsurance } from './pages/MultiChainInsurance';
 import { EnterpriseBulk } from './pages/EnterpriseBulk';
+import { Escrow } from './pages/Escrow';
 
 const manifestUrl = 'https://tonsurance.io/tonconnect-manifest.json';
 
@@ -17,6 +19,10 @@ function Navigation() {
   const location = useLocation();
   const isActive = (path: string) => location.pathname === path;
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [coverageDropdownOpen, setCoverageDropdownOpen] = useState(false);
+  const [mobileCoverageOpen, setMobileCoverageOpen] = useState(false);
+
+  const isCoveragePage = ['/policy', '/multi-chain', '/enterprise', '/hedged'].includes(location.pathname);
 
   return (
     <nav className="bg-cream-300 border-b-3 border-cream-400">
@@ -29,48 +35,67 @@ function Navigation() {
 
           {/* Desktop menu */}
           <div className="hidden md:flex gap-1 text-sm font-mono flex-1">
-            <Link
-              to="/policy"
-              className={`px-3 py-1 border-2 transition-colors ${
-                isActive('/policy')
-                  ? 'bg-copper-500 text-cream-50 border-copper-600'
-                  : 'border-cream-400 hover:bg-cream-200 text-text-primary'
-              }`}
+            {/* BUY_COVERAGE Dropdown */}
+            <div
+              className="relative"
+              onMouseEnter={() => setCoverageDropdownOpen(true)}
+              onMouseLeave={() => setCoverageDropdownOpen(false)}
             >
-              &gt; BUY_COVERAGE
-            </Link>
-            <Link
-              to="/multi-chain"
-              className={`px-3 py-1 border-2 transition-colors ${
-                isActive('/multi-chain')
-                  ? 'bg-copper-500 text-cream-50 border-copper-600'
-                  : 'border-cream-400 hover:bg-cream-200 text-text-primary'
-              }`}
-            >
-              &gt; MULTI-CHAIN
-            </Link>
-            <Link
-              to="/enterprise"
-              className={`px-3 py-1 border-2 transition-colors ${
-                isActive('/enterprise')
-                  ? 'bg-copper-500 text-cream-50 border-copper-600'
-                  : 'border-cream-400 hover:bg-cream-200 text-text-primary'
-              }`}
-            >
-              &gt; ENTERPRISE
-            </Link>
-            <Link
-              to="/hedged"
-              className={`px-3 py-1 border-2 transition-colors ${
-                isActive('/hedged')
-                  ? 'bg-copper-500 text-cream-50 border-copper-600'
-                  : 'border-cream-400 hover:bg-cream-200 text-text-primary'
-              }`}
-            >
-              &gt; HEDGED
-            </Link>
+              <Link
+                to="/policy"
+                className={`px-3 py-1 border-2 transition-colors inline-block ${
+                  isCoveragePage
+                    ? 'bg-copper-500 text-cream-50 border-copper-600'
+                    : 'border-cream-400 hover:bg-cream-200 text-text-primary'
+                }`}
+              >
+                &gt; BUY_COVERAGE ▾
+              </Link>
+
+              {coverageDropdownOpen && (
+                <div
+                  className="absolute top-full left-0 mt-1 w-48 bg-cream-300 border-2 border-cream-400 shadow-lg z-50"
+                >
+                  <Link
+                    to="/multi-chain"
+                    onClick={() => setCoverageDropdownOpen(false)}
+                    className={`block px-3 py-2 border-b-2 border-cream-400 transition-colors ${
+                      isActive('/multi-chain')
+                        ? 'bg-copper-500 text-cream-50'
+                        : 'hover:bg-cream-200 text-text-primary'
+                    }`}
+                  >
+                    &gt; Multi-Chain
+                  </Link>
+                  <Link
+                    to="/enterprise"
+                    onClick={() => setCoverageDropdownOpen(false)}
+                    className={`block px-3 py-2 border-b-2 border-cream-400 transition-colors ${
+                      isActive('/enterprise')
+                        ? 'bg-copper-500 text-cream-50'
+                        : 'hover:bg-cream-200 text-text-primary'
+                    }`}
+                  >
+                    &gt; Enterprise
+                  </Link>
+                  <Link
+                    to="/hedged"
+                    onClick={() => setCoverageDropdownOpen(false)}
+                    className={`block px-3 py-2 transition-colors ${
+                      isActive('/hedged')
+                        ? 'bg-copper-500 text-cream-50'
+                        : 'hover:bg-cream-200 text-text-primary'
+                    }`}
+                  >
+                    &gt; Hedge
+                  </Link>
+                </div>
+              )}
+            </div>
+
             <Link
               to="/vaults"
+              onClick={() => setCoverageDropdownOpen(false)}
               className={`px-3 py-1 border-2 transition-colors ${
                 isActive('/vaults')
                   ? 'bg-copper-500 text-cream-50 border-copper-600'
@@ -80,7 +105,19 @@ function Navigation() {
               &gt; VAULTS
             </Link>
             <Link
+              to="/escrow"
+              onClick={() => setCoverageDropdownOpen(false)}
+              className={`px-3 py-1 border-2 transition-colors ${
+                isActive('/escrow')
+                  ? 'bg-copper-500 text-cream-50 border-copper-600'
+                  : 'border-cream-400 hover:bg-cream-200 text-text-primary'
+              }`}
+            >
+              &gt; ESCROW
+            </Link>
+            <Link
               to="/claims"
+              onClick={() => setCoverageDropdownOpen(false)}
               className={`px-3 py-1 border-2 transition-colors ${
                 isActive('/claims')
                   ? 'bg-copper-500 text-cream-50 border-copper-600'
@@ -91,6 +128,7 @@ function Navigation() {
             </Link>
             <Link
               to="/analytics"
+              onClick={() => setCoverageDropdownOpen(false)}
               className={`px-3 py-1 border-2 transition-colors ${
                 isActive('/analytics')
                   ? 'bg-copper-500 text-cream-50 border-copper-600'
@@ -98,6 +136,17 @@ function Navigation() {
               }`}
             >
               &gt; ANALYTICS
+            </Link>
+            <Link
+              to="/risk"
+              onClick={() => setCoverageDropdownOpen(false)}
+              className={`px-3 py-1 border-2 transition-colors ${
+                isActive('/risk')
+                  ? 'bg-copper-500 text-cream-50 border-copper-600'
+                  : 'border-cream-400 hover:bg-cream-200 text-text-primary'
+              }`}
+            >
+              &gt; RISK
             </Link>
           </div>
 
@@ -121,28 +170,66 @@ function Navigation() {
         {/* Mobile menu */}
         {mobileMenuOpen && (
           <div className="md:hidden mt-3 pt-3 border-t-2 border-cream-400 space-y-2">
-            <Link
-              to="/policy"
-              onClick={() => setMobileMenuOpen(false)}
-              className={`block px-3 py-2 border-2 transition-colors text-sm font-mono ${
-                isActive('/policy')
-                  ? 'bg-copper-500 text-cream-50 border-copper-600'
-                  : 'border-cream-400 hover:bg-cream-200 text-text-primary'
-              }`}
-            >
-              &gt; BUY_COVERAGE
-            </Link>
-            <Link
-              to="/hedged"
-              onClick={() => setMobileMenuOpen(false)}
-              className={`block px-3 py-2 border-2 transition-colors text-sm font-mono ${
-                isActive('/hedged')
-                  ? 'bg-copper-500 text-cream-50 border-copper-600'
-                  : 'border-cream-400 hover:bg-cream-200 text-text-primary'
-              }`}
-            >
-              &gt; HEDGED
-            </Link>
+            {/* BUY_COVERAGE Collapsible */}
+            <div>
+              <Link
+                to="/policy"
+                onClick={() => setMobileMenuOpen(false)}
+                className={`block px-3 py-2 border-2 transition-colors text-sm font-mono ${
+                  isActive('/policy')
+                    ? 'bg-copper-500 text-cream-50 border-copper-600'
+                    : 'border-cream-400 hover:bg-cream-200 text-text-primary'
+                }`}
+              >
+                &gt; BUY_COVERAGE
+              </Link>
+
+              <button
+                onClick={() => setMobileCoverageOpen(!mobileCoverageOpen)}
+                className="w-full text-left px-3 py-2 text-xs font-mono text-text-secondary hover:text-copper-500 transition-colors"
+              >
+                {mobileCoverageOpen ? '▴' : '▾'} More Coverage Options
+              </button>
+
+              {mobileCoverageOpen && (
+                <div className="ml-4 space-y-2">
+                  <Link
+                    to="/multi-chain"
+                    onClick={() => setMobileMenuOpen(false)}
+                    className={`block px-3 py-2 border-2 transition-colors text-sm font-mono ${
+                      isActive('/multi-chain')
+                        ? 'bg-copper-500 text-cream-50 border-copper-600'
+                        : 'border-cream-400 hover:bg-cream-200 text-text-primary'
+                    }`}
+                  >
+                    &gt; Multi-Chain
+                  </Link>
+                  <Link
+                    to="/enterprise"
+                    onClick={() => setMobileMenuOpen(false)}
+                    className={`block px-3 py-2 border-2 transition-colors text-sm font-mono ${
+                      isActive('/enterprise')
+                        ? 'bg-copper-500 text-cream-50 border-copper-600'
+                        : 'border-cream-400 hover:bg-cream-200 text-text-primary'
+                    }`}
+                  >
+                    &gt; Enterprise
+                  </Link>
+                  <Link
+                    to="/hedged"
+                    onClick={() => setMobileMenuOpen(false)}
+                    className={`block px-3 py-2 border-2 transition-colors text-sm font-mono ${
+                      isActive('/hedged')
+                        ? 'bg-copper-500 text-cream-50 border-copper-600'
+                        : 'border-cream-400 hover:bg-cream-200 text-text-primary'
+                    }`}
+                  >
+                    &gt; Hedge
+                  </Link>
+                </div>
+              )}
+            </div>
+
             <Link
               to="/vaults"
               onClick={() => setMobileMenuOpen(false)}
@@ -153,6 +240,17 @@ function Navigation() {
               }`}
             >
               &gt; VAULTS
+            </Link>
+            <Link
+              to="/escrow"
+              onClick={() => setMobileMenuOpen(false)}
+              className={`block px-3 py-2 border-2 transition-colors text-sm font-mono ${
+                isActive('/escrow')
+                  ? 'bg-copper-500 text-cream-50 border-copper-600'
+                  : 'border-cream-400 hover:bg-cream-200 text-text-primary'
+              }`}
+            >
+              &gt; ESCROW
             </Link>
             <Link
               to="/claims"
@@ -175,6 +273,17 @@ function Navigation() {
               }`}
             >
               &gt; ANALYTICS
+            </Link>
+            <Link
+              to="/risk"
+              onClick={() => setMobileMenuOpen(false)}
+              className={`block px-3 py-2 border-2 transition-colors text-sm font-mono ${
+                isActive('/risk')
+                  ? 'bg-copper-500 text-cream-50 border-copper-600'
+                  : 'border-cream-400 hover:bg-cream-200 text-text-primary'
+              }`}
+            >
+              &gt; RISK
             </Link>
           </div>
         )}
@@ -199,6 +308,8 @@ function App() {
               <Route path="/vaults" element={<VaultStaking />} />
               <Route path="/claims" element={<Claims />} />
               <Route path="/analytics" element={<Analytics />} />
+              <Route path="/risk" element={<RiskDashboard />} />
+              <Route path="/escrow" element={<Escrow />} />
             </Routes>
           </main>
         </div>

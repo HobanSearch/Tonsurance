@@ -1,0 +1,343 @@
+;; DepegOracleAdapter - Stablecoin Depeg Verification Oracle
+;;
+;; This adapter verifies stablecoin depeg claims by validating price data
+;; from multiple sources (Chainlink, Pyth, Binance, Coinbase).
+;;
+;; Coverage Type: 0 (Depeg)
+;;
+;; Verification Requirements:
+;; 1. Price must be below threshold ($0.97) for 4+ consecutive hours
+;; 2. Multiple exchange consensus (2 out of 3 minimum)
+;; 3. Price data must be recent (< 1 hour stale)
+;;
+;; Evidence Format:
+;; - stablecoin_id: uint8 (0=USDC, 1=USDT, etc.)
+;; - threshold: uint64 (9 decimals, 970000000 = $0.97)
+;; - claim_timestamp: uint32
+;; - duration_seconds: uint32 (must be >= 14400 = 4 hours)
+;; - price_samples: ref cell (array of price snapshots)
+
+#include "../imports/stdlib.fc";
+
+;; ===== CONSTANTS =====
+
+;; Operation codes
+const int OP_VERIFY_CLAIM = 0x01;
+const int OP_SET_CLAIMS_PROCESSOR = 0x10;
+const int OP_SET_KEEPER = 0x11;
+const int OP_UPDATE_PRICE = 0x12;
+const int OP_BATCH_UPDATE_PRICES = 0x13;
+
+;; Response operation
+const int OP_RECEIVE_VERIFICATION = 0x20;
+
+;; Stablecoin IDs (matches types.ml)
+const int STABLECOIN_USDC = 0;
+const int STABLECOIN_USDT = 1;
+const int STABLECOIN_USDP = 2;
+const int STABLECOIN_DAI = 3;
+const int STABLECOIN_FRAX = 4;
+const int STABLECOIN_BUSD = 5;
+const int STABLECOIN_USDE = 6;
+const int STABLECOIN_SUSDE = 7;
+const int STABLECOIN_USDY = 8;
+const int STABLECOIN_PYUSD = 9;
+const int STABLECOIN_GHO = 10;
+const int STABLECOIN_LUSD = 11;
+const int STABLECOIN_CRVUSD = 12;
+const int STABLECOIN_MKUSD = 13;
+
+;; Error codes
+const int ERR_ACCESS_DENIED = 403;
+const int ERR_INVALID_EVIDENCE = 400;
+const int ERR_STALE_DATA = 408;
+const int ERR_INSUFFICIENT_SAMPLES = 409;
+const int ERR_DURATION_TOO_SHORT = 410;
+const int ERR_PRICE_ABOVE_THRESHOLD = 411;
+
+;; Constants
+const int MIN_DEPEG_DURATION = 14400;  ;; 4 hours in seconds
+const int MAX_DATA_STALENESS = 3600;   ;; 1 hour
+const int DECIMALS = 1000000000;       ;; 9 decimals for fixed-point
+const int MIN_CONSENSUS_SOURCES = 2;   ;; Require 2/3 sources agree
+
+;; ===== STORAGE =====
+
+global slice owner_address;
+global slice claims_processor_address;
+global slice keeper_address;
+global cell price_data;  ;; Dict: (stablecoin_id << 32 | timestamp) -> (price, source_bitmap)
+global int last_update_timestamp;
+
+() load_data() impure {
+    slice ds = get_data().begin_parse();
+    owner_address = ds~load_msg_addr();
+    claims_processor_address = ds~load_msg_addr();
+    keeper_address = ds~load_msg_addr();
+    price_data = ds~load_dict();
+    last_update_timestamp = ds~load_uint(32);
+}
+
+() save_data() impure {
+    set_data(begin_cell()
+        .store_slice(owner_address)
+        .store_slice(claims_processor_address)
+        .store_slice(keeper_address)
+        .store_dict(price_data)
+        .store_uint(last_update_timestamp, 32)
+        .end_cell());
+}
+
+;; ===== ACCESS CONTROL =====
+
+() check_owner(slice sender) impure inline {
+    throw_unless(ERR_ACCESS_DENIED, equal_slices_bits(sender, owner_address));
+}
+
+() check_claims_processor(slice sender) impure inline {
+    throw_unless(ERR_ACCESS_DENIED, equal_slices_bits(sender, claims_processor_address));
+}
+
+() check_keeper(slice sender) impure inline {
+    throw_unless(ERR_ACCESS_DENIED, equal_slices_bits(sender, keeper_address));
+}
+
+;; ===== PRICE DATA MANAGEMENT =====
+
+() update_price(int stablecoin_id, int timestamp, int price, int source_bitmap) impure {
+    ;; source_bitmap: bit flags for data sources
+    ;; bit 0: Chainlink
+    ;; bit 1: Pyth
+    ;; bit 2: Binance
+    ;; bit 3: Coinbase
+    
+    ;; Create composite key: (stablecoin_id << 32) | timestamp
+    int key = (stablecoin_id << 32) | timestamp;
+
+    ;; Store price with source information
+    cell price_cell = begin_cell()
+        .store_uint(price, 64)
+        .store_uint(source_bitmap, 8)
+        .end_cell();
+
+    price_data~udict_set_ref(64, key, price_cell);
+
+    ;; Update last update timestamp
+    if (timestamp > last_update_timestamp) {
+        last_update_timestamp = timestamp;
+    }
+}
+
+(int, int, int) get_price_at_timestamp(int stablecoin_id, int timestamp) inline {
+    ;; Returns (price, source_bitmap, found)
+    int key = (stablecoin_id << 32) | timestamp;
+
+    (slice price_slice, int found) = price_data.udict_get?(64, key);
+    if (~ found) {
+        return (0, 0, 0);
+    }
+
+    slice ps = price_slice~load_ref().begin_parse();
+    int price = ps~load_uint(64);
+    int source_bitmap = ps~load_uint(8);
+
+    return (price, source_bitmap, -1);
+}
+
+;; Count number of sources that agree (bits set in bitmap)
+int count_sources(int source_bitmap) inline {
+    int count = 0;
+    int i = 0;
+    while (i < 8) {
+        if (source_bitmap & (1 << i)) {
+            count += 1;
+        }
+        i += 1;
+    }
+    return count;
+}
+
+;; ===== CLAIM VERIFICATION LOGIC =====
+
+() verify_depeg_claim(
+    slice sender,
+    int query_id,
+    int coverage_type,
+    int stablecoin_id,
+    cell evidence_cell
+) impure {
+    check_claims_processor(sender);
+
+    ;; Parse evidence
+    slice evidence = evidence_cell.begin_parse();
+    int threshold = evidence~load_uint(64);           ;; e.g., 970000000 for $0.97
+    int claim_timestamp = evidence~load_uint(32);     ;; When depeg occurred
+    int duration_seconds = evidence~load_uint(32);    ;; How long it lasted
+    int num_samples = evidence~load_uint(16);         ;; Number of price samples
+    cell samples_cell = evidence~load_ref();          ;; Price sample data
+
+    ;; Validation 1: Check duration meets minimum (4 hours)
+    throw_unless(ERR_DURATION_TOO_SHORT, duration_seconds >= MIN_DEPEG_DURATION);
+
+    ;; Validation 2: Check we have enough samples (at least 1 per hour)
+    int min_samples = duration_seconds / 3600;
+    throw_unless(ERR_INSUFFICIENT_SAMPLES, num_samples >= min_samples);
+
+    ;; Validation 3: Check data freshness
+    throw_unless(ERR_STALE_DATA, now() - last_update_timestamp < MAX_DATA_STALENESS);
+
+    ;; Validation 4: Verify all samples show price below threshold
+    slice samples = samples_cell.begin_parse();
+    int all_below_threshold = -1;  ;; True
+    int consensus_count = 0;
+    int i = 0;
+
+    while (i < num_samples) {
+        int sample_timestamp = samples~load_uint(32);
+        
+        ;; Get price data for this timestamp
+        var (price, source_bitmap, found) = get_price_at_timestamp(stablecoin_id, sample_timestamp);
+        
+        if (~ found) {
+            ;; Missing price data - claim invalid
+            all_below_threshold = 0;
+            i = num_samples;  ;; Break loop
+        } else {
+            ;; Check if price is below threshold
+            if (price >= threshold) {
+                all_below_threshold = 0;
+                i = num_samples;  ;; Break loop
+            }
+
+            ;; Check consensus (2+ sources must agree)
+            int num_sources = count_sources(source_bitmap);
+            if (num_sources >= MIN_CONSENSUS_SOURCES) {
+                consensus_count += 1;
+            }
+        }
+
+        i += 1;
+    }
+
+    ;; Require consensus on at least 80% of samples
+    int min_consensus = muldiv(num_samples, 80, 100);
+    int is_valid = all_below_threshold & (consensus_count >= min_consensus);
+
+    ;; Send verification result back to ClaimsProcessor
+    cell response_body = begin_cell()
+        .store_uint(OP_RECEIVE_VERIFICATION, 32)
+        .store_uint(query_id, 64)
+        .store_uint(is_valid, 1)
+        .end_cell();
+
+    cell response_msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(claims_processor_address)
+        .store_coins(50000000)  ;; 0.05 TON for gas
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_ref(response_body)
+        .end_cell();
+
+    send_raw_message(response_msg, 1);
+
+    ;; Emit verification event
+    emit_log(0xDE9E9,  ;; "DEPEG" shortened
+        begin_cell()
+            .store_uint(query_id, 64)
+            .store_uint(stablecoin_id, 8)
+            .store_uint(is_valid, 1)
+            .store_uint(num_samples, 16)
+            .store_uint(consensus_count, 16)
+            .end_cell().begin_parse());
+}
+
+;; ===== ADMIN FUNCTIONS =====
+
+() set_claims_processor(slice sender, slice new_processor) impure {
+    check_owner(sender);
+    claims_processor_address = new_processor;
+}
+
+() set_keeper(slice sender, slice new_keeper) impure {
+    check_owner(sender);
+    keeper_address = new_keeper;
+}
+
+;; ===== MESSAGE HANDLER =====
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) { return (); }
+
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) { return (); }  ;; Ignore bounced messages
+
+    slice sender_address = cs~load_msg_addr();
+    load_data();
+
+    int op = in_msg_body~load_uint(32);
+
+    if (op == OP_VERIFY_CLAIM) {
+        int query_id = in_msg_body~load_uint(64);
+        int coverage_type = in_msg_body~load_uint(8);
+        int stablecoin_id = in_msg_body~load_uint(8);
+        cell evidence = in_msg_body~load_ref();
+        verify_depeg_claim(sender_address, query_id, coverage_type, stablecoin_id, evidence);
+    } elseif (op == OP_UPDATE_PRICE) {
+        check_keeper(sender_address);
+        int stablecoin_id = in_msg_body~load_uint(8);
+        int timestamp = in_msg_body~load_uint(32);
+        int price = in_msg_body~load_uint(64);
+        int source_bitmap = in_msg_body~load_uint(8);
+        update_price(stablecoin_id, timestamp, price, source_bitmap);
+    } elseif (op == OP_BATCH_UPDATE_PRICES) {
+        check_keeper(sender_address);
+        int num_updates = in_msg_body~load_uint(16);
+        int i = 0;
+        while (i < num_updates) {
+            int stablecoin_id = in_msg_body~load_uint(8);
+            int timestamp = in_msg_body~load_uint(32);
+            int price = in_msg_body~load_uint(64);
+            int source_bitmap = in_msg_body~load_uint(8);
+            update_price(stablecoin_id, timestamp, price, source_bitmap);
+            i += 1;
+        }
+    } elseif (op == OP_SET_CLAIMS_PROCESSOR) {
+        slice new_processor = in_msg_body~load_msg_addr();
+        set_claims_processor(sender_address, new_processor);
+    } elseif (op == OP_SET_KEEPER) {
+        slice new_keeper = in_msg_body~load_msg_addr();
+        set_keeper(sender_address, new_keeper);
+    } else {
+        throw(0xffff);
+    }
+
+    save_data();
+}
+
+;; ===== GETTERS =====
+
+slice get_owner() method_id {
+    load_data();
+    return owner_address;
+}
+
+slice get_claims_processor() method_id {
+    load_data();
+    return claims_processor_address;
+}
+
+slice get_keeper() method_id {
+    load_data();
+    return keeper_address;
+}
+
+int get_last_update() method_id {
+    load_data();
+    return last_update_timestamp;
+}
+
+(int, int, int) get_price(int stablecoin_id, int timestamp) method_id {
+    load_data();
+    return get_price_at_timestamp(stablecoin_id, timestamp);
+}

@@ -1,0 +1,11 @@
+(library
+ (name config)
+ (public_name tonsurance.config)
+ (modules config_manager)
+ (libraries
+   core
+   lwt
+   lwt.unix
+   yojson
+   logs
+   types))

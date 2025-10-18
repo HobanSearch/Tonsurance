@@ -28,9 +28,38 @@ dune-project.lock
 
 # Environment variables
 .env
+.env.*
 .env.local
 .env.production
+.env.development
+.env.staging
+.env.testnet
+.env.mainnet
 .env.*.local
+.env.deployment
+.env.backup*
+.env.secrets
+frontend/.env
+frontend/.env.*
+frontend/.env.deployment
+frontend/.env.backup*
+backend/.env
+backend/.env.*
+
+# Secrets and credentials
+*.pem
+*.key
+*.cert
+*.p12
+*.pfx
+credentials.json
+secrets.json
+secrets/
+.secrets/
+*secret*
+*mnemonic*
+*private-key*
+wallet-*.json
 
 # Logs
 logs/

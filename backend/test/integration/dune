@@ -1,0 +1,41 @@
+; TODO: Re-enable after fixing Chainlink config API
+; (executable
+;  (name test_api_integration)
+;  (modules test_api_integration)
+;  (libraries
+;    core
+;    lwt
+;    lwt.unix
+;    cohttp-lwt-unix
+;    yojson
+;    alcotest
+;    alcotest-lwt
+;    logs
+;    logs.fmt
+;    integration
+;    types)
+;  (preprocess (pps lwt_ppx)))
+
+(executable
+ (name test_config_management)
+ (modules test_config_management)
+ (libraries
+   core
+   lwt
+   lwt.unix
+   yojson
+   alcotest
+   alcotest-lwt
+   logs
+   logs.fmt
+   config
+   etl
+   risk_model
+   reporting
+   types)
+ (preprocess (pps lwt_ppx)))
+
+(rule
+ (alias runtest)
+ (deps test_config_management.exe)
+ (action (run ./test_config_management.exe)))

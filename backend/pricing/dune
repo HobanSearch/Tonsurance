@@ -1,5 +1,20 @@
 (library
  (name pricing_engine)
  (public_name tonsurance.pricing_engine)
+ (modules pricing_engine)
  (libraries core types math)
  (preprocess (pps ppx_sexp_conv)))
+
+(library
+ (name tranche_pricing)
+ (public_name tonsurance.tranche_pricing)
+ (modules tranche_pricing)
+ (libraries core)
+ (preprocess (pps ppx_jane)))
+
+(executable
+ (name pricing_oracle_keeper)
+ (public_name pricing_oracle_keeper)
+ (modules pricing_oracle_keeper)
+ (libraries core types monitoring lwt lwt.unix cohttp-lwt-unix yojson)
+ (preprocess (pps lwt_ppx ppx_sexp_conv)))

@@ -42,16 +42,11 @@ let default_config () = {
 module Telegram = struct
   (** Send message to chat *)
   let send_message ~token ~chat_id ~text =
-    let open Lwt.Syntax in
-    (* TODO: Implement actual Telegram API call *)
-    (* For now, just log it *)
-    Lwt_io.printlf "[Telegram] Sending to %Ld: %s" chat_id text
+    Telegram_webhook.TelegramAPI.send_message ~token ~chat_id ~text
 
   (** Send typing action *)
   let send_typing_action ~token ~chat_id =
-    let open Lwt.Syntax in
-    (* TODO: Implement actual Telegram API call *)
-    Lwt_io.printlf "[Telegram] Typing action for %Ld" chat_id
+    Telegram_webhook.TelegramAPI.send_chat_action ~token ~chat_id ~action:"typing"
 end
 
 (** Route commands to handlers *)
@@ -90,40 +85,6 @@ let handle_command ~state ~user_id ~chat_id ~message_text =
        | _ ->
            send_message chat_id "Service temporarily unavailable. Please try again later.")
 
-  | "buy" ->
-      Buy.handle
-        ~user_id
-        ~chat_id
-        ~send_message
-        ~send_inline_keyboard:(fun chat_id text keyboard ->
-          Telegram.send_inline_keyboard ~token ~chat_id ~text ~keyboard)
-        ~policy_factory_address:"EQC..." (* TODO: Get from config *)
-
-  | "policies" ->
-      Policies.handle
-        ~user_id
-        ~chat_id
-        ~send_message
-        ~get_user_policies:(fun user_id ->
-          (* TODO: Implement database query *)
-          Lwt.return (Ok []))
-
-  | "claim" ->
-      Claim.handle
-        ~user_id
-        ~chat_id
-        ~message_text
-        ~send_message
-        ~get_policy_claim_status:(fun user_id policy_id ->
-          (* TODO: Implement claim status query *)
-          Lwt.return (Ok { has_claim = false }))
-
-  | "bridges" ->
-      Bridges.handle
-        ~chat_id
-        ~send_message
-        ~bridge_monitor:state.bridge_monitor
-
   | "tonny" ->
       Tonny.handle
         ~user_id
@@ -133,17 +94,26 @@ let handle_command ~state ~user_id ~chat_id ~message_text =
         ~send_typing_action
         ~ollama_config:state.config.ollama_config
 
+  | "buy" ->
+      Buy.handle ~user_id ~chat_id ~message_text ~send_message
+
+  | "policies" ->
+      Policies.handle ~user_id ~chat_id ~send_message
+
+  | "claim" ->
+      Claim.handle ~user_id ~chat_id ~message_text ~send_message
+
+  | "bridges" ->
+      (match state.bridge_monitor with
+       | Some bm ->
+           Bridges.handle ~chat_id ~send_message ~bridge_monitor:bm
+       | None ->
+           send_message chat_id "Bridge monitoring service temporarily unavailable.")
+
   | _ ->
-      send_message chat_id
-        {|❓ Unknown command. Try:
+      send_message chat_id {|❓ Unknown command
 
-• `/quote` - Get coverage quote
-• `/buy` - Purchase coverage
-• `/bridges` - Check bridge health
-• `/tonny` - Chat with me
-• `/help` - See all commands
-
-Or just ask me a question! 🤖|}
+Use `/help` to see all available commands! 🤖|}
 
 (** Handle incoming message *)
 let handle_message ~state ~user_id ~chat_id ~message_text =
@@ -152,7 +122,7 @@ let handle_message ~state ~user_id ~chat_id ~message_text =
   if String.is_prefix message_text ~prefix:"/" then
     handle_command ~state ~user_id ~chat_id ~message_text
   else (
-    (* Not a command - treat as chat with Tonny *)
+    (* Natural language message - route to Tonny *)
     let token = state.config.telegram_token in
     let send_message = Telegram.send_message ~token in
     let send_typing_action = Telegram.send_typing_action ~token in
@@ -160,7 +130,7 @@ let handle_message ~state ~user_id ~chat_id ~message_text =
     Tonny.handle
       ~user_id
       ~chat_id
-      ~message_text:("/tonny " ^ message_text)
+      ~message_text
       ~send_message
       ~send_typing_action
       ~ollama_config:state.config.ollama_config
@@ -177,8 +147,14 @@ let initialize_services state =
 
   (* Initialize bridge monitor *)
   let* () = Lwt_io.printl "Initializing bridge monitor..." in
-  (* TODO: Initialize with actual oracle sources *)
-  (* state.bridge_monitor <- Some (Bridge_monitor.create ...) *)
+  let monitor_config = {
+    Bridge_monitor.update_interval_seconds = 300; (* 5 minutes *)
+    oracle_sources = [
+      Bridge_monitor.Chainlink;
+      Bridge_monitor.Custom "https://bridgehealth.ton.org/api/status";
+    ];
+  } in
+  state.bridge_monitor <- Some (Bridge_monitor.create monitor_config);
 
   Lwt_io.printl "✅ Services initialized"
 
@@ -220,18 +196,29 @@ let run () =
   (* Start cleanup task *)
   start_cleanup_task ();
 
-  (* Start bot loop *)
-  let* () = Lwt_io.printl "✅ Tonny is ready!" in
-  let* () = Lwt_io.printl "Waiting for Telegram messages..." in
+  (* Get webhook configuration *)
+  let port = Option.value (Sys.getenv "WEBHOOK_PORT") ~default:"8080" |> Int.of_string in
+  let webhook_path = Option.value (Sys.getenv "WEBHOOK_PATH") ~default:"/webhook" in
+  let webhook_url = Sys.getenv "WEBHOOK_URL" in
 
-  (* TODO: Implement actual Telegram bot polling/webhook *)
-  (* For now, just keep running *)
-  let rec keep_alive () =
-    let* () = Lwt_unix.sleep 60.0 in
-    let* () = Lwt_io.printlf "Stats: %s" (Conversation_state.get_stats ()) in
-    keep_alive ()
+  (* Set Telegram webhook if URL provided *)
+  let* () = match webhook_url with
+    | Some url ->
+        let* () = Lwt_io.printlf "Setting Telegram webhook to: %s" url in
+        Telegram_webhook.TelegramAPI.set_webhook
+          ~token:config.telegram_token
+          ~url:(url ^ webhook_path)
+    | None ->
+        Lwt_io.printl "⚠️  No WEBHOOK_URL set - webhook not configured"
   in
-  keep_alive ()
+
+  (* Start webhook server *)
+  let* () = Lwt_io.printl "✅ Tonny is ready!" in
+  Telegram_webhook.start_webhook_server
+    ~state
+    ~token:config.telegram_token
+    ~port
+    ~webhook_path
 
 (** Entry point *)
 let () =

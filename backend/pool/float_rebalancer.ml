@@ -17,7 +17,6 @@
 *)
 
 open Core
-open Lwt.Syntax
 open Types
 open Math
 
@@ -78,7 +77,7 @@ module FloatRebalancer = struct
 
         (* Calculate payout if triggered *)
         let payout =
-          if stress_price < policy.trigger_price then
+          if Float.(stress_price < policy.trigger_price) then
             let payout_ratio =
               (policy.trigger_price -. stress_price) /.
               (policy.trigger_price -. policy.floor_price)
@@ -117,11 +116,11 @@ module FloatRebalancer = struct
   (** Calculate dynamic target allocation based on market conditions **)
   let calculate_dynamic_allocation
       (collateral_mgr: Collateral_manager.CollateralManager.t)
-      ~(btc_price: float)
+      ~(_btc_price: float)
       ~(btc_volatility: float)
       ~(config: rebalancer_config)
       ~(price_scenarios: (asset * float) list)
-    : (float * float) = (* (target_usd_pct, target_btc_pct) *)
+    : (float * float) = (* (target_usd_pct, _target_btc_pct) *)
 
     (* Calculate required liquidity *)
     let required_liquidity = calculate_required_liquidity collateral_mgr ~price_scenarios in
@@ -160,7 +159,7 @@ module FloatRebalancer = struct
     let current_btc_value = sats_to_btc pool.btc_float_sats *. btc_price in
     let total = current_usd +. current_btc_value in
 
-    if total <= 0.0 then (0.50, 0.50)
+    if Float.(total <= 0.0) then (0.50, 0.50)
     else (current_usd /. total, current_btc_value /. total)
 
   (** Determine rebalancing urgency **)
@@ -171,11 +170,11 @@ module FloatRebalancer = struct
     : [`Low | `Medium | `High | `Critical] =
 
     (* Critical if reserves low AND drift high *)
-    if reserve_ratio < 0.15 && drift > 0.15 then `Critical
-    else if reserve_ratio < 0.20 && drift > 0.10 then `High
-    else if ltv > 0.70 && drift > 0.10 then `High
-    else if drift > 0.15 then `High
-    else if drift > 0.10 then `Medium
+    if Float.(reserve_ratio < 0.15) && Float.(drift > 0.15) then `Critical
+    else if Float.(reserve_ratio < 0.20) && Float.(drift > 0.10) then `High
+    else if Float.(ltv > 0.70) && Float.(drift > 0.10) then `High
+    else if Float.(drift > 0.15) then `High
+    else if Float.(drift > 0.10) then `Medium
     else `Low
 
   (** Generate rebalancing action **)
@@ -190,16 +189,16 @@ module FloatRebalancer = struct
     let pool = collateral_mgr.pool in
 
     (* Calculate target allocation *)
-    let (target_usd_pct, target_btc_pct) =
+    let (target_usd_pct, _target_btc_pct) =
       calculate_dynamic_allocation collateral_mgr
-        ~btc_price
+        ~_btc_price:btc_price
         ~btc_volatility
         ~config
         ~price_scenarios
     in
 
     (* Calculate current allocation *)
-    let (current_usd_pct, current_btc_pct) =
+    let (current_usd_pct, _current_btc_pct) =
       calculate_current_allocation collateral_mgr ~btc_price
     in
 
@@ -207,7 +206,7 @@ module FloatRebalancer = struct
     let drift = Float.abs (current_usd_pct -. target_usd_pct) in
 
     (* Check if rebalancing needed *)
-    if drift < config.rebalance_threshold then
+    if Float.(drift < config.rebalance_threshold) then
       None (* No rebalancing needed *)
     else
       let total_capital = cents_to_usd pool.total_capital_usd in
@@ -216,7 +215,7 @@ module FloatRebalancer = struct
 
       let urgency = calculate_urgency drift reserve_ratio ltv in
 
-      if current_usd_pct > target_usd_pct then
+      if Float.(current_usd_pct > target_usd_pct) then
         (* Too much USD → Buy BTC *)
         let excess_usd = (current_usd_pct -. target_usd_pct) *. total_capital in
 
@@ -248,11 +247,11 @@ module FloatRebalancer = struct
         let current_btc = sats_to_btc pool.btc_float_sats in
 
         (* Check minimum float *)
-        if (current_btc -. btc_to_sell) < config.min_btc_float then
+        if Float.((current_btc -. btc_to_sell) < config.min_btc_float) then
           let max_sellable = Float.max 0.0 (current_btc -. config.min_btc_float) in
           let actual_usd = max_sellable *. btc_price in
 
-          if max_sellable > 0.01 then
+          if Float.(max_sellable > 0.01) then
             Some {
               action = `Sell_BTC actual_usd;
               usd_amount = actual_usd;
@@ -289,7 +288,7 @@ module FloatRebalancer = struct
   let execute_rebalance
       (collateral_manager: Collateral_manager.CollateralManager.t ref)
       (action: rebalance_action)
-      ~(btc_price: float)
+      ~(_btc_price: float)
     : unit =
 
     let pool = !collateral_manager.pool in
@@ -305,7 +304,7 @@ module FloatRebalancer = struct
           btc_float_sats = Int64.(pool.btc_float_sats + btc_sats);
           btc_cost_basis_usd = Int64.(pool.btc_cost_basis_usd + usd_cents);
           usd_reserves = Int64.(pool.usd_reserves - usd_cents);
-          last_rebalance_time = Unix.time ();
+          last_rebalance_time = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
         } in
 
         collateral_manager := { !collateral_manager with pool = new_pool }
@@ -317,7 +316,7 @@ module FloatRebalancer = struct
 
         (* Calculate cost basis reduction (proportional) *)
         let cost_basis_reduction =
-          if pool.btc_float_sats = 0L then 0L
+          if Int64.(pool.btc_float_sats = 0L) then 0L
           else
             Int64.(pool.btc_cost_basis_usd * btc_sats / pool.btc_float_sats)
         in
@@ -327,7 +326,7 @@ module FloatRebalancer = struct
           btc_float_sats = Int64.(pool.btc_float_sats - btc_sats);
           btc_cost_basis_usd = Int64.(pool.btc_cost_basis_usd - cost_basis_reduction);
           usd_reserves = Int64.(pool.usd_reserves + usd_cents);
-          last_rebalance_time = Unix.time ();
+          last_rebalance_time = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
         } in
 
         collateral_manager := { !collateral_manager with pool = new_pool }
@@ -350,7 +349,7 @@ module FloatRebalancer = struct
     let btc_value_usd = current_btc *. btc_price in
     let cost_basis = cents_to_usd pool.btc_cost_basis_usd in
     let unrealized_pnl = btc_value_usd -. cost_basis in
-    let pnl_pct = if cost_basis > 0.0 then (unrealized_pnl /. cost_basis) *. 100.0 else 0.0 in
+    let pnl_pct = if Float.(cost_basis > 0.0) then (unrealized_pnl /. cost_basis) *. 100.0 else 0.0 in
 
     [
       ("Current USD %", Printf.sprintf "%.2f%%" (current_usd_pct *. 100.0));
@@ -359,7 +358,7 @@ module FloatRebalancer = struct
       ("BTC Value", Printf.sprintf "$%.2f" btc_value_usd);
       ("Cost Basis", Printf.sprintf "$%.2f" cost_basis);
       ("Unrealized P&L", Printf.sprintf "$%.2f (%.2f%%)" unrealized_pnl pnl_pct);
-      ("Last Rebalance", Time.to_string (Time.of_float pool.last_rebalance_time));
+      ("Last Rebalance", Time_float.to_string_utc (Time_float.of_span_since_epoch (Time_float.Span.of_sec pool.last_rebalance_time)));
     ]
 
   (** Main rebalancing loop **)
@@ -374,8 +373,8 @@ module FloatRebalancer = struct
     let rec loop () =
       let%lwt () =
         try%lwt
-          Lwt_io.printlf "\n[%s] Checking rebalancing needs..."
-            (Time.to_string (Time.now ())) >>= fun () ->
+          let%lwt () = Lwt_io.printlf "\n[%s] Checking rebalancing needs..."
+            (Time_float.to_string_utc (Time_float.now ())) in
 
           (* Get market data *)
           let%lwt btc_price = btc_price_provider () in
@@ -402,17 +401,17 @@ module FloatRebalancer = struct
                 | `Low -> "ℹ️  LOW"
               in
 
-              Lwt_io.printlf "\n%s REBALANCE NEEDED:" urgency_str >>= fun () ->
-              Lwt_io.printlf "  Action: %s"
+              let%lwt () = Lwt_io.printlf "\n%s REBALANCE NEEDED:" urgency_str in
+              let%lwt () = Lwt_io.printlf "  Action: %s"
                 (match action.action with
                   | `Buy_BTC amt -> Printf.sprintf "Buy %.8f BTC ($%.2f)" action.btc_amount amt
                   | `Sell_BTC amt -> Printf.sprintf "Sell %.8f BTC ($%.2f)" action.btc_amount amt
-                  | `Hold -> "Hold") >>= fun () ->
-              Lwt_io.printlf "  Reason: %s" action.reason >>= fun () ->
-              Lwt_io.printlf "  Expected benefit: $%.2f" action.expected_benefit >>= fun () ->
+                  | `Hold -> "Hold") in
+              let%lwt () = Lwt_io.printlf "  Reason: %s" action.reason in
+              let%lwt () = Lwt_io.printlf "  Expected benefit: $%.2f" action.expected_benefit in
 
               (* Execute rebalance *)
-              execute_rebalance collateral_manager action ~btc_price;
+              execute_rebalance collateral_manager action ~_btc_price:btc_price;
 
               Lwt_io.printlf "✓ Rebalance executed successfully"
 
@@ -434,10 +433,10 @@ module FloatRebalancer = struct
       loop ()
     in
 
-    Lwt_io.printlf "\n╔════════════════════════════════════════╗" >>= fun () ->
-    Lwt_io.printlf "║  Float Rebalancer Started              ║" >>= fun () ->
-    Lwt_io.printlf "╚════════════════════════════════════════╝\n" >>= fun () ->
-    Lwt_io.printlf "Check interval: %.0f seconds\n" config.check_interval_seconds >>= fun () ->
+    let%lwt () = Lwt_io.printlf "\n╔════════════════════════════════════════╗" in
+    let%lwt () = Lwt_io.printlf "║  Float Rebalancer Started              ║" in
+    let%lwt () = Lwt_io.printlf "╚════════════════════════════════════════╝\n" in
+    let%lwt () = Lwt_io.printlf "Check interval: %.0f seconds\n" config.check_interval_seconds in
 
     loop ()
 

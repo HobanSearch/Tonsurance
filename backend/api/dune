@@ -1,5 +1,55 @@
 (library
  (name api_server)
  (public_name tonsurance.api_server)
- (libraries core types math pricing_engine risk_model pool claims_engine monitoring dream lwt lwt.unix yojson logs logs.lwt)
+ (modules api_server bulk_protection_api ocaml_price_api admin_api)
+ (libraries core types math pricing_engine risk_model pool claims_engine monitoring config opium dream lwt lwt.unix yojson logs logs.lwt)
  (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
+
+(executable
+ (name tranche_apy_api)
+ (public_name tranche_apy_api)
+ (modules tranche_apy_api)
+ (libraries core tranche_pricing dream lwt lwt.unix yojson)
+ (preprocess (pps lwt_ppx ppx_yojson_conv)))
+
+(library
+ (name escrow_api)
+ (public_name tonsurance.escrow_api)
+ (modules escrow_api)
+ (libraries core types escrow db dream lwt lwt.unix yojson)
+ (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
+
+(library
+ (name transactional_api)
+ (public_name tonsurance.transactional_api)
+ (modules transactional_api)
+ (libraries core types math pricing_engine db integration dream lwt lwt.unix yojson)
+ (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
+
+(library
+ (name security_middleware)
+ (public_name tonsurance.security_middleware)
+ (modules security_middleware rate_limiter)
+ (libraries core dream lwt lwt.unix yojson logs logs.lwt base64)
+ (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
+
+(library
+ (name api_v2)
+ (public_name tonsurance.api_v2)
+ (modules api_v2)
+ (libraries core types math pricing_engine risk_model pool monitoring escrow_api transactional_api integration security_middleware dream lwt lwt.unix yojson logs logs.lwt)
+ (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
+
+(library
+ (name websocket_v2)
+ (public_name tonsurance.websocket_v2)
+ (modules websocket_v2)
+ (libraries core types pool monitoring dream lwt lwt.unix yojson)
+ (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
+
+(executable
+ (name api_v2_server)
+ (public_name tonsurance-api-v2)
+ (modules api_v2_server)
+ (libraries api_v2 websocket_v2 pool security_middleware dream lwt lwt.unix)
+ (preprocess (pps lwt_ppx)))

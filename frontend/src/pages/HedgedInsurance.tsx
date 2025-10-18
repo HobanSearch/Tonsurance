@@ -429,7 +429,7 @@ export const HedgedInsurance = () => {
                     variant="primary"
                     className="w-full"
                   >
-                    {isLoading ? 'PROCESSING...' : userAddress ? 'PURCHASE HEDGED POLICY >>' : 'CONNECT WALLET'}
+                    {isLoading ? 'PROCESSING...' : userAddress ? 'PURCHASE HEDGED COVERAGE >>' : 'CONNECT TON WALLET'}
                   </RetroButton>
 
                   <div className="border-t-2 border-cream-400 pt-3 space-y-1.5">

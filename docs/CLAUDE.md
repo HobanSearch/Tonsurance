@@ -74,6 +74,118 @@ Tonsurance offers **two distinct insurance products**:
 - Same claims engine and oracles
 - Same multi-party reward distribution
 
+### Multi-Dimensional Product Matrix (560 Products)
+
+Tonsurance supports a **3-dimensional product matrix** combining:
+- **5 Coverage Types** (coverage_type dimension)
+- **8 Blockchains** (chain dimension)
+- **14 Stablecoins** (asset dimension)
+
+This creates **560 possible products** (5 × 8 × 14), though not all combinations are valid (e.g., Bitcoin doesn't have smart contracts).
+
+#### Coverage Types (5)
+1. **Depeg Protection** (Type ID: 0)
+   - Stablecoin drops below $0.97 for 4+ hours
+   - Base risk multiplier: 1.0x
+   - Most common product
+   - Example: USDC depeg on Ethereum
+
+2. **Bridge Exploit** (Type ID: 3)
+   - Cross-chain bridge hacks/exploits
+   - Base risk multiplier: 1.5x
+   - Chain-pair dependent pricing
+   - Example: Wormhole Ethereum→Solana
+
+3. **Smart Contract** (Type ID: 1)
+   - Contract vulnerability exploits
+   - Base risk multiplier: 1.3x
+   - Not available on Bitcoin/Lightning
+   - Example: Aave on Polygon
+
+4. **Oracle Failure** (Type ID: 2)
+   - Oracle manipulation/failure
+   - Base risk multiplier: 1.2x
+   - Example: Chainlink on Arbitrum
+
+5. **CEX Liquidation** (Type ID: 4)
+   - Cascading liquidation events
+   - Base risk multiplier: 1.4x
+   - Tracks centralized exchange events
+   - Example: Binance USDT liquidations
+
+#### Supported Blockchains (9)
+1. **Ethereum** (Chain ID: 0) - Security multiplier: 1.0x
+2. **Arbitrum** (Chain ID: 1) - Security multiplier: 1.1x
+3. **Base** (Chain ID: 2) - Security multiplier: 1.1x
+4. **Polygon** (Chain ID: 3) - Security multiplier: 1.2x
+5. **Optimism** (Chain ID: 4) - Security multiplier: 1.1x
+6. **Bitcoin** (Chain ID: 5) - Security multiplier: 0.9x (discount)
+7. **Lightning** (Chain ID: 6) - Security multiplier: 1.3x
+8. **Solana** (Chain ID: 7) - Security multiplier: 1.4x
+9. **TON** (Chain ID: 8) - Security multiplier: 1.15x
+
+#### Supported Stablecoins (14)
+1. **USDC** (Coin ID: 0) - Tier 1, Depeg risk: 0.15
+2. **USDT** (Coin ID: 1) - Tier 1, Depeg risk: 0.25
+3. **USDP** (Coin ID: 2) - Tier 1, Depeg risk: 0.20
+4. **DAI** (Coin ID: 3) - Tier 2, Depeg risk: 0.30
+5. **FRAX** (Coin ID: 4) - Tier 2, Depeg risk: 0.40
+6. **BUSD** (Coin ID: 5) - Tier 2, Depeg risk: 0.35
+7. **USDe** (Coin ID: 6) - Tier 3, Depeg risk: 0.50
+8. **sUSDe** (Coin ID: 7) - Tier 3, Depeg risk: 0.55
+9. **USDY** (Coin ID: 8) - Tier 2, Depeg risk: 0.30
+10. **PYUSD** (Coin ID: 9) - Tier 1, Depeg risk: 0.25
+11. **GHO** (Coin ID: 10) - Tier 2, Depeg risk: 0.35
+12. **LUSD** (Coin ID: 11) - Tier 2, Depeg risk: 0.30
+13. **crvUSD** (Coin ID: 12) - Tier 3, Depeg risk: 0.40
+14. **mkUSD** (Coin ID: 13) - Tier 3, Depeg risk: 0.45
+
+#### Multi-Dimensional Pricing Formula
+
+```
+Final Premium = Base Premium × Coverage Type Multiplier × Chain Risk Multiplier × Stablecoin Risk Adjustment
+```
+
+**Example Product: USDC Depeg on Ethereum**
+```
+Coverage: $100,000
+Duration: 30 days
+Base Premium: $100,000 × 0.04 APR × (30/365) = $328.77
+
+Coverage Type: Depeg (1.0x)
+Chain Risk: Ethereum (1.0x)
+Stablecoin Risk: USDC Tier 1 (0 bps adjustment)
+
+Final Premium: $328.77 × 1.0 × 1.0 = $328.77
+```
+
+**Example Product: USDe Smart Contract on Polygon**
+```
+Coverage: $100,000
+Duration: 30 days
+Base Premium: $328.77
+
+Coverage Type: Smart Contract (1.3x)
+Chain Risk: Polygon (1.2x)
+Stablecoin Risk: USDe Tier 3 (+150 bps)
+
+Base: $328.77
+After Coverage Type: $328.77 × 1.3 = $427.40
+After Chain Risk: $427.40 × 1.2 = $512.88
+After Stablecoin Risk: $512.88 + ($100,000 × 0.015 × 30/365) = $512.88 + $123.29 = $636.17
+
+Final Premium: $636.17 (1.93x more expensive than USDC on Ethereum)
+```
+
+#### Product Availability Matrix
+
+Not all 560 combinations are available:
+- **Bitcoin/Lightning**: Only Depeg coverage (no smart contracts)
+- **CEX Liquidation**: Available on all chains
+- **Bridge Exploit**: Requires bridge TVL > $100M
+
+See `docs/PRODUCT_MATRIX.md` for complete product list and `docs/RISK_MATRIX.md` for risk multipliers.
+
 ### Contract Structure
 - **contracts/**: FunC smart contract source files (.fc)
   - `contracts/core/`: Core Insurance contracts (fixed pricing)

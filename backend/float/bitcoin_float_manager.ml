@@ -31,6 +31,17 @@ open Math
 
 module BitcoinFloatManager = struct
 
+  (** Vault state for Bitcoin float management *)
+  type vault_state = {
+    total_capital_usd: usd_cents;
+    btc_float_sats: int64;
+    btc_float_value_usd: usd_cents;
+    usd_reserves: usd_cents;
+    collateral_positions: unit list; (* Placeholder *)
+    active_policies: unit list; (* Placeholder *)
+    total_coverage_sold: usd_cents;
+  }
+
   (** Allocation strategy parameters *)
   module AllocationStrategy = struct
 
@@ -41,7 +52,7 @@ module BitcoinFloatManager = struct
       rebalance_threshold: float;  (* When to rebalance (as % drift) *)
       dca_enabled: bool;           (* Use dollar-cost averaging? *)
       dca_frequency_hours: int;    (* DCA purchase frequency *)
-    } [@@deriving sexp, yojson]
+    } [@@deriving sexp]
 
     (** Default allocation rules *)
     let default_rule = {
@@ -92,7 +103,7 @@ module BitcoinFloatManager = struct
         in
 
         let drift = Float.abs (usd_pct -. rule.target_usd_pct) in
-        drift > rule.rebalance_threshold
+        Float.(drift > rule.rebalance_threshold)
 
   end
 
@@ -103,7 +114,7 @@ module BitcoinFloatManager = struct
       | BuyBTC of float  (* USD amount to spend *)
       | SellBTC of float (* BTC amount to sell *)
       | Hold
-    [@@deriving sexp, yojson]
+    [@@deriving sexp]
 
     type trade_execution = {
       signal: trade_signal;
@@ -112,7 +123,28 @@ module BitcoinFloatManager = struct
       usd_amount: float;
       timestamp: float;
       reason: string;
-    } [@@deriving sexp, yojson]
+    } [@@deriving sexp]
+
+    (** Hedge position tracking *)
+    type hedge_position = {
+      binance_position_id: string;
+      btc_amount: float;
+      entry_price: float;
+      unrealized_pnl: float;
+      opened_at: float;
+    } [@@deriving sexp]
+
+    type hedge_state = {
+      active_hedge: hedge_position option;
+      total_hedged_btc: float;
+      hedge_history: trade_execution list;
+    } [@@deriving sexp]
+
+    let empty_hedge_state = {
+      active_hedge = None;
+      total_hedged_btc = 0.0;
+      hedge_history = [];
+    }
 
     (** Generate trading signal based on current state *)
     let generate_signal
@@ -133,7 +165,7 @@ module BitcoinFloatManager = struct
 
         (* Check if rebalancing needed *)
         if AllocationStrategy.needs_rebalancing vault rule then
-          if current_usd_pct > rule.target_usd_pct then
+          if Float.O.(current_usd_pct > rule.target_usd_pct) then
             (* Too much USD, buy BTC *)
             let excess_usd =
               (current_usd_pct -. rule.target_usd_pct) *.
@@ -148,14 +180,172 @@ module BitcoinFloatManager = struct
             in
 
             (* Don't sell below minimum float *)
-            if current_btc -. excess_btc < rule.min_float_btc then
+            if Float.O.(current_btc -. excess_btc < rule.min_float_btc) then
               Hold
             else
               SellBTC excess_btc
         else
           Hold
 
-    (** Execute trade (in production, would call exchange API) *)
+    (** Execute trade using Binance Futures (REAL INTEGRATION) *)
+    let execute_trade_with_hedge
+        (signal: trade_signal)
+        (vault: vault_state)
+        ~(btc_price: float)
+        ~(reason: string)
+        ~(binance_config: Integration.Binance_futures_client.BinanceFuturesClient.config)
+        ~(hedge_state: hedge_state)
+      : (vault_state * trade_execution option * hedge_state, string) Result.t Lwt.t =
+      let open Lwt.Syntax in
+
+      match signal with
+      | BuyBTC usd_amount ->
+          if Float.O.(usd_amount <= 0.0) then Lwt.return (Ok (vault, None, hedge_state))
+          else
+            let btc_amount = usd_amount /. btc_price in
+            let btc_sats = btc_to_sats btc_amount in
+            let usd_cents = usd_to_cents usd_amount in
+
+            (* Open short hedge on Binance Futures *)
+            let%lwt hedge_result = Integration.Binance_futures_client.BinanceFuturesClient.open_short
+              ~config:binance_config
+              ~symbol:"BTCUSDT"
+              ~quantity:btc_amount
+              ~leverage:5  (* Use 5x leverage for hedging *)
+            in
+
+            (match hedge_result with
+            | Error e ->
+                let err_msg = Integration.Binance_futures_client.BinanceFuturesClient.error_to_string e in
+                let%lwt () = Logs_lwt.warn (fun m ->
+                  m "Failed to open hedge position: %s (continuing without hedge)" err_msg
+                ) in
+
+                (* Continue without hedge *)
+                let new_vault = {
+                  vault with
+                  btc_float_sats = Int64.(vault.btc_float_sats + btc_sats);
+                  btc_float_value_usd = Int64.(vault.btc_float_value_usd + usd_cents);
+                  usd_reserves = Int64.(vault.usd_reserves - usd_cents);
+                } in
+
+                let execution = {
+                  signal;
+                  btc_price;
+                  btc_amount;
+                  usd_amount;
+                  timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
+                  reason = reason ^ " (hedge failed)";
+                } in
+
+                Lwt.return (Ok (new_vault, Some execution, hedge_state))
+
+            | Ok position ->
+                let%lwt () = Logs_lwt.info (fun m ->
+                  m "Hedge opened: %.8f BTC short @ $%.2f (position: %s)"
+                    btc_amount position.entry_price position.position_id
+                ) in
+
+                (* Update vault state *)
+                let new_vault = {
+                  vault with
+                  btc_float_sats = Int64.(vault.btc_float_sats + btc_sats);
+                  btc_float_value_usd = Int64.(vault.btc_float_value_usd + usd_cents);
+                  usd_reserves = Int64.(vault.usd_reserves - usd_cents);
+                } in
+
+                let execution = {
+                  signal;
+                  btc_price;
+                  btc_amount;
+                  usd_amount;
+                  timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
+                  reason = reason ^ " (hedged)";
+                } in
+
+                (* Update hedge state *)
+                let hedge_pos = {
+                  binance_position_id = position.position_id;
+                  btc_amount;
+                  entry_price = position.entry_price;
+                  unrealized_pnl = position.unrealized_pnl;
+                  opened_at = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
+                } in
+
+                let new_hedge_state = {
+                  active_hedge = Some hedge_pos;
+                  total_hedged_btc = hedge_state.total_hedged_btc +. btc_amount;
+                  hedge_history = execution :: hedge_state.hedge_history;
+                } in
+
+                Lwt.return (Ok (new_vault, Some execution, new_hedge_state))
+            )
+
+      | SellBTC btc_amount ->
+          if Float.O.(btc_amount <= 0.0) then Lwt.return (Ok (vault, None, hedge_state))
+          else
+            let btc_sats = btc_to_sats btc_amount in
+            let usd_amount = btc_amount *. btc_price in
+            let usd_cents = usd_to_cents usd_amount in
+
+            (* Close hedge position if active *)
+            let%lwt (hedge_pnl_opt, new_hedge_state) = match hedge_state.active_hedge with
+            | None ->
+                Lwt.return (None, hedge_state)
+            | Some hedge_pos ->
+                let%lwt close_result = Integration.Binance_futures_client.BinanceFuturesClient.close_position
+                  ~config:binance_config
+                  ~position_id:hedge_pos.binance_position_id
+                in
+
+                match close_result with
+                | Error e ->
+                    let%lwt () = Logs_lwt.warn (fun m ->
+                      m "Failed to close hedge: %s"
+                        (Integration.Binance_futures_client.BinanceFuturesClient.error_to_string e)
+                    ) in
+                    Lwt.return (None, hedge_state)
+                | Ok pnl ->
+                    let%lwt () = Logs_lwt.info (fun m ->
+                      m "Hedge closed: realized PnL = $%.2f, fees = $%.2f, net = $%.2f"
+                        pnl.realized_pnl pnl.fees pnl.net_pnl
+                    ) in
+                    let updated_state = {
+                      active_hedge = None;
+                      total_hedged_btc = hedge_state.total_hedged_btc;
+                      hedge_history = hedge_state.hedge_history;
+                    } in
+                    Lwt.return (Some pnl, updated_state)
+            in
+
+            (* Update vault state *)
+            let new_vault = {
+              vault with
+              btc_float_sats = Int64.(vault.btc_float_sats - btc_sats);
+              btc_float_value_usd = Int64.(vault.btc_float_value_usd - usd_cents);
+              usd_reserves = Int64.(vault.usd_reserves + usd_cents);
+            } in
+
+            let reason_with_pnl = match hedge_pnl_opt with
+            | Some pnl -> Printf.sprintf "%s (hedge PnL: $%.2f)" reason pnl.net_pnl
+            | None -> reason
+            in
+
+            let execution = {
+              signal;
+              btc_price;
+              btc_amount;
+              usd_amount;
+              timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
+              reason = reason_with_pnl;
+            } in
+
+            Lwt.return (Ok (new_vault, Some execution, new_hedge_state))
+
+      | Hold ->
+          Lwt.return (Ok (vault, None, hedge_state))
+
+    (** Execute trade (legacy, without hedging) *)
     let execute_trade
         (signal: trade_signal)
         (vault: vault_state)
@@ -165,7 +355,7 @@ module BitcoinFloatManager = struct
 
       match signal with
       | BuyBTC usd_amount ->
-          if usd_amount <= 0.0 then (vault, None)
+          if Float.O.(usd_amount <= 0.0) then (vault, None)
           else
             let btc_amount = usd_amount /. btc_price in
             let btc_sats = btc_to_sats btc_amount in
@@ -184,14 +374,14 @@ module BitcoinFloatManager = struct
               btc_price;
               btc_amount;
               usd_amount;
-              timestamp = Unix.time ();
+              timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
               reason;
             } in
 
             (new_vault, Some execution)
 
       | SellBTC btc_amount ->
-          if btc_amount <= 0.0 then (vault, None)
+          if Float.O.(btc_amount <= 0.0) then (vault, None)
           else
             let btc_sats = btc_to_sats btc_amount in
             let usd_amount = btc_amount *. btc_price in
@@ -210,7 +400,7 @@ module BitcoinFloatManager = struct
               btc_price;
               btc_amount;
               usd_amount;
-              timestamp = Unix.time ();
+              timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
               reason;
             } in
 
@@ -257,7 +447,7 @@ module BitcoinFloatManager = struct
       let required_yield_usd = required_annual_yield_btc *. btc_price in
       let shortfall = required_yield_usd -. annual_premiums_usd in
 
-      if shortfall <= 0.0 then max_int (* Sustainable indefinitely *)
+      if Float.O.(shortfall <= 0.0) then Int.max_value (* Sustainable indefinitely *)
       else
         (* How many years can we cover from float? *)
         let years = btc_float_value /. shortfall in
@@ -286,7 +476,7 @@ module BitcoinFloatManager = struct
 
           (* Adjust BTC float *)
           let new_btc_float =
-            if surplus > 0.0 then
+            if Float.O.(surplus > 0.0) then
               (* Surplus: Buy more BTC *)
               btc_float +. (surplus /. new_price)
             else
@@ -327,7 +517,7 @@ module BitcoinFloatManager = struct
       urgency: [`Low | `Medium | `High | `Critical];
       reason: string;
       estimated_cost_usd: float;
-    } [@@deriving sexp, yojson]
+    } [@@deriving sexp]
 
     (** Determine rebalancing urgency *)
     let calculate_urgency
@@ -346,9 +536,9 @@ module BitcoinFloatManager = struct
 
         let drift = Float.abs (current_usd_pct -. rule.target_usd_pct) in
 
-        if drift > 0.25 then `Critical      (* >25% drift *)
-        else if drift > 0.18 then `High     (* >18% drift *)
-        else if drift > 0.12 then `Medium   (* >12% drift *)
+        if Float.O.(drift > 0.25) then `Critical      (* >25% drift *)
+        else if Float.O.(drift > 0.18) then `High     (* >18% drift *)
+        else if Float.O.(drift > 0.12) then `Medium   (* >12% drift *)
         else `Low
 
     (** Generate rebalancing recommendation *)
@@ -407,7 +597,7 @@ module BitcoinFloatManager = struct
       unrealized_gain_pct: float;
       average_purchase_price: float;
       years_of_yield_coverage: int;
-    } [@@deriving sexp, yojson]
+    } [@@deriving sexp]
 
     (** Calculate performance metrics *)
     let calculate_performance
@@ -423,13 +613,13 @@ module BitcoinFloatManager = struct
 
       let unrealized_gain = current_value -. total_btc_purchased_usd in
       let unrealized_gain_pct =
-        if total_btc_purchased_usd > 0.0 then
+        if Float.O.(total_btc_purchased_usd > 0.0) then
           (unrealized_gain /. total_btc_purchased_usd) *. 100.0
         else 0.0
       in
 
       let avg_price =
-        if total_btc > 0.0 then
+        if Float.O.(total_btc > 0.0) then
           total_btc_purchased_usd /. total_btc
         else 0.0
       in
@@ -456,6 +646,7 @@ module BitcoinFloatManager = struct
 
 end
 
+(* TODO: Move Tests module to separate test file
 (** Unit tests *)
 module Tests = struct
   open Alcotest
@@ -538,3 +729,4 @@ module Tests = struct
   ]
 
 end
+*)

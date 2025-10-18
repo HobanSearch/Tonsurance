@@ -207,64 +207,16 @@ let reset_error_count state component =
     List.Assoc.add state.error_counts ~equal:String.equal component 0
 
 (** Risk Monitor Loop *)
-let risk_monitor_loop state config =
-  let rec loop () =
-    if not state.is_running then Lwt.return_unit
-    else begin
-      Lwt.catch
-        (fun () ->
-          (* Provide price history *)
-          let price_history_provider () =
-            Lwt.return (Some state.price_history)
-          in
-
-          (* Get current prices for risk calculation *)
-          fetch_current_prices () >>= fun current_prices ->
-
-          (* Calculate risk metrics *)
-          let snapshot = Unified_risk_monitor.calculate_risk_metrics
-            state.collateral_manager
-            ~price_scenarios:current_prices
-            ~price_history:state.price_history
-          in
-
-          state.metrics.last_risk_snapshot <- Some snapshot;
-          state.metrics.risk_monitor_cycles <- state.metrics.risk_monitor_cycles + 1;
-          reset_error_count state "RiskMonitor";
-
-          log_message `Info "RiskMonitor"
-            (Printf.sprintf "Cycle %d: VaR95=%.2f%%, LTV=%.2f%%, Reserves=%.2f%%"
-              state.metrics.risk_monitor_cycles
-              (snapshot.var_95 *. 100.0)
-              (snapshot.ltv *. 100.0)
-              (snapshot.reserve_ratio *. 100.0));
-
-          (* Log alerts *)
-          List.iter snapshot.breach_alerts ~f:(fun alert ->
-            log_message `Error "RiskMonitor"
-              (Printf.sprintf "BREACH: %s (severity: %s)"
-                alert.message
-                (match alert.severity with
-                 | `Critical -> "Critical"
-                 | `High -> "High"
-                 | `Medium -> "Medium"
-                 | `Low -> "Low"))
-          );
-
-          Lwt.return_unit
-        )
-        (fun exn ->
-          log_message `Error "RiskMonitor"
-            (Printf.sprintf "Error: %s" (Exn.to_string exn));
-          increment_error_count state "RiskMonitor";
-          Lwt.return_unit
-        )
-      >>= fun () ->
-      Lwt_unix.sleep config.risk_monitor_interval >>= fun () ->
-      loop ()
-    end
+let risk_monitor_loop state config db_pool =
+  let monitor_config = Unified_risk_monitor.default_config in
+  let price_history_provider () =
+    Lwt.return (Some state.price_history)
   in
-  loop ()
+  Unified_risk_monitor.monitor_loop
+    ~db_pool
+    ~collateral_manager:(ref state.collateral_manager)
+    ~config:monitor_config
+    ~price_history_provider
 
 (** Float Rebalancer Loop *)
 let rebalancer_loop state config =
@@ -515,7 +467,7 @@ let create_daemon ?(config = default_config) initial_collateral_manager =
     };
   }
 
-let start_daemon ?(config = default_config) state =
+let start_daemon ?(config = default_config) state db_pool =
   setup_logging config;
 
   log_message `Info "Daemon" "Starting Risk Management Daemon";
@@ -533,7 +485,7 @@ let start_daemon ?(config = default_config) state =
   (* Start all loops in parallel *)
   Lwt_main.run (
     Lwt.join [
-      risk_monitor_loop state config;
+      risk_monitor_loop state config db_pool;
       rebalancer_loop state config;
       arbitrage_loop state config;
       price_update_loop state config;
@@ -562,6 +514,10 @@ let main () =
   let config = default_config in
   let state = create_daemon ~config initial_mgr in
 
+  (* Create database pool *)
+  let db_config = Integration.Database.Database.default_config in
+  let db_pool = Integration.Database.Database.create_pool db_config in
+
   (* Setup signal handlers *)
   let shutdown_handler _signum =
     log_message `Info "Daemon" "Received shutdown signal";
@@ -571,7 +527,7 @@ let main () =
   Sys.set_signal Sys.sigterm (Sys.Signal_handle shutdown_handler);
 
   (* Start daemon *)
-  start_daemon ~config state;
+  start_daemon ~config state db_pool;
 
   (* Print final metrics *)
   print_metrics state

@@ -1,5 +1,5 @@
 (library
  (name escrow)
  (public_name tonsurance.escrow)
- (libraries core types lwt lwt.unix)
- (preprocess (pps lwt_ppx ppx_sexp_conv)))
+ (libraries core types integration crypto db lwt lwt.unix logs logs.lwt)
+ (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))

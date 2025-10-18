@@ -1,0 +1,6 @@
+services:
+  tonsurance:
+    image: tonsurance
+    build:
+      context: .
+      dockerfile: ./Dockerfile

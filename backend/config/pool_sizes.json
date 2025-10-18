@@ -1,0 +1,112 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Connection pool sizes and concurrency limits",
+  "version": "1.0.0",
+
+  "database": {
+    "default_pool_size": 10,
+    "max_pool_size": 50,
+    "min_pool_size": 5,
+    "connection_timeout_seconds": 30,
+    "idle_timeout_seconds": 600,
+    "description": "PostgreSQL connection pool (default 10, max 50)"
+  },
+
+  "redis": {
+    "pool_size": 20,
+    "max_connections": 100,
+    "connection_timeout_seconds": 5,
+    "description": "Redis connection pool for caching"
+  },
+
+  "http_client": {
+    "max_concurrent_requests": 100,
+    "per_host_limit": 20,
+    "description": "HTTP client connection limits"
+  },
+
+  "worker_threads": {
+    "default_workers": 4,
+    "max_workers": 16,
+    "queue_size": 1000,
+    "description": "Background worker thread pool"
+  },
+
+  "websocket": {
+    "max_connections": 1000,
+    "max_connections_per_ip": 10,
+    "description": "WebSocket connection limits"
+  },
+
+  "oracle_clients": {
+    "chainlink_pool_size": 5,
+    "pyth_pool_size": 5,
+    "binance_pool_size": 10,
+    "description": "Oracle client connection pools"
+  },
+
+  "daemon_concurrency": {
+    "vault_sync_workers": 3,
+    "event_processor_workers": 5,
+    "risk_monitor_workers": 2,
+    "description": "Concurrent workers for daemon operations"
+  },
+
+  "rate_limits": {
+    "requests_per_minute_per_ip": 100,
+    "requests_per_minute_authenticated": 500,
+    "websocket_messages_per_second": 10,
+    "description": "API rate limiting thresholds"
+  },
+
+  "oracle_rate_limits": {
+    "chainlink_requests_per_minute": 60,
+    "pyth_requests_per_minute": 120,
+    "binance_requests_per_minute": 1200,
+    "bridge_health_requests_per_minute": 30,
+    "chain_metrics_requests_per_minute": 60,
+    "etherscan_requests_per_minute": 5,
+    "description": "External API rate limits (per their terms)"
+  },
+
+  "cache_sizes": {
+    "config_cache_entries": 1000,
+    "market_data_cache_entries": 500,
+    "policy_cache_entries": 10000,
+    "description": "In-memory cache size limits"
+  },
+
+  "bulk_operations": {
+    "batch_size": 100,
+    "max_batch_size": 1000,
+    "concurrent_batches": 5,
+    "description": "Batch processing limits for bulk operations"
+  },
+
+  "environment_overrides": {
+    "development": {
+      "database_pool_size": 5,
+      "worker_threads": 2,
+      "max_concurrent_requests": 50
+    },
+    "staging": {
+      "database_pool_size": 10,
+      "worker_threads": 4,
+      "max_concurrent_requests": 100
+    },
+    "production": {
+      "database_pool_size": 50,
+      "worker_threads": 16,
+      "max_concurrent_requests": 200
+    }
+  },
+
+  "notes": [
+    "Pool sizes should scale with expected load",
+    "Development uses smaller pools to conserve resources",
+    "Production pools sized for peak load + 20% buffer",
+    "Rate limits respect external API terms of service",
+    "Monitor connection pool exhaustion in production",
+    "Adjust based on actual usage patterns"
+  ]
+}

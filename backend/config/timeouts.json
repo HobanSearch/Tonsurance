@@ -1,0 +1,90 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Timeout configuration for all backend operations",
+  "version": "1.0.0",
+
+  "ton_client": {
+    "request_timeout_seconds": 30,
+    "description": "Timeout for TON blockchain API requests"
+  },
+
+  "http_client": {
+    "default_timeout_seconds": 10.0,
+    "long_timeout_seconds": 60.0,
+    "oracle_timeout_seconds": 15.0,
+    "description": "HTTP request timeouts for external APIs"
+  },
+
+  "oracle": {
+    "chainlink_timeout_seconds": 10.0,
+    "pyth_timeout_seconds": 10.0,
+    "aggregator_timeout_seconds": 10.0,
+    "update_interval_seconds": 60.0,
+    "max_staleness_seconds": 300,
+    "description": "Oracle service timeouts and update intervals"
+  },
+
+  "daemon": {
+    "vault_sync_interval_seconds": 300.0,
+    "event_poll_interval_seconds": 10.0,
+    "policy_poll_interval_seconds": 10.0,
+    "risk_monitor_interval_seconds": 60.0,
+    "rebalancer_interval_seconds": 300.0,
+    "arbitrage_interval_seconds": 900.0,
+    "health_check_interval_seconds": 30.0,
+    "price_update_interval_seconds": 120.0,
+    "escrow_check_interval_seconds": 60.0,
+    "trigger_check_interval_seconds": 60.0,
+    "description": "Daemon polling and check intervals"
+  },
+
+  "etl": {
+    "retry_delay_seconds": 300.0,
+    "timeout_seconds": 3600.0,
+    "check_interval_seconds": 60.0,
+    "description": "ETL pipeline timeouts and retry delays"
+  },
+
+  "claims": {
+    "sample_interval_seconds": 60.0,
+    "max_payout_delay_seconds": 86400.0,
+    "description": "Claims processing intervals (24 hours = 86400 seconds)"
+  },
+
+  "float": {
+    "rebalance_check_interval_seconds": 300.0,
+    "arbitrage_check_interval_seconds": 900.0,
+    "description": "Float management check intervals"
+  },
+
+  "websocket": {
+    "reconnect_delay_seconds": 5.0,
+    "ping_interval_seconds": 30.0,
+    "description": "WebSocket connection management"
+  },
+
+  "bot": {
+    "conversation_timeout_seconds": 1800.0,
+    "request_timeout_seconds": 30.0,
+    "description": "Tonny bot timeouts (30 minutes conversation)"
+  },
+
+  "bridge_health": {
+    "check_interval_seconds": 300.0,
+    "timeout_seconds": 15.0,
+    "description": "Bridge health monitoring intervals"
+  },
+
+  "market_data": {
+    "aggregation_interval_seconds": 60.0,
+    "stale_data_threshold_seconds": 300.0,
+    "description": "Market data aggregation and staleness checks"
+  },
+
+  "notes": [
+    "All timeout values are in seconds for consistency",
+    "Float values allow fractional seconds for precise timing",
+    "Intervals should be adjusted based on environment (dev/staging/prod)",
+    "Staleness thresholds prevent using outdated oracle data"
+  ]
+}

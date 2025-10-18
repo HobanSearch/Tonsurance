@@ -1,0 +1,591 @@
+{
+  "info": {
+    "name": "Tonsurance Transactional API",
+    "description": "Complete collection for testing Tonsurance transactional endpoints (policy purchase, claims, vault operations)",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "version": "2.0.0"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8080",
+      "type": "string"
+    },
+    {
+      "key": "user_address",
+      "value": "EQDtFpEwcFAEcRe5mLVh2N6C0x-_hJEM7W61_JLnSF74p4q2",
+      "type": "string"
+    },
+    {
+      "key": "tx_hash",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "policy_id",
+      "value": "",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Buy Policy",
+      "item": [
+        {
+          "name": "Buy USDC Depeg Insurance (30 days)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"Response has tx_hash\", function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    pm.expect(jsonData.tx_hash).to.exist;",
+                  "    pm.collectionVariables.set(\"tx_hash\", jsonData.tx_hash);",
+                  "});",
+                  "",
+                  "pm.test(\"Status is pending\", function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    pm.expect(jsonData.status).to.eql(\"pending\");",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_address\": \"{{user_address}}\",\n  \"coverage_type\": \"depeg\",\n  \"chain\": \"Ethereum\",\n  \"stablecoin\": \"USDC\",\n  \"coverage_amount\": 10000.0,\n  \"duration_days\": 30,\n  \"payment_token\": \"USDT\",\n  \"payment_amount\": 6.58\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/policies",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "policies"]
+            },
+            "description": "Purchase $10k USDC depeg insurance for 30 days on Ethereum"
+          },
+          "response": []
+        },
+        {
+          "name": "Buy Bridge Insurance (90 days)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_address\": \"{{user_address}}\",\n  \"coverage_type\": \"bridge\",\n  \"chain\": \"Arbitrum\",\n  \"stablecoin\": \"USDT\",\n  \"coverage_amount\": 50000.0,\n  \"duration_days\": 90,\n  \"payment_token\": \"TON\",\n  \"payment_amount\": 270.0\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/policies",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "policies"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Buy CEX Liquidation Insurance",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_address\": \"{{user_address}}\",\n  \"coverage_type\": \"cex_liquidation\",\n  \"chain\": \"Bitcoin\",\n  \"stablecoin\": \"USDT\",\n  \"coverage_amount\": 100000.0,\n  \"duration_days\": 7,\n  \"payment_token\": \"TON\",\n  \"payment_amount\": 48.0\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/policies",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "policies"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Invalid Premium (should fail)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 400\", function () {",
+                  "    pm.response.to.have.status(400);",
+                  "});",
+                  "",
+                  "pm.test(\"Error message mentions premium\", function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    pm.expect(jsonData.error).to.include(\"premium\");",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_address\": \"{{user_address}}\",\n  \"coverage_type\": \"depeg\",\n  \"chain\": \"Ethereum\",\n  \"stablecoin\": \"USDC\",\n  \"coverage_amount\": 10000.0,\n  \"duration_days\": 30,\n  \"payment_token\": \"USDT\",\n  \"payment_amount\": 999.0\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/policies",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "policies"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "2. File Claim",
+      "item": [
+        {
+          "name": "File Valid Claim",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"Has tx_hash\", function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    pm.expect(jsonData.tx_hash).to.exist;",
+                  "    pm.collectionVariables.set(\"tx_hash\", jsonData.tx_hash);",
+                  "});",
+                  "",
+                  "pm.test(\"Auto verifiable flag present\", function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    pm.expect(jsonData.auto_verifiable).to.be.a('boolean');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_address\": \"{{user_address}}\",\n  \"policy_id\": 12345,\n  \"evidence_url\": \"ipfs://QmXa1bC2dE3fG4hI5jK6lM7nO8pQ9rS0tU1vW2xY3zA4bC\",\n  \"claim_amount\": 10000.0\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/claims",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "claims"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Invalid Evidence URL (should fail)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 400\", function () {",
+                  "    pm.response.to.have.status(400);",
+                  "});",
+                  "",
+                  "pm.test(\"Error mentions IPFS\", function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    pm.expect(jsonData.error).to.include(\"IPFS\");",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_address\": \"{{user_address}}\",\n  \"policy_id\": 12345,\n  \"evidence_url\": \"https://example.com/evidence.pdf\",\n  \"claim_amount\": 10000.0\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/claims",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "claims"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "3. Vault Deposit",
+      "item": [
+        {
+          "name": "Deposit to SURE-SNR (1000 TON, 90-day lock)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"Tokens minted\", function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    pm.expect(jsonData.tokens_minted).to.be.above(0);",
+                  "});",
+                  "",
+                  "pm.test(\"Has lock_until date\", function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    pm.expect(jsonData.lock_until).to.exist;",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_address\": \"{{user_address}}\",\n  \"tranche_id\": 2,\n  \"amount\": 1000.0,\n  \"lock_period_days\": 90\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/vault/deposit",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "vault", "deposit"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Deposit to SURE-EQT (no lock)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_address\": \"{{user_address}}\",\n  \"tranche_id\": 6,\n  \"amount\": 5000.0\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/vault/deposit",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "vault", "deposit"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Invalid Tranche ID (should fail)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 400\", function () {",
+                  "    pm.response.to.have.status(400);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_address\": \"{{user_address}}\",\n  \"tranche_id\": 99,\n  \"amount\": 1000.0\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/vault/deposit",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "vault", "deposit"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "4. Vault Withdrawal",
+      "item": [
+        {
+          "name": "Withdraw from SURE-SNR",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"Has capital_returned\", function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    pm.expect(jsonData.capital_returned).to.be.above(0);",
+                  "});",
+                  "",
+                  "pm.test(\"Has yield_returned\", function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    pm.expect(jsonData.yield_returned).to.exist;",
+                  "});",
+                  "",
+                  "pm.test(\"Total = capital + yield\", function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    var expected = jsonData.capital_returned + jsonData.yield_returned;",
+                  "    pm.expect(jsonData.total_payout).to.be.closeTo(expected, 0.01);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_address\": \"{{user_address}}\",\n  \"tranche_id\": 2,\n  \"token_amount\": 500.0\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/vault/withdraw",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "vault", "withdraw"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Negative Token Amount (should fail)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 400\", function () {",
+                  "    pm.response.to.have.status(400);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_address\": \"{{user_address}}\",\n  \"tranche_id\": 2,\n  \"token_amount\": -100.0\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/vault/withdraw",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "vault", "withdraw"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "5. Poll Transaction",
+      "item": [
+        {
+          "name": "Poll Transaction Status (pending)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"Has status field\", function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    pm.expect(jsonData.status).to.be.oneOf(['pending', 'confirmed', 'failed']);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v2/transactions/{{tx_hash}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "transactions", "{{tx_hash}}"]
+            },
+            "description": "Poll transaction using tx_hash from previous request"
+          },
+          "response": []
+        },
+        {
+          "name": "Poll Nonexistent Transaction",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 400\", function () {",
+                  "    pm.response.to.have.status(400);",
+                  "});",
+                  "",
+                  "pm.test(\"Error mentions not found\", function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    pm.expect(jsonData.error).to.include(\"not found\");",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v2/transactions/0xNONEXISTENT",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "transactions", "0xNONEXISTENT"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "6. Read-Only Endpoints",
+      "item": [
+        {
+          "name": "Get Premium Quote",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"coverage_type\": \"depeg\",\n  \"chain\": \"Ethereum\",\n  \"stablecoin\": \"USDC\",\n  \"coverage_amount\": 10000.0,\n  \"duration_days\": 30\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v2/quote/multi-dimensional",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "quote", "multi-dimensional"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Get Risk Exposure",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v2/risk/exposure",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "risk", "exposure"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Get Tranche APYs",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v2/tranches/apy",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v2", "tranches", "apy"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/health",
+              "host": ["{{base_url}}"],
+              "path": ["health"]
+            }
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}

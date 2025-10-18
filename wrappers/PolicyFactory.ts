@@ -1,4 +1,5 @@
 import { Address, beginCell, Cell, Contract, contractAddress, ContractProvider, Dictionary, Sender, SendMode } from '@ton/core';
+import { CoverageType, Chain, Stablecoin, ProductKey, calculateProductHash, validateProduct, calculatePremium } from './types/ProductMatrix';
 
 export type PolicyFactoryConfig = {
     ownerAddress: Address;
@@ -17,7 +18,9 @@ export function policyFactoryConfigToCell(config: PolicyFactoryConfig): Cell {
         .storeUint(config.activePoliciesCount, 64)
         .storeAddress(config.treasuryAddress)
         .storeUint(config.paused, 1)
-        .storeDict(null)  // Empty dictionary initially
+        .storeDict(null)  // policies_dict (empty initially)
+        .storeDict(null)  // pending_txs (empty initially)
+        .storeUint(0, 32) // seq_no
         .endCell();
 }
 
@@ -45,12 +48,20 @@ export class PolicyFactory implements Contract {
         });
     }
 
+    /**
+     * Create a new insurance policy with multi-dimensional parameters
+     * @param provider Contract provider
+     * @param via Sender
+     * @param opts Policy creation options
+     */
     async sendCreatePolicy(
         provider: ContractProvider,
         via: Sender,
         opts: {
             value: bigint;
-            coverageType: number;
+            coverageType: CoverageType;
+            chainId: Chain;
+            stablecoinId: Stablecoin;
             coverageAmount: bigint;
             duration: number;
         }
@@ -59,8 +70,10 @@ export class PolicyFactory implements Contract {
             value: opts.value,
             sendMode: SendMode.PAY_GAS_SEPARATELY,
             body: beginCell()
-                .storeUint(0x01, 32) // op: create_policy
+                .storeUint(0x01, 32) // op: create_policy (multi-dimensional)
                 .storeUint(opts.coverageType, 8)
+                .storeUint(opts.chainId, 8)
+                .storeUint(opts.stablecoinId, 8)
                 .storeCoins(opts.coverageAmount)
                 .storeUint(opts.duration, 16)
                 .endCell(),
@@ -108,8 +121,13 @@ export class PolicyFactory implements Contract {
         return result.stack.readBigNumber();
     }
 
+    /**
+     * Get policy data (extended with multi-dimensional fields)
+     */
     async getPolicyData(provider: ContractProvider, policyId: bigint): Promise<{
-        coverageType: number;
+        coverageType: CoverageType;
+        chainId: Chain;
+        stablecoinId: Stablecoin;
         coverageAmount: bigint;
         premium: bigint;
         startTime: number;
@@ -121,7 +139,9 @@ export class PolicyFactory implements Contract {
         ]);
 
         return {
-            coverageType: result.stack.readNumber(),
+            coverageType: result.stack.readNumber() as CoverageType,
+            chainId: result.stack.readNumber() as Chain,
+            stablecoinId: result.stack.readNumber() as Stablecoin,
             coverageAmount: result.stack.readBigNumber(),
             premium: result.stack.readBigNumber(),
             startTime: result.stack.readNumber(),
@@ -130,17 +150,82 @@ export class PolicyFactory implements Contract {
         };
     }
 
+    /**
+     * Calculate premium with multi-dimensional risk factors
+     * Uses on-chain calculation (matches risk_multipliers.fc)
+     */
     async getCalculatePremium(
         provider: ContractProvider,
-        coverageType: number,
+        coverageType: CoverageType,
+        chainId: Chain,
+        stablecoinId: Stablecoin,
         coverageAmount: bigint,
         durationDays: number
     ): Promise<bigint> {
         const result = await provider.get('calculate_premium_external', [
             { type: 'int', value: BigInt(coverageType) },
+            { type: 'int', value: BigInt(chainId) },
+            { type: 'int', value: BigInt(stablecoinId) },
             { type: 'int', value: coverageAmount },
             { type: 'int', value: BigInt(durationDays) }
         ]);
         return result.stack.readBigNumber();
+    }
+
+    /**
+     * Get product information for a specific combination
+     */
+    async getProductInfo(
+        provider: ContractProvider,
+        coverageType: CoverageType,
+        chainId: Chain,
+        stablecoinId: Stablecoin
+    ): Promise<{
+        productHash: number;
+        baseRate: number;
+        chainMultiplier: number;
+    }> {
+        const result = await provider.get('get_product_info', [
+            { type: 'int', value: BigInt(coverageType) },
+            { type: 'int', value: BigInt(chainId) },
+            { type: 'int', value: BigInt(stablecoinId) }
+        ]);
+
+        return {
+            productHash: result.stack.readNumber(),
+            baseRate: result.stack.readNumber(),
+            chainMultiplier: result.stack.readNumber(),
+        };
+    }
+
+    // ================================
+    // HELPER METHODS (OFF-CHAIN)
+    // ================================
+
+    /**
+     * Validate product parameters before creating policy
+     * @returns Validation result with error message if invalid
+     */
+    validateProduct(product: ProductKey): { valid: boolean; error?: string } {
+        return validateProduct(product);
+    }
+
+    /**
+     * Calculate premium off-chain (matches on-chain calculation)
+     * Useful for quote generation without blockchain call
+     */
+    calculatePremiumOffchain(
+        product: ProductKey,
+        coverageAmount: bigint,
+        durationDays: number
+    ): bigint {
+        return calculatePremium(product, coverageAmount, durationDays);
+    }
+
+    /**
+     * Calculate product hash for indexing/caching
+     */
+    calculateProductHash(product: ProductKey): number {
+        return calculateProductHash(product);
     }
 }

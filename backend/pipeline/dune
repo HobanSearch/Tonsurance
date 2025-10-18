@@ -1,0 +1,15 @@
+(library
+ (name market_data_pipeline)
+ (public_name tonsurance.pipeline)
+ (libraries
+   core
+   lwt
+   lwt.unix
+   logs
+   logs.lwt
+   yojson
+   types
+   math
+   integration)
+ (preprocess (pps lwt_ppx ppx_jane ppx_deriving_yojson))
+ (modules market_data_aggregator risk_score_calculator))

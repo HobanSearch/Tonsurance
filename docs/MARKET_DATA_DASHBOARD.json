@@ -1,0 +1,440 @@
+{
+  "dashboard": {
+    "title": "Tonsurance Market Data Dashboard",
+    "description": "Real-time monitoring of CEX liquidations, bridge health, and chain metrics",
+    "tags": ["tonsurance", "market-data", "risk", "production"],
+    "timezone": "utc",
+    "refresh": "5m",
+    "time": {
+      "from": "now-24h",
+      "to": "now"
+    },
+    "panels": [
+      {
+        "id": 1,
+        "title": "CEX Liquidations - 24h Volume",
+        "type": "timeseries",
+        "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+        "datasource": "TimescaleDB",
+        "targets": [
+          {
+            "rawSql": "SELECT\n  time_bucket('1 hour', liquidation_time) AS time,\n  exchange,\n  SUM(value_usd_cents)/100 AS total_usd\nFROM cex_liquidations\nWHERE liquidation_time >= NOW() - INTERVAL '24 hours'\nGROUP BY time, exchange\nORDER BY time",
+            "format": "time_series"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "currencyUSD",
+            "color": { "mode": "palette-classic" },
+            "custom": {
+              "lineWidth": 2,
+              "fillOpacity": 10,
+              "spanNulls": false
+            }
+          },
+          "overrides": [
+            {
+              "matcher": { "id": "byName", "options": "Binance" },
+              "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+            },
+            {
+              "matcher": { "id": "byName", "options": "Bybit" },
+              "properties": [{ "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }]
+            },
+            {
+              "matcher": { "id": "byName", "options": "OKX" },
+              "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+            }
+          ]
+        },
+        "options": {
+          "legend": {
+            "displayMode": "table",
+            "placement": "right",
+            "calcs": ["sum", "max", "last"]
+          },
+          "tooltip": { "mode": "multi" }
+        }
+      },
+      {
+        "id": 2,
+        "title": "Liquidation Heatmap (Hourly)",
+        "type": "heatmap",
+        "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+        "datasource": "TimescaleDB",
+        "targets": [
+          {
+            "rawSql": "SELECT\n  time_bucket('1 hour', liquidation_time) AS time,\n  symbol,\n  SUM(value_usd_cents)/100 AS value\nFROM cex_liquidations\nWHERE liquidation_time >= NOW() - INTERVAL '24 hours'\nGROUP BY time, symbol\nORDER BY time",
+            "format": "time_series"
+          }
+        ],
+        "options": {
+          "color": {
+            "mode": "scheme",
+            "scheme": "Spectral",
+            "steps": 128
+          },
+          "yAxis": {
+            "decimals": 0
+          }
+        }
+      },
+      {
+        "id": 3,
+        "title": "Top 5 Liquidated Symbols (24h)",
+        "type": "bargauge",
+        "gridPos": { "x": 0, "y": 8, "w": 6, "h": 6 },
+        "datasource": "TimescaleDB",
+        "targets": [
+          {
+            "rawSql": "SELECT\n  symbol,\n  SUM(value_usd_cents)/100 AS total_liquidated_usd\nFROM cex_liquidations\nWHERE liquidation_time >= NOW() - INTERVAL '24 hours'\nGROUP BY symbol\nORDER BY total_liquidated_usd DESC\nLIMIT 5",
+            "format": "table"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "currencyUSD",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                { "value": 0, "color": "green" },
+                { "value": 50000000, "color": "yellow" },
+                { "value": 100000000, "color": "orange" },
+                { "value": 500000000, "color": "red" }
+              ]
+            }
+          }
+        },
+        "options": {
+          "orientation": "horizontal",
+          "displayMode": "gradient",
+          "showUnfilled": true
+        }
+      },
+      {
+        "id": 4,
+        "title": "Market Stress Level",
+        "type": "stat",
+        "gridPos": { "x": 6, "y": 8, "w": 6, "h": 6 },
+        "datasource": "TimescaleDB",
+        "targets": [
+          {
+            "rawSql": "SELECT\n  CASE\n    WHEN total_liquidations_24h_usd_cents/100 > 1000000000 THEN 'EXTREME'\n    WHEN total_liquidations_24h_usd_cents/100 > 500000000 THEN 'HIGH'\n    WHEN total_liquidations_24h_usd_cents/100 > 100000000 THEN 'ELEVATED'\n    ELSE 'NORMAL'\n  END AS stress_level,\n  total_liquidations_24h_usd_cents/100 AS liquidation_volume\nFROM market_stress_indicators\nORDER BY timestamp DESC\nLIMIT 1",
+            "format": "table"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "mappings": [
+              { "type": "value", "options": { "NORMAL": { "color": "green", "text": "NORMAL" } } },
+              { "type": "value", "options": { "ELEVATED": { "color": "yellow", "text": "ELEVATED" } } },
+              { "type": "value", "options": { "HIGH": { "color": "orange", "text": "HIGH" } } },
+              { "type": "value", "options": { "EXTREME": { "color": "red", "text": "EXTREME" } } }
+            ]
+          }
+        },
+        "options": {
+          "graphMode": "none",
+          "colorMode": "background",
+          "textMode": "value_and_name",
+          "orientation": "auto"
+        }
+      },
+      {
+        "id": 5,
+        "title": "Bridge TVL (All Bridges)",
+        "type": "timeseries",
+        "gridPos": { "x": 0, "y": 14, "w": 12, "h": 8 },
+        "datasource": "TimescaleDB",
+        "targets": [
+          {
+            "rawSql": "SELECT\n  time_bucket('1 hour', timestamp) AS time,\n  bridge_id,\n  AVG(tvl_usd_cents)/100000000 AS tvl_millions\nFROM bridge_health_metrics\nWHERE timestamp >= NOW() - INTERVAL '24 hours'\nGROUP BY time, bridge_id\nORDER BY time",
+            "format": "time_series"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "currencyUSD",
+            "decimals": 0,
+            "custom": {
+              "lineWidth": 2,
+              "fillOpacity": 0,
+              "spanNulls": false
+            }
+          }
+        },
+        "options": {
+          "legend": {
+            "displayMode": "table",
+            "placement": "right",
+            "calcs": ["mean", "lastNotNull"]
+          }
+        }
+      },
+      {
+        "id": 6,
+        "title": "Bridge Health Scores (0-100)",
+        "type": "gauge",
+        "gridPos": { "x": 12, "y": 14, "w": 12, "h": 8 },
+        "datasource": "TimescaleDB",
+        "targets": [
+          {
+            "rawSql": "SELECT DISTINCT ON (bridge_id)\n  bridge_id,\n  health_score * 100 AS health_score_pct\nFROM bridge_health_metrics\nORDER BY bridge_id, timestamp DESC",
+            "format": "table"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                { "value": 0, "color": "red" },
+                { "value": 40, "color": "orange" },
+                { "value": 60, "color": "yellow" },
+                { "value": 75, "color": "green" },
+                { "value": 90, "color": "dark-green" }
+              ]
+            }
+          }
+        },
+        "options": {
+          "showThresholdLabels": true,
+          "showThresholdMarkers": true
+        }
+      },
+      {
+        "id": 7,
+        "title": "Recent Bridge Exploits Timeline",
+        "type": "state-timeline",
+        "gridPos": { "x": 0, "y": 22, "w": 24, "h": 6 },
+        "datasource": "TimescaleDB",
+        "targets": [
+          {
+            "rawSql": "SELECT\n  timestamp AS time,\n  bridge_id,\n  CASE WHEN recent_exploits THEN 'EXPLOIT' ELSE 'SAFE' END AS status\nFROM bridge_health_metrics\nWHERE timestamp >= NOW() - INTERVAL '30 days'\nORDER BY time",
+            "format": "time_series"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "mappings": [
+              { "type": "value", "options": { "SAFE": { "color": "green" } } },
+              { "type": "value", "options": { "EXPLOIT": { "color": "red" } } }
+            ]
+          }
+        }
+      },
+      {
+        "id": 8,
+        "title": "Chain Block Times (Real-time)",
+        "type": "timeseries",
+        "gridPos": { "x": 0, "y": 28, "w": 12, "h": 8 },
+        "datasource": "TimescaleDB",
+        "targets": [
+          {
+            "rawSql": "SELECT\n  time_bucket('5 minutes', timestamp) AS time,\n  chain,\n  AVG(avg_block_time_ms) AS avg_block_time_ms\nFROM chain_metrics\nWHERE timestamp >= NOW() - INTERVAL '24 hours'\nGROUP BY time, chain\nORDER BY time",
+            "format": "time_series"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "ms",
+            "custom": {
+              "lineWidth": 2,
+              "fillOpacity": 10
+            }
+          },
+          "overrides": [
+            {
+              "matcher": { "id": "byName", "options": "Ethereum" },
+              "properties": [
+                { "id": "custom.axisPlacement", "value": "left" },
+                { "id": "custom.lineWidth", "value": 3 }
+              ]
+            },
+            {
+              "matcher": { "id": "byName", "options": "Arbitrum" },
+              "properties": [
+                { "id": "custom.axisPlacement", "value": "right" },
+                { "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }
+              ]
+            }
+          ]
+        },
+        "options": {
+          "legend": {
+            "displayMode": "table",
+            "placement": "right",
+            "calcs": ["mean", "min", "max"]
+          }
+        }
+      },
+      {
+        "id": 9,
+        "title": "Chain Gas Prices",
+        "type": "timeseries",
+        "gridPos": { "x": 12, "y": 28, "w": 12, "h": 8 },
+        "datasource": "TimescaleDB",
+        "targets": [
+          {
+            "rawSql": "SELECT\n  time_bucket('5 minutes', timestamp) AS time,\n  chain,\n  AVG(avg_gas_price_gwei) AS gas_price_gwei\nFROM chain_metrics\nWHERE timestamp >= NOW() - INTERVAL '24 hours'\n  AND avg_gas_price_gwei IS NOT NULL\nGROUP BY time, chain\nORDER BY time",
+            "format": "time_series"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "none",
+            "decimals": 2,
+            "custom": {
+              "lineWidth": 2,
+              "fillOpacity": 5
+            }
+          }
+        },
+        "options": {
+          "legend": {
+            "displayMode": "table",
+            "placement": "right",
+            "calcs": ["mean", "max"]
+          }
+        }
+      },
+      {
+        "id": 10,
+        "title": "Chain Congestion Scores",
+        "type": "bargauge",
+        "gridPos": { "x": 0, "y": 36, "w": 12, "h": 6 },
+        "datasource": "TimescaleDB",
+        "targets": [
+          {
+            "rawSql": "SELECT DISTINCT ON (chain)\n  chain,\n  congestion_score * 100 AS congestion_pct\nFROM chain_metrics\nORDER BY chain, timestamp DESC",
+            "format": "table"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                { "value": 0, "color": "green" },
+                { "value": 30, "color": "yellow" },
+                { "value": 50, "color": "orange" },
+                { "value": 70, "color": "red" }
+              ]
+            }
+          }
+        },
+        "options": {
+          "orientation": "horizontal",
+          "displayMode": "gradient"
+        }
+      },
+      {
+        "id": 11,
+        "title": "Failed Transaction Rates",
+        "type": "stat",
+        "gridPos": { "x": 12, "y": 36, "w": 12, "h": 6 },
+        "datasource": "TimescaleDB",
+        "targets": [
+          {
+            "rawSql": "SELECT DISTINCT ON (b.bridge_id)\n  b.bridge_id,\n  b.failed_tx_rate * 100 AS failed_tx_pct\nFROM bridge_health_metrics b\nORDER BY b.bridge_id, b.timestamp DESC",
+            "format": "table"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "decimals": 2,
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                { "value": 0, "color": "green" },
+                { "value": 1, "color": "yellow" },
+                { "value": 3, "color": "orange" },
+                { "value": 5, "color": "red" }
+              ]
+            }
+          }
+        },
+        "options": {
+          "colorMode": "background",
+          "graphMode": "none",
+          "textMode": "value_and_name"
+        }
+      },
+      {
+        "id": 12,
+        "title": "Risk Multipliers (Combined)",
+        "type": "timeseries",
+        "gridPos": { "x": 0, "y": 42, "w": 24, "h": 8 },
+        "datasource": "TimescaleDB",
+        "targets": [
+          {
+            "rawSql": "SELECT\n  time_bucket('1 hour', m.timestamp) AS time,\n  'Bridge Risk' AS metric,\n  AVG(b.risk_multiplier) AS multiplier\nFROM market_stress_indicators m\nCROSS JOIN LATERAL (\n  SELECT risk_multiplier FROM bridge_health_metrics\n  WHERE timestamp BETWEEN m.timestamp - INTERVAL '1 hour' AND m.timestamp\n  LIMIT 1\n) b\nWHERE m.timestamp >= NOW() - INTERVAL '24 hours'\nGROUP BY time\nUNION ALL\nSELECT\n  time_bucket('1 hour', timestamp) AS time,\n  'Market Stress' AS metric,\n  recommended_global_multiplier AS multiplier\nFROM market_stress_indicators\nWHERE timestamp >= NOW() - INTERVAL '24 hours'\nGROUP BY time, recommended_global_multiplier\nORDER BY time",
+            "format": "time_series"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "none",
+            "decimals": 2,
+            "custom": {
+              "lineWidth": 3,
+              "fillOpacity": 20
+            }
+          }
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom",
+            "calcs": ["mean", "max"]
+          }
+        }
+      }
+    ],
+    "annotations": {
+      "list": [
+        {
+          "name": "High Stress Events",
+          "datasource": "TimescaleDB",
+          "enable": true,
+          "iconColor": "red",
+          "rawQuery": "SELECT\n  timestamp AS time,\n  stress_level AS text,\n  'stress_event' AS tags\nFROM market_stress_indicators\nWHERE stress_level IN ('HIGH', 'EXTREME')\n  AND timestamp >= $__timeFrom()\n  AND timestamp <= $__timeTo()\nORDER BY time"
+        },
+        {
+          "name": "Bridge Exploits",
+          "datasource": "TimescaleDB",
+          "enable": true,
+          "iconColor": "dark-red",
+          "rawQuery": "SELECT\n  timestamp AS time,\n  bridge_id || ' EXPLOIT' AS text,\n  'exploit' AS tags\nFROM bridge_health_metrics\nWHERE recent_exploits = true\n  AND timestamp >= $__timeFrom()\n  AND timestamp <= $__timeTo()\nORDER BY time"
+        }
+      ]
+    },
+    "templating": {
+      "list": [
+        {
+          "name": "exchange",
+          "type": "custom",
+          "options": ["All", "Binance", "Bybit", "OKX", "Deribit"],
+          "current": { "value": "All" }
+        },
+        {
+          "name": "bridge",
+          "type": "query",
+          "datasource": "TimescaleDB",
+          "query": "SELECT DISTINCT bridge_id FROM bridge_health_metrics ORDER BY bridge_id",
+          "current": { "value": "All" }
+        },
+        {
+          "name": "chain",
+          "type": "query",
+          "datasource": "TimescaleDB",
+          "query": "SELECT DISTINCT chain FROM chain_metrics ORDER BY chain",
+          "current": { "value": "All" }
+        }
+      ]
+    }
+  }
+}

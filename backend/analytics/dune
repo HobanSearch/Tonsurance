@@ -1,0 +1,16 @@
+(library
+ (name market_analytics)
+ (public_name tonsurance.analytics)
+ (libraries
+   core
+   lwt
+   lwt.unix
+   logs
+   logs.lwt
+   yojson
+   ppx_yojson_conv
+   tonsurance.types
+   tonsurance.math
+   tonsurance.pipeline)
+ (preprocess (pps ppx_jane ppx_yojson_conv))
+ (modules market_correlation volatility_estimator))

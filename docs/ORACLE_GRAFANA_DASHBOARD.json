@@ -1,0 +1,321 @@
+{
+  "dashboard": {
+    "title": "Tonsurance Oracle Monitoring",
+    "tags": ["oracle", "pricing", "monitoring"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "title": "Real-Time Oracle Prices",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 0, "w": 24, "h": 8},
+        "targets": [
+          {
+            "expr": "oracle_price_usd{asset_provider=~\".*chainlink\"}",
+            "legendFormat": "{{asset_provider}} - Chainlink",
+            "refId": "A"
+          },
+          {
+            "expr": "oracle_price_usd{asset_provider=~\".*pyth\"}",
+            "legendFormat": "{{asset_provider}} - Pyth",
+            "refId": "B"
+          },
+          {
+            "expr": "oracle_price_usd{asset_provider=~\".*binance\"}",
+            "legendFormat": "{{asset_provider}} - Binance",
+            "refId": "C"
+          }
+        ],
+        "yaxes": [
+          {"format": "currencyUSD", "label": "Price (USD)"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "title": "Price Confidence Scores",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 8, "w": 12, "h": 6},
+        "targets": [
+          {
+            "expr": "oracle_confidence",
+            "legendFormat": "{{asset}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "percentunit", "label": "Confidence", "min": 0, "max": 1},
+          {"format": "short"}
+        ],
+        "alert": {
+          "conditions": [
+            {
+              "evaluator": {"params": [0.5], "type": "lt"},
+              "operator": {"type": "and"},
+              "query": {"params": ["A", "5m", "now"]},
+              "reducer": {"params": [], "type": "min"},
+              "type": "query"
+            }
+          ],
+          "executionErrorState": "alerting",
+          "frequency": "1m",
+          "handler": 1,
+          "name": "Low Oracle Confidence",
+          "noDataState": "no_data",
+          "notifications": []
+        }
+      },
+      {
+        "title": "Price Staleness (Age)",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 8, "w": 12, "h": 6},
+        "targets": [
+          {
+            "expr": "oracle_staleness_seconds",
+            "legendFormat": "{{asset}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "s", "label": "Age (seconds)"},
+          {"format": "short"}
+        ],
+        "alert": {
+          "conditions": [
+            {
+              "evaluator": {"params": [300], "type": "gt"},
+              "operator": {"type": "and"},
+              "query": {"params": ["A", "5m", "now"]},
+              "reducer": {"params": [], "type": "max"},
+              "type": "query"
+            }
+          ],
+          "executionErrorState": "alerting",
+          "frequency": "1m",
+          "handler": 1,
+          "name": "Stale Oracle Data (>5 min)",
+          "noDataState": "alerting",
+          "notifications": []
+        }
+      },
+      {
+        "title": "Price Divergence from Median",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 14, "w": 12, "h": 6},
+        "targets": [
+          {
+            "expr": "oracle_divergence_percent",
+            "legendFormat": "{{asset}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "percent", "label": "Divergence (%)"},
+          {"format": "short"}
+        ],
+        "alert": {
+          "conditions": [
+            {
+              "evaluator": {"params": [5.0], "type": "gt"},
+              "operator": {"type": "and"},
+              "query": {"params": ["A", "5m", "now"]},
+              "reducer": {"params": [], "type": "max"},
+              "type": "query"
+            }
+          ],
+          "executionErrorState": "alerting",
+          "frequency": "1m",
+          "handler": 1,
+          "name": "High Price Divergence (>5%)",
+          "noDataState": "no_data",
+          "notifications": []
+        }
+      },
+      {
+        "title": "Oracle Failure Rate",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 14, "w": 12, "h": 6},
+        "targets": [
+          {
+            "expr": "rate(oracle_failures_total[5m])",
+            "legendFormat": "{{provider}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "Failures per second"},
+          {"format": "short"}
+        ],
+        "alert": {
+          "conditions": [
+            {
+              "evaluator": {"params": [0.1], "type": "gt"},
+              "operator": {"type": "and"},
+              "query": {"params": ["A", "5m", "now"]},
+              "reducer": {"params": [], "type": "avg"},
+              "type": "query"
+            }
+          ],
+          "executionErrorState": "alerting",
+          "frequency": "1m",
+          "handler": 1,
+          "name": "High Oracle Failure Rate",
+          "noDataState": "no_data",
+          "notifications": []
+        }
+      },
+      {
+        "title": "Circuit Breaker Activations",
+        "type": "stat",
+        "gridPos": {"x": 0, "y": 20, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "oracle_circuit_breaker_total",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "colorMode": "background",
+          "graphMode": "area",
+          "justifyMode": "auto",
+          "orientation": "auto",
+          "reduceOptions": {
+            "calcs": ["lastNotNull"],
+            "fields": "",
+            "values": false
+          },
+          "textMode": "auto"
+        }
+      },
+      {
+        "title": "Oracle Health Status",
+        "type": "stat",
+        "gridPos": {"x": 6, "y": 20, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "count(oracle_confidence > 0.5) / count(oracle_confidence)",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "colorMode": "background",
+          "graphMode": "none",
+          "justifyMode": "auto",
+          "orientation": "auto",
+          "reduceOptions": {
+            "calcs": ["lastNotNull"],
+            "fields": "",
+            "values": false
+          },
+          "textMode": "value_and_name"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percentunit",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": null, "color": "red"},
+                {"value": 0.8, "color": "yellow"},
+                {"value": 0.95, "color": "green"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "title": "BTC Price Comparison (All Sources)",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 20, "w": 12, "h": 6},
+        "targets": [
+          {
+            "expr": "oracle_price_usd{asset_provider=\"BTC_chainlink\"}",
+            "legendFormat": "Chainlink",
+            "refId": "A"
+          },
+          {
+            "expr": "oracle_price_usd{asset_provider=\"BTC_pyth\"}",
+            "legendFormat": "Pyth",
+            "refId": "B"
+          },
+          {
+            "expr": "oracle_price_usd{asset_provider=\"BTC_binance\"}",
+            "legendFormat": "Binance",
+            "refId": "C"
+          }
+        ],
+        "yaxes": [
+          {"format": "currencyUSD", "label": "BTC Price"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "title": "Stablecoin Peg Deviations",
+        "type": "heatmap",
+        "gridPos": {"x": 0, "y": 26, "w": 24, "h": 8},
+        "targets": [
+          {
+            "expr": "abs(oracle_price_usd{asset_provider=~\"(USDC|USDT|DAI|FRAX|BUSD).*\"} - 1.0) * 100",
+            "legendFormat": "{{asset_provider}}",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "calculate": false,
+          "cellGap": 2,
+          "cellRadius": null,
+          "color": {
+            "exponent": 0.5,
+            "fill": "dark-orange",
+            "mode": "scheme",
+            "reverse": false,
+            "scale": "exponential",
+            "scheme": "Spectral",
+            "steps": 128
+          },
+          "exemplars": {
+            "color": "rgba(255,0,255,0.7)"
+          },
+          "filterValues": {
+            "le": 1e-9
+          },
+          "legend": {
+            "show": true
+          },
+          "rowsFrame": {
+            "layout": "auto"
+          },
+          "showValue": "never",
+          "tooltip": {
+            "show": true,
+            "yHistogram": false
+          },
+          "yAxis": {
+            "axisPlacement": "left",
+            "reverse": false,
+            "unit": "percent"
+          }
+        },
+        "fieldConfig": {
+          "defaults": {
+            "custom": {
+              "hideFrom": {
+                "tooltip": false,
+                "viz": false,
+                "legend": false
+              },
+              "scaleDistribution": {
+                "type": "linear"
+              }
+            }
+          }
+        }
+      }
+    ],
+    "refresh": "30s",
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    },
+    "timepicker": {},
+    "version": 1
+  }
+}

@@ -1,0 +1,119 @@
+;; RiskMultipliersTest - Wrapper contract for testing risk_multipliers.fc library
+;; This contract exposes all library functions as getters for unit testing
+
+#include "../imports/stdlib.fc";
+#include "../libs/risk_multipliers.fc";
+
+;; Simple storage: just owner
+global slice owner_address;
+
+() load_data() impure {
+    slice ds = get_data().begin_parse();
+    owner_address = ds~load_msg_addr();
+}
+
+() save_data() impure {
+    set_data(begin_cell()
+        .store_slice(owner_address)
+        .end_cell());
+}
+
+;; ===== GETTER FUNCTIONS FOR TESTING =====
+
+;; Test chain risk multipliers
+int get_chain_risk_multiplier_test(int chain_id) method_id {
+    return get_chain_risk_multiplier(chain_id);
+}
+
+;; Test stablecoin risk adjustments
+int get_stablecoin_risk_adjustment_test(int stablecoin_id) method_id {
+    return get_stablecoin_risk_adjustment(stablecoin_id);
+}
+
+;; Test coverage type base rates
+int get_coverage_type_base_rate_test(int coverage_type) method_id {
+    return get_coverage_type_base_rate(coverage_type);
+}
+
+;; Test stablecoin risk tier
+int get_stablecoin_risk_tier_test(int stablecoin_id) method_id {
+    return get_stablecoin_risk_tier(stablecoin_id);
+}
+
+;; Test chain-stablecoin validation
+int validate_chain_stablecoin_pair_test(int chain_id, int stablecoin_id) method_id {
+    return validate_chain_stablecoin_pair(chain_id, stablecoin_id);
+}
+
+;; Test product hash calculation
+int calculate_product_hash_test(int coverage_type, int chain_id, int stablecoin_id) method_id {
+    return calculate_product_hash(coverage_type, chain_id, stablecoin_id);
+}
+
+;; Test product hash decomposition
+(int, int, int) decompose_product_hash_test(int product_hash) method_id {
+    return decompose_product_hash(product_hash);
+}
+
+;; Test multi-dimensional premium calculation
+int calculate_multi_dimensional_premium_test(
+    int coverage_type,
+    int chain_id,
+    int stablecoin_id,
+    int coverage_amount,
+    int duration_days
+) method_id {
+    return calculate_multi_dimensional_premium(
+        coverage_type,
+        chain_id,
+        stablecoin_id,
+        coverage_amount,
+        duration_days
+    );
+}
+
+;; Test validation functions (these throw on invalid input)
+;; We wrap them to return success/failure for testing
+
+int validate_chain_id_test(int chain_id) method_id {
+    try {
+        validate_chain_id(chain_id);
+        return 1;  ;; Success
+    } catch (_, _) {
+        return 0;  ;; Failed validation
+    }
+}
+
+int validate_stablecoin_id_test(int stablecoin_id) method_id {
+    try {
+        validate_stablecoin_id(stablecoin_id);
+        return 1;  ;; Success
+    } catch (_, _) {
+        return 0;  ;; Failed validation
+    }
+}
+
+int validate_coverage_type_test(int coverage_type) method_id {
+    try {
+        validate_coverage_type(coverage_type);
+        return 1;  ;; Success
+    } catch (_, _) {
+        return 0;  ;; Failed validation
+    }
+}
+
+;; Message handler (minimal - just for deployment)
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) {
+        return ();
+    }
+
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) {
+        return ();
+    }
+
+    load_data();
+    save_data();
+}

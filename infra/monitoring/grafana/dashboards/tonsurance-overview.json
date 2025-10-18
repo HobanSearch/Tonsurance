@@ -1,0 +1,308 @@
+{
+  "dashboard": {
+    "title": "Tonsurance - System Overview",
+    "tags": ["tonsurance", "overview"],
+    "timezone": "browser",
+    "schemaVersion": 38,
+    "refresh": "30s",
+    "time": {
+      "from": "now-6h",
+      "to": "now"
+    },
+    "panels": [
+      {
+        "id": 1,
+        "title": "System Status",
+        "type": "stat",
+        "gridPos": {"x": 0, "y": 0, "w": 24, "h": 3},
+        "targets": [
+          {
+            "expr": "up{job=~\"ocaml-backend|pricing-oracle-keeper|bridge-health-keeper\"}",
+            "legendFormat": "{{job}}"
+          }
+        ],
+        "options": {
+          "colorMode": "background",
+          "graphMode": "none",
+          "textMode": "name"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 1, "color": "green"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "title": "Total Value Locked (TVL)",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 3, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "vault_total_capital / 1000000000",
+            "legendFormat": "Total Capital (TON)"
+          },
+          {
+            "expr": "vault_total_coverage_sold / 1000000000",
+            "legendFormat": "Coverage Sold (TON)"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "TON"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Vault Utilization",
+        "type": "gauge",
+        "gridPos": {"x": 12, "y": 3, "w": 6, "h": 8},
+        "targets": [
+          {
+            "expr": "(vault_total_coverage_sold / vault_total_capital) * 100",
+            "legendFormat": "Utilization %"
+          }
+        ],
+        "options": {
+          "showThresholdLabels": false,
+          "showThresholdMarkers": true
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 70, "color": "yellow"},
+                {"value": 80, "color": "red"}
+              ]
+            },
+            "max": 100,
+            "min": 0
+          }
+        }
+      },
+      {
+        "id": 4,
+        "title": "Oracle Update Freshness",
+        "type": "stat",
+        "gridPos": {"x": 18, "y": 3, "w": 6, "h": 8},
+        "targets": [
+          {
+            "expr": "time() - pricing_oracle_last_update_timestamp",
+            "legendFormat": "Seconds since last update"
+          }
+        ],
+        "options": {
+          "colorMode": "background",
+          "graphMode": "none",
+          "textMode": "value_and_name"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 60, "color": "yellow"},
+                {"value": 300, "color": "red"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "title": "Active Policies",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 11, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "policy_count_by_type",
+            "legendFormat": "{{coverage_type}}"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "Count"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 6,
+        "title": "Premium Pricing",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 11, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "avg_final_premium_by_type / 1000000000",
+            "legendFormat": "{{coverage_type}} (TON)"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "Premium (TON)"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 7,
+        "title": "API Request Rate",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 19, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "rate(http_requests_total[5m])",
+            "legendFormat": "{{method}} {{path}}"
+          }
+        ],
+        "yaxes": [
+          {"format": "reqps", "label": "Requests/sec"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 8,
+        "title": "API Latency (p99)",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 19, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))",
+            "legendFormat": "{{path}}"
+          }
+        ],
+        "yaxes": [
+          {"format": "s", "label": "Latency"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 9,
+        "title": "Tranche Capital Distribution",
+        "type": "piechart",
+        "gridPos": {"x": 0, "y": 27, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "tranche_capital_by_id",
+            "legendFormat": "{{tranche_name}}"
+          }
+        ]
+      },
+      {
+        "id": 10,
+        "title": "Error Rate",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 27, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "rate(http_requests_total{status=~\"5..\"}[5m])",
+            "legendFormat": "5xx Errors"
+          },
+          {
+            "expr": "rate(http_requests_total{status=~\"4..\"}[5m])",
+            "legendFormat": "4xx Errors"
+          }
+        ],
+        "yaxes": [
+          {"format": "reqps", "label": "Errors/sec"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 11,
+        "title": "Keeper Performance",
+        "type": "table",
+        "gridPos": {"x": 0, "y": 35, "w": 24, "h": 8},
+        "targets": [
+          {
+            "expr": "keeper_update_success_total",
+            "format": "table",
+            "instant": true
+          }
+        ],
+        "transformations": [
+          {
+            "id": "organize",
+            "options": {
+              "excludeByName": {},
+              "indexByName": {},
+              "renameByName": {
+                "keeper_name": "Keeper",
+                "Value": "Updates"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": 12,
+        "title": "Database Connection Pool",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 43, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "pg_stat_activity_count",
+            "legendFormat": "Active Connections"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "Connections", "max": 100},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 13,
+        "title": "Redis Memory Usage",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 43, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "redis_memory_used_bytes / 1024 / 1024",
+            "legendFormat": "Used (MB)"
+          },
+          {
+            "expr": "redis_memory_max_bytes / 1024 / 1024",
+            "legendFormat": "Max (MB)"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "MB"},
+          {"format": "short"}
+        ]
+      }
+    ],
+    "annotations": {
+      "list": [
+        {
+          "name": "Deployments",
+          "datasource": "Prometheus",
+          "enable": true,
+          "expr": "changes(contract_deployment_total[5m]) > 0",
+          "tagKeys": "contract_name",
+          "textFormat": "Deployed {{contract_name}}",
+          "titleFormat": "Deployment"
+        }
+      ]
+    },
+    "templating": {
+      "list": [
+        {
+          "name": "environment",
+          "type": "custom",
+          "options": [
+            {"text": "Testnet", "value": "testnet"},
+            {"text": "Mainnet", "value": "mainnet"}
+          ],
+          "current": {"text": "Mainnet", "value": "mainnet"}
+        }
+      ]
+    }
+  }
+}

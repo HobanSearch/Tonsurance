@@ -22,8 +22,6 @@
 *)
 
 open Core
-open Lwt.Syntax
-open Types
 
 module Database = struct
 
@@ -72,7 +70,7 @@ module Database = struct
     status: string;
     created_at: float;
     updated_at: float;
-  } [@@deriving sexp, yojson]
+  } [@@deriving sexp]
 
   (** Price history record **)
   type price_record = {
@@ -82,7 +80,7 @@ module Database = struct
     market_cap: float option;
     source: string;
     timestamp: float;
-  } [@@deriving sexp, yojson]
+  } [@@deriving sexp]
 
   (** Transaction record **)
   type transaction_record = {
@@ -95,7 +93,7 @@ module Database = struct
     tx_hash: string option; (* Blockchain tx hash *)
     status: string;
     created_at: float;
-  } [@@deriving sexp, yojson]
+  } [@@deriving sexp]
 
   (** Schema creation queries **)
   module Schema = struct
@@ -250,25 +248,24 @@ module Database = struct
 
   (** Initialize database schema **)
   let initialize_schema (module Db : CONNECTION) : unit Lwt.t =
-    let%lwt () =
-      Lwt_list.iter_s
-        (fun query ->
-          let%lwt _ = Db.exec (Caqti_request.exec Caqti_type.unit query) () in
-          Lwt.return ()
-        )
-        Schema.all_tables
-    in
-    Lwt.return ()
+    let open Lwt.Infix in
+    Lwt_list.iter_s
+      (fun query ->
+        let req = Caqti_request.Infix.(Caqti_type.unit ->. Caqti_type.unit) query in
+        Db.exec req () >>= function
+        | Ok () -> Lwt.return_unit
+        | Error e -> Lwt.fail_with (Caqti_error.show e)
+      )
+      Schema.all_tables
 
   (** Policy Queries **)
   module PolicyQueries = struct
 
     let insert_policy =
-      Caqti_request.exec
-        Caqti_type.(tup3 string string
-          (tup4 string int64 int64
-            (tup4 float float float float)))
-        {|
+      let open Caqti_request.Infix in
+      Caqti_type.(t3 string string
+          (t4 string int64 int64
+            (t4 float float float float))) ->. Caqti_type.unit @@ {|
           INSERT INTO policies (
             buyer_address, beneficiary_address, asset,
             coverage_amount_cents, premium_amount_cents,
@@ -283,12 +280,12 @@ module Database = struct
         |}
 
     let get_policy_by_id =
-      Caqti_request.find
+      Caqti_request.Infix.(->?)
         Caqti_type.int64
-        Caqti_type.(tup3 int64 string
-          (tup3 string string
-            (tup3 int64 int64
-              (tup3 float float string))))
+        Caqti_type.(t3 int64 string
+          (t3 string string
+            (t3 int64 int64
+              (t3 float float string))))
         {|
           SELECT
             policy_id, buyer_address, beneficiary_address,
@@ -299,10 +296,10 @@ module Database = struct
         |}
 
     let get_active_policies =
-      Caqti_request.collect
+      Caqti_request.Infix.(->*)
         Caqti_type.unit
-        Caqti_type.(tup3 int64 string
-          (tup3 string int64 float))
+        Caqti_type.(t3 int64 string
+          (t3 string int64 float))
         {|
           SELECT
             policy_id, asset, beneficiary_address,
@@ -314,8 +311,8 @@ module Database = struct
         |}
 
     let update_policy_status =
-      Caqti_request.exec
-        Caqti_type.(tup2 string int64)
+      let open Caqti_request.Infix in
+      Caqti_type.(t2 string int64) ->. Caqti_type.unit @@
         {|
           UPDATE policies
           SET status = $1, updated_at = NOW()
@@ -323,10 +320,10 @@ module Database = struct
         |}
 
     let get_policies_by_user =
-      Caqti_request.collect
+      Caqti_request.Infix.(->*)
         Caqti_type.string
-        Caqti_type.(tup3 int64 string
-          (tup3 int64 float string))
+        Caqti_type.(t3 int64 string
+          (t3 int64 float string))
         {|
           SELECT
             policy_id, asset, coverage_amount_cents,
@@ -342,9 +339,8 @@ module Database = struct
   module PriceQueries = struct
 
     let insert_price =
-      Caqti_request.exec
-        Caqti_type.(tup3 string float
-          (tup2 string float))
+      let open Caqti_request.Infix in
+      Caqti_type.(t3 string float (t2 string float)) ->. Caqti_type.unit @@
         {|
           INSERT INTO price_history (
             asset, price, source, timestamp
@@ -354,9 +350,9 @@ module Database = struct
         |}
 
     let get_latest_price =
-      Caqti_request.find
+      Caqti_request.Infix.(->?)
         Caqti_type.string
-        Caqti_type.(tup2 float float)
+        Caqti_type.(t2 float float)
         {|
           SELECT price, EXTRACT(EPOCH FROM timestamp)
           FROM price_history
@@ -366,9 +362,9 @@ module Database = struct
         |}
 
     let get_price_history =
-      Caqti_request.collect
-        Caqti_type.(tup3 string float float)
-        Caqti_type.(tup2 float float)
+      Caqti_request.Infix.(->*)
+        Caqti_type.(t3 string float float)
+        Caqti_type.(t2 float float)
         {|
           SELECT price, EXTRACT(EPOCH FROM timestamp)
           FROM price_history
@@ -379,8 +375,8 @@ module Database = struct
         |}
 
     let get_twap =
-      Caqti_request.find
-        Caqti_type.(tup2 string float)
+      Caqti_request.Infix.(->?)
+        Caqti_type.(t2 string float)
         Caqti_type.float
         {|
           SELECT AVG(price)
@@ -390,8 +386,8 @@ module Database = struct
         |}
 
     let check_sustained_depeg =
-      Caqti_request.find
-        Caqti_type.(tup3 string float float)
+      Caqti_request.Infix.(->?)
+        Caqti_type.(t3 string float float)
         Caqti_type.bool
         {|
           SELECT BOOL_AND(price < $2)
@@ -406,9 +402,8 @@ module Database = struct
   module TransactionQueries = struct
 
     let insert_transaction =
-      Caqti_request.exec
-        Caqti_type.(tup4 string (option int64)
-          (tup3 string string int64))
+      let open Caqti_request.Infix in
+      Caqti_type.(t2 string (t2 (option int64) (t3 string string int64))) ->. Caqti_type.unit @@
         {|
           INSERT INTO transactions (
             tx_type, policy_id, from_address,
@@ -420,8 +415,8 @@ module Database = struct
         |}
 
     let update_transaction_status =
-      Caqti_request.exec
-        Caqti_type.(tup3 string (option string) int64)
+      let open Caqti_request.Infix in
+      Caqti_type.(t3 string (option string) int64) ->. Caqti_type.unit @@
         {|
           UPDATE transactions
           SET status = $1, tx_hash = $2
@@ -429,10 +424,9 @@ module Database = struct
         |}
 
     let get_user_transactions =
-      Caqti_request.collect
+      Caqti_request.Infix.(->*)
         Caqti_type.string
-        Caqti_type.(tup4 int64 string
-          (tup3 int64 string float))
+        Caqti_type.(t2 int64 (t2 string (t3 int64 string float)))
         {|
           SELECT
             tx_id, tx_type, amount_cents,
@@ -449,8 +443,8 @@ module Database = struct
   module VaultQueries = struct
 
     let insert_vault =
-      Caqti_request.exec
-        Caqti_type.(tup3 string string int)
+      let open Caqti_request.Infix in
+      Caqti_type.(t3 string string int) ->. Caqti_type.unit @@
         {|
           INSERT INTO vaults (
             vault_name, vault_type, target_return_bps,
@@ -464,10 +458,9 @@ module Database = struct
         |}
 
     let get_vault_state =
-      Caqti_request.find
+      Caqti_request.Infix.(->?)
         Caqti_type.string
-        Caqti_type.(tup4 int64 int64
-          (tup3 int64 int64 int64))
+        Caqti_type.(t2 int64 (t2 int64 (t3 int64 int64 int64)))
         {|
           SELECT
             total_capital_cents, total_coverage_sold_cents,
@@ -478,8 +471,8 @@ module Database = struct
         |}
 
     let update_vault_capital =
-      Caqti_request.exec
-        Caqti_type.(tup2 int64 string)
+      let open Caqti_request.Infix in
+      Caqti_type.(t2 int64 string) ->. Caqti_type.unit @@
         {|
           UPDATE vaults
           SET total_capital_cents = $1, updated_at = NOW()
@@ -489,24 +482,21 @@ module Database = struct
   end
 
   (** Connection pool management **)
-  let create_pool (config: db_config) : (Caqti_lwt.connection Caqti_lwt.Pool.t, [> Caqti_error.t]) result =
-    let uri = Uri.of_string (connection_uri config) in
-    Caqti_lwt.connect_pool ~max_size:config.pool_size uri
+  let create_pool (config: db_config) =
+    let uri = connection_uri config in
+    let pool_config = Caqti_pool_config.create ~max_size:config.pool_size () in
+    Caqti_lwt_unix.connect_pool ~pool_config (Uri.of_string uri)
 
   (** Execute query with connection pool **)
-  let with_connection
-      (pool: (Caqti_lwt.connection Caqti_lwt.Pool.t, [> Caqti_error.t]) result)
-      (f: (module CONNECTION) -> 'a Lwt.t)
-    : ('a, [> Caqti_error.t]) result Lwt.t =
-
+  let with_connection pool f =
     match pool with
     | Error e -> Lwt.return (Error e)
     | Ok pool ->
-        Caqti_lwt.Pool.use f pool
+        Caqti_lwt_unix.Pool.use f pool
 
   (** Helper: Insert policy **)
   let insert_policy
-      (pool: (Caqti_lwt.connection Caqti_lwt.Pool.t, [> Caqti_error.t]) result)
+      pool
       ~(buyer: string)
       ~(beneficiary: string)
       ~(asset: string)
@@ -526,7 +516,7 @@ module Database = struct
 
   (** Helper: Get active policies **)
   let get_active_policies
-      (pool: (Caqti_lwt.connection Caqti_lwt.Pool.t, [> Caqti_error.t]) result)
+      pool
     : ((int64 * string * (string * int64 * float)) list, [> Caqti_error.t]) result Lwt.t =
 
     with_connection pool (fun (module Db : CONNECTION) ->
@@ -535,7 +525,7 @@ module Database = struct
 
   (** Helper: Insert price **)
   let insert_price
-      (pool: (Caqti_lwt.connection Caqti_lwt.Pool.t, [> Caqti_error.t]) result)
+      pool
       ~(asset: string)
       ~(price: float)
       ~(source: string)
@@ -548,15 +538,19 @@ module Database = struct
 
   (** Helper: Check sustained depeg **)
   let check_sustained_depeg
-      (pool: (Caqti_lwt.connection Caqti_lwt.Pool.t, [> Caqti_error.t]) result)
+      pool
       ~(asset: string)
       ~(trigger_price: float)
       ~(duration_seconds: float)
     : (bool, [> Caqti_error.t]) result Lwt.t =
 
-    with_connection pool (fun (module Db : CONNECTION) ->
-      Db.find PriceQueries.check_sustained_depeg
+    let%lwt result = with_connection pool (fun (module Db : CONNECTION) ->
+      Db.find_opt PriceQueries.check_sustained_depeg
         (asset, trigger_price, duration_seconds)
-    )
+    ) in
+    match result with
+    | Ok (Some b) -> Lwt.return (Ok b)
+    | Ok None -> Lwt.return (Ok false)
+    | Error e -> Lwt.return (Error e)
 
 end

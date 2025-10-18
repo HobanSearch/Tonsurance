@@ -32,6 +32,31 @@ const int TOTAL_SUPPLY = 1000000000000000000;  ;; 1B SURE (9 decimals)
         .end_cell());
 }
 
+;; Helper functions for Jetton wallet address calculation
+cell calculate_jetton_wallet_state_init(slice owner_address, slice jetton_master_address, cell jetton_wallet_code) inline {
+    cell data = begin_cell()
+        .store_coins(0)
+        .store_slice(owner_address)
+        .store_slice(jetton_master_address)
+        .store_ref(jetton_wallet_code)
+        .end_cell();
+    return begin_cell()
+        .store_uint(0, 2)
+        .store_dict(jetton_wallet_code)
+        .store_dict(data)
+        .store_uint(0, 1)
+        .end_cell();
+}
+
+slice calculate_jetton_wallet_address(cell wallet_state_init) inline {
+    return begin_cell()
+        .store_uint(4, 3)
+        .store_int(0, 8)
+        .store_uint(cell_hash(wallet_state_init), 256)
+        .end_cell()
+        .begin_parse();
+}
+
 () mint_tokens(slice sender_address, slice to_address, int amount, slice response_address) impure {
     load_data();
     throw_unless(403, equal_slices_bits(sender_address, admin_address));
@@ -135,29 +160,4 @@ slice get_wallet_address(slice owner_address) method_id {
     }
 
     throw(0xffff);
-}
-
-;; Helper functions for Jetton wallet address calculation
-cell calculate_jetton_wallet_state_init(slice owner_address, slice jetton_master_address, cell jetton_wallet_code) inline {
-    cell data = begin_cell()
-        .store_coins(0)
-        .store_slice(owner_address)
-        .store_slice(jetton_master_address)
-        .store_ref(jetton_wallet_code)
-        .end_cell();
-    return begin_cell()
-        .store_uint(0, 2)
-        .store_dict(jetton_wallet_code)
-        .store_dict(data)
-        .store_uint(0, 1)
-        .end_cell();
-}
-
-slice calculate_jetton_wallet_address(cell wallet_state_init) inline {
-    return begin_cell()
-        .store_uint(4, 3)
-        .store_int(0, 8)
-        .store_uint(cell_hash(wallet_state_init), 256)
-        .end_cell()
-        .begin_parse();
 }

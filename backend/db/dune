@@ -1,0 +1,17 @@
+(library
+ (name db)
+ (public_name tonsurance.db)
+ (modules connection_pool escrow_db transaction_db claims_db risk_db)
+ (libraries
+   core
+   lwt
+   lwt.unix
+   yojson
+   types
+   integration
+   caqti
+   caqti-lwt
+   caqti-lwt.unix
+   logs
+   logs.lwt)
+ (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))

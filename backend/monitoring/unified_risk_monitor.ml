@@ -23,6 +23,13 @@ open Math
 
 module UnifiedRiskMonitor = struct
 
+  (** Product key for 560 combinations *)
+  type product_key = {
+    coverage_type: string;              (* depeg, bridge_exploit, smart_contract, oracle_failure, cex_liquidation *)
+    chain: blockchain;
+    stablecoin: asset;
+  } [@@deriving sexp, compare]
+
   (** Risk snapshot at point in time **)
   type risk_snapshot = {
     timestamp: float;
@@ -42,10 +49,16 @@ module UnifiedRiskMonitor = struct
     reserve_ratio: float;               (* Liquid reserves / total capital *)
     utilization_by_product: (string * float) list; (* Product-specific *)
 
-    (* Concentration metrics *)
+    (* Concentration metrics - EXPANDED *)
     asset_concentrations: (asset * float) list; (* Asset → % of capital *)
+    chain_concentrations: (blockchain * float) list; (* Chain → % of capital *)
     max_concentration: float;           (* Largest single asset exposure *)
     correlated_exposure: float;         (* Max correlated group exposure *)
+    cross_chain_bridge_exposure: float; (* Total bridge risk exposure *)
+
+    (* Multi-dimensional exposure - NEW *)
+    exposure_by_product: (product_key * float) list; (* 560 products → USD exposure *)
+    top_10_products: (product_key * float * int) list; (* Top products by exposure (key, usd, policy_count) *)
 
     (* Correlation analysis *)
     correlation_matrix: (asset * asset * float) list; (* Pairwise correlations *)
@@ -54,13 +67,14 @@ module UnifiedRiskMonitor = struct
     (* Portfolio composition *)
     total_policies: int;
     policies_by_asset: (asset * int) list;
+    policies_by_chain: (blockchain * int) list; (* NEW *)
     policies_by_product: (string * int) list;
     avg_policy_duration: float;         (* Days *)
 
     (* Risk alerts *)
     breach_alerts: risk_alert list;
     warning_alerts: risk_alert list;
-  } [@@deriving sexp, yojson]
+  } [@@deriving sexp]
 
   and risk_alert = {
     alert_type: alert_type;
@@ -68,7 +82,7 @@ module UnifiedRiskMonitor = struct
     message: string;
     current_value: float;
     limit_value: float;
-    timestamp: float;
+    alert_timestamp: float;
   }
 
   and alert_type =
@@ -78,7 +92,7 @@ module UnifiedRiskMonitor = struct
     | Correlation_Spike
     | Stress_Loss_High
     | VaR_Breach
-  [@@deriving sexp, yojson]
+  [@@deriving sexp]
 
   (** Monitor configuration **)
   type monitor_config = {
@@ -119,15 +133,16 @@ module UnifiedRiskMonitor = struct
 
   (** Calculate asset concentrations **)
   let calculate_asset_concentrations
-      (collateral_mgr: Collateral_manager.CollateralManager.t)
+      (collateral_mgr: Pool.Collateral_manager.CollateralManager.t)
     : (asset * float) list =
 
     let pool = collateral_mgr.pool in
-    let all_assets = [USDC; USDT; DAI; FRAX; BUSD] in
+    (* All 14 stablecoins *)
+    let all_assets = [USDC; USDT; USDP; DAI; FRAX; BUSD; USDe; USDY; PYUSD; GHO; LUSD] in
 
     List.map all_assets ~f:(fun asset ->
       let concentration =
-        Collateral_manager.CollateralManager.calculate_asset_concentration pool asset
+        Pool.Collateral_manager.CollateralManager.calculate_asset_concentration pool asset
       in
       (asset, concentration)
     )
@@ -137,7 +152,8 @@ module UnifiedRiskMonitor = struct
       (price_history: (asset * float list) list)
     : (asset * asset * float) list =
 
-    let all_assets = [USDC; USDT; DAI; FRAX; BUSD] in
+    (* All 14 stablecoins *)
+    let all_assets = [USDC; USDT; USDP; DAI; FRAX; BUSD; USDe; USDY; PYUSD; GHO; LUSD] in
 
     (* Generate all pairs *)
     let pairs = List.cartesian_product all_assets all_assets in
@@ -155,6 +171,84 @@ module UnifiedRiskMonitor = struct
         | _ -> None
     )
 
+  (** Calculate chain concentrations - NEW **)
+  let calculate_chain_concentrations
+      (policies: policy list)
+    : (blockchain * float) list =
+
+    if List.is_empty policies then []
+    else
+      let total_exposure =
+        List.fold policies ~init:0.0 ~f:(fun acc policy ->
+          acc +. Math.cents_to_usd policy.coverage_amount
+        )
+      in
+
+      let exposure_by_chain =
+        List.fold policies ~init:[] ~f:(fun acc policy ->
+          let chain = policy.chain in
+          let exposure = Math.cents_to_usd policy.coverage_amount in
+          let current_exposure = List.Assoc.find acc chain ~equal:Poly.equal |> Option.value ~default:0.0 in
+          List.Assoc.add acc chain (current_exposure +. exposure) ~equal:Poly.equal
+        )
+      in
+
+      List.map exposure_by_chain ~f:(fun (chain, exposure) ->
+        let concentration = if Float.(total_exposure > 0.0) then exposure /. total_exposure else 0.0 in
+        (chain, concentration)
+      )
+
+  (** Calculate product exposures (560 combinations) - NEW **)
+  let calculate_product_exposures
+      (policies: policy list)
+    : (product_key * float) list =
+
+    if List.is_empty policies then []
+    else
+      let exposure_map = Hashtbl.create (module struct
+        type t = product_key [@@deriving sexp, compare]
+        let hash (t : product_key) =
+          Hashtbl.hash (t.coverage_type, t.chain, t.stablecoin)
+      end) in
+
+      List.iter policies ~f:(fun policy ->
+        let key = {
+          coverage_type = coverage_type_to_string policy.coverage_type;
+          chain = policy.chain;
+          stablecoin = policy.asset;
+        } in
+
+        let current_exposure = Hashtbl.find exposure_map key |> Option.value ~default:0.0 in
+        let new_exposure = current_exposure +. Math.cents_to_usd policy.coverage_amount in
+        Hashtbl.set exposure_map ~key ~data:new_exposure
+      );
+
+      Hashtbl.to_alist exposure_map
+
+  (** Calculate top 10 products by exposure - NEW **)
+  let calculate_top_products
+      (exposure_by_product: (product_key * float) list)
+      (policies: policy list)
+    : (product_key * float * int) list =
+
+    let with_counts =
+      List.map exposure_by_product ~f:(fun (key, exposure) ->
+        let count =
+          List.count policies ~f:(fun policy ->
+            Poly.equal (coverage_type_to_string policy.coverage_type) key.coverage_type &&
+            Poly.equal policy.chain key.chain &&
+            Poly.equal policy.asset key.stablecoin
+          )
+        in
+        (key, exposure, count)
+      )
+    in
+
+    List.sort with_counts ~compare:(fun (_, exp1, _) (_, exp2, _) ->
+      Float.compare exp2 exp1
+    )
+    |> (fun lst -> List.take lst 10)
+
   (** Detect correlation regime **)
   let detect_correlation_regime
       (correlation_matrix: (asset * asset * float) list)
@@ -165,58 +259,49 @@ module UnifiedRiskMonitor = struct
       let correlations = List.map correlation_matrix ~f:(fun (_, _, corr) -> Float.abs corr) in
       let avg_correlation = Math.mean correlations in
 
-      if avg_correlation > 0.70 then `High
-      else if avg_correlation > 0.40 then `Medium
+      if Float.(avg_correlation > 0.70) then `High
+      else if Float.(avg_correlation > 0.40) then `Medium
       else `Low
 
   (** Calculate portfolio VaR using Monte Carlo **)
   let calculate_portfolio_var
-      (collateral_mgr: Collateral_manager.CollateralManager.t)
+      (pool: (Caqti_lwt.connection Caqti_lwt.Pool.t, [> Caqti_error.t]) result)
+      (collateral_mgr: Pool.Collateral_manager.CollateralManager.t)
       ~(confidence_level: float)
-      ~(num_simulations: int)
-    : float =
+    : (Risk_model.risk_assessment_result, [> Caqti_error.t]) result Lwt.t =
 
-    (* Simplified: use historical returns if available *)
-    (* In production, would use full Monte Carlo with correlation matrix *)
+    let vault_state = {
+      total_capital_usd = collateral_mgr.pool.total_capital_usd;
+      btc_float_sats = collateral_mgr.pool.btc_float_sats;
+      btc_float_value_usd = collateral_mgr.pool.btc_cost_basis_usd;
+      usd_reserves = collateral_mgr.pool.usd_reserves;
+      collateral_positions = [];
+      active_policies = collateral_mgr.pool.active_policies;
+      total_coverage_sold = collateral_mgr.pool.total_coverage_sold;
+    } in
 
-    let pool = collateral_mgr.pool in
-
-    if List.is_empty pool.active_policies then 0.0
-    else
-      (* Approximate VaR as % of total coverage *)
-      let total_coverage = Math.cents_to_usd pool.total_coverage_sold in
-
-      (* Historical depeg probability *)
-      let avg_depeg_prob =
-        List.fold [USDC; USDT; DAI] ~init:0.0 ~f:(fun acc asset ->
-          acc +. Risk_model.RiskModel.DepegAnalysis.annual_depeg_probability asset ~threshold:0.97
-        ) /. 3.0
-      in
-
-      (* Expected severity *)
-      let avg_severity =
-        List.fold [USDC; USDT; DAI] ~init:0.0 ~f:(fun acc asset ->
-          acc +. Risk_model.RiskModel.DepegAnalysis.expected_severity asset
-        ) /. 3.0
-      in
-
-      (* VaR estimate *)
-      let var_pct = if confidence_level >= 0.99 then
-        avg_depeg_prob *. avg_severity *. 2.0  (* 99% VaR ~2x expected *)
-      else
-        avg_depeg_prob *. avg_severity *. 1.5  (* 95% VaR ~1.5x expected *)
-      in
-
-      total_coverage *. var_pct
+    Risk_model.calculate_risk_assessment
+      ~db_pool:pool
+      ~vault:vault_state
+      ~market_conditions:{ (* TODO: Pass real market conditions *)
+        bridge_multiplier = 1.0;
+        chain_multiplier = 1.0;
+        market_stress_multiplier = 1.0;
+        combined_multiplier = 1.0;
+        timestamp = 0.0;
+        bridge_health_score = None;
+        chain_congestion_score = None;
+        market_stress_level = Normal;
+      }
 
   (** Run stress tests **)
   let run_stress_tests
-      (collateral_mgr: Collateral_manager.CollateralManager.t)
-    : (string * float) list * float =
+      (db_pool: (Caqti_lwt.connection Caqti_lwt.Pool.t, [> Caqti_error.t]) result)
+      (collateral_mgr: Pool.Collateral_manager.CollateralManager.t)
+    : ((string * float) list * float) Lwt.t =
 
     let pool = collateral_mgr.pool in
 
-    (* Convert pool to vault_state for stress testing *)
     let vault_state = {
       total_capital_usd = pool.total_capital_usd;
       btc_float_sats = pool.btc_float_sats;
@@ -229,10 +314,13 @@ module UnifiedRiskMonitor = struct
       total_coverage_sold = pool.total_coverage_sold;
     } in
 
-    let results = Risk_model.RiskModel.StressTest.run_all_scenarios vault_state in
-    let worst_case = Risk_model.RiskModel.StressTest.worst_case_loss vault_state in
+    let%lwt results = MonteCarloEnhanced.run_stress_test_suite db_pool ~vault:vault_state in
 
-    (results, worst_case)
+    match results with
+    | Ok stress_results ->
+        Lwt.return (stress_results.scenarios, stress_results.worst_loss)
+    | Error _ ->
+        Lwt.return ([], 0.0) (* TODO: Handle error *)
 
   (** Check risk limits and generate alerts **)
   let check_risk_limits
@@ -253,7 +341,7 @@ module UnifiedRiskMonitor = struct
           (snapshot.ltv *. 100.0) (thresholds.ltv_critical *. 100.0);
         current_value = snapshot.ltv;
         limit_value = thresholds.ltv_critical;
-        timestamp = Unix.time ();
+        alert_timestamp = Unix.time ();
       } :: !breaches
     else if snapshot.ltv >= thresholds.ltv_warning then
       warnings := {
@@ -263,7 +351,7 @@ module UnifiedRiskMonitor = struct
           (snapshot.ltv *. 100.0) (thresholds.ltv_warning *. 100.0);
         current_value = snapshot.ltv;
         limit_value = thresholds.ltv_warning;
-        timestamp = Unix.time ();
+        alert_timestamp = Unix.time ();
       } :: !warnings;
 
     (* Check reserves *)
@@ -275,7 +363,7 @@ module UnifiedRiskMonitor = struct
           (snapshot.reserve_ratio *. 100.0) (thresholds.reserve_critical *. 100.0);
         current_value = snapshot.reserve_ratio;
         limit_value = thresholds.reserve_critical;
-        timestamp = Unix.time ();
+        alert_timestamp = Unix.time ();
       } :: !breaches
     else if snapshot.reserve_ratio <= thresholds.reserve_warning then
       warnings := {
@@ -285,7 +373,7 @@ module UnifiedRiskMonitor = struct
           (snapshot.reserve_ratio *. 100.0) (thresholds.reserve_warning *. 100.0);
         current_value = snapshot.reserve_ratio;
         limit_value = thresholds.reserve_warning;
-        timestamp = Unix.time ();
+        alert_timestamp = Unix.time ();
       } :: !warnings;
 
     (* Check concentration *)
@@ -297,7 +385,7 @@ module UnifiedRiskMonitor = struct
           (snapshot.max_concentration *. 100.0) (thresholds.concentration_critical *. 100.0);
         current_value = snapshot.max_concentration;
         limit_value = thresholds.concentration_critical;
-        timestamp = Unix.time ();
+        alert_timestamp = Unix.time ();
       } :: !breaches
     else if snapshot.max_concentration >= thresholds.concentration_warning then
       warnings := {
@@ -307,49 +395,37 @@ module UnifiedRiskMonitor = struct
           (snapshot.max_concentration *. 100.0) (thresholds.concentration_warning *. 100.0);
         current_value = snapshot.max_concentration;
         limit_value = thresholds.concentration_warning;
-        timestamp = Unix.time ();
+        alert_timestamp = Unix.time ();
       } :: !warnings;
 
     (!breaches, !warnings)
 
   (** Calculate comprehensive risk snapshot **)
   let calculate_risk_snapshot
-      (collateral_mgr: Collateral_manager.CollateralManager.t)
+      (db_pool: (Caqti_lwt.connection Caqti_lwt.Pool.t, [> Caqti_error.t]) result)
+      (collateral_mgr: Pool.Collateral_manager.CollateralManager.t)
       ~(config: monitor_config)
       ~(price_history_opt: (asset * float list) list option)
-    : risk_snapshot =
+    : risk_snapshot Lwt.t =
 
     let pool = collateral_mgr.pool in
 
     (* Calculate VaR *)
-    let var_95 = calculate_portfolio_var collateral_mgr
+    let%lwt var_result = calculate_portfolio_var db_pool collateral_mgr
       ~confidence_level:0.95
-      ~num_simulations:config.monte_carlo_simulations
     in
 
-    let var_99 = calculate_portfolio_var collateral_mgr
-      ~confidence_level:0.99
-      ~num_simulations:config.monte_carlo_simulations
-    in
-
-    let cvar_95 = var_95 *. 1.3 in (* CVaR typically ~1.3x VaR *)
-
-    (* Calculate expected loss *)
-    let expected_loss =
-      List.fold pool.active_policies ~init:0.0 ~f:(fun acc policy ->
-        acc +. Risk_model.RiskModel.DepegAnalysis.expected_loss_per_policy
-          policy.asset
-          ~coverage:policy.coverage_amount
-          ~trigger_price:policy.trigger_price
-      )
+    let (var_95, var_99, cvar_95, expected_loss) = match var_result with
+      | Ok res -> (res.var_95, res.var_99, res.cvar_95, res.expected_loss)
+      | Error _ -> (0.0, 0.0, 0.0, 0.0) (* TODO: Handle error *)
     in
 
     (* Run stress tests *)
-    let (stress_results, worst_case) = run_stress_tests collateral_mgr in
+    let%lwt (stress_results, worst_case) = run_stress_tests db_pool collateral_mgr in
 
     (* Calculate utilization metrics *)
-    let ltv = Collateral_manager.CollateralManager.calculate_ltv pool in
-    let reserve_ratio = Collateral_manager.CollateralManager.calculate_reserve_ratio pool in
+    let ltv = Pool.Collateral_manager.CollateralManager.calculate_ltv pool in
+    let reserve_ratio = Pool.Collateral_manager.CollateralManager.calculate_reserve_ratio pool in
 
     (* Calculate concentrations *)
     let asset_concentrations = calculate_asset_concentrations collateral_mgr in
@@ -362,7 +438,7 @@ module UnifiedRiskMonitor = struct
     (* Calculate correlated exposure *)
     let correlated_exposure =
       List.fold asset_concentrations ~init:0.0 ~f:(fun acc (asset, _) ->
-        Float.max acc (Collateral_manager.CollateralManager.calculate_correlated_exposure pool asset)
+        Float.max acc (Pool.Collateral_manager.CollateralManager.calculate_correlated_exposure pool asset)
       )
     in
 
@@ -422,7 +498,7 @@ module UnifiedRiskMonitor = struct
     (* Check limits *)
     let (breaches, warnings) = check_risk_limits snapshot config in
 
-    { snapshot with breach_alerts = breaches; warning_alerts = warnings }
+    Lwt.return { snapshot with breach_alerts = breaches; warning_alerts = warnings }
 
   (** Get risk-adjusted pricing multiplier **)
   let get_risk_adjusted_multiplier
@@ -467,7 +543,8 @@ module UnifiedRiskMonitor = struct
 
   (** Main monitoring loop **)
   let monitor_loop
-      ~(collateral_manager: Collateral_manager.CollateralManager.t ref)
+      ~(db_pool: (Caqti_lwt.connection Caqti_lwt.Pool.t, [> Caqti_error.t]) result)
+      ~(collateral_manager: Pool.Collateral_manager.CollateralManager.t ref)
       ~(config: monitor_config)
       ~(price_history_provider: unit -> (asset * float list) list option Lwt.t)
     : unit Lwt.t =
@@ -482,7 +559,7 @@ module UnifiedRiskMonitor = struct
           let%lwt price_history_opt = price_history_provider () in
 
           (* Calculate snapshot *)
-          let snapshot = calculate_risk_snapshot !collateral_manager
+          let%lwt snapshot = calculate_risk_snapshot db_pool !collateral_manager
             ~config
             ~price_history_opt
           in

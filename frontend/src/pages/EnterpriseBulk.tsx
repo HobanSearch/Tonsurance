@@ -193,21 +193,10 @@ export const EnterpriseBulk = () => {
   return (
     <div className="space-y-8 pb-20">
       {/* Header */}
-      <TerminalWindow title="ENTERPRISE BULK INSURANCE">
-        <div className="space-y-2 font-mono text-sm">
-          <div className="text-green-400">
-            ╔════════════════════════════════════════════════════════════════╗
-          </div>
-          <div className="text-green-400">
-            ║  EMPLOYEE PROTECTION PROGRAM                                    ║
-          </div>
-          <div className="text-green-400">
-            ║  Bulk Discounts • CSV Import • Automated Distribution          ║
-          </div>
-          <div className="text-green-400">
-            ╚════════════════════════════════════════════════════════════════╝
-          </div>
-          <div className="text-gray-400 mt-4">
+      <TerminalWindow title="ENTERPRISE_BULK_INSURANCE">
+        <div className="font-mono text-sm text-text-secondary">
+          &gt; Bulk Discounts • CSV Import • Automated Distribution
+          <div className="mt-2 text-xs">
             Protect your entire team with stablecoin insurance. Upload a CSV of employee
             wallets and coverage amounts, or add them manually. Enjoy volume discounts
             up to 20% for teams of 200+.
@@ -229,8 +218,8 @@ export const EnterpriseBulk = () => {
       <TerminalWindow title="STEP 2: CONFIGURE COVERAGE">
         <div className="space-y-6">
           <div>
-            <h3 className="text-green-400 font-mono text-sm mb-3">
-              DEFAULT COVERAGE PER EMPLOYEE ({selectedStablecoin})
+            <h3 className="text-text-secondary font-mono text-xs font-semibold mb-3 uppercase">
+              Default Coverage Per Employee ({selectedStablecoin})
             </h3>
             <div className="flex gap-3">
               <input
@@ -240,7 +229,7 @@ export const EnterpriseBulk = () => {
                   setCoveragePerEmployee(e.target.value);
                   calculateBulkQuote();
                 }}
-                className="flex-1 bg-black border-2 border-gray-600 px-4 py-3 text-green-400 font-mono focus:border-green-400 outline-none"
+                className="flex-1 bg-cream-300/50 border border-cream-400 px-4 py-3 text-text-primary font-mono focus:border-copper-500 focus:outline-none outline-none"
               />
               <div className="grid grid-cols-4 gap-2">
                 {['1000', '5000', '10000', '25000'].map(preset => (
@@ -271,7 +260,7 @@ export const EnterpriseBulk = () => {
                   setDurationDays(e.target.value);
                   calculateBulkQuote();
                 }}
-                className="flex-1 bg-black border-2 border-gray-600 px-4 py-3 text-green-400 font-mono focus:border-green-400 outline-none"
+                className="flex-1 bg-cream-300/50 border border-cream-400 px-4 py-3 text-text-primary font-mono focus:border-copper-500 focus:outline-none outline-none"
               />
               <div className="grid grid-cols-4 gap-2">
                 {['30', '90', '180', '365'].map(preset => (
@@ -483,7 +472,7 @@ export const EnterpriseBulk = () => {
 
       {!userAddress && (
         <InfoPanel variant="warning">
-          Please connect your TON wallet to purchase bulk insurance
+          Please connect your TON wallet to purchase bulk parametric coverage
         </InfoPanel>
       )}
 

@@ -1,0 +1,139 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+:root {
+  --cream-200: #F7F3ED;
+  --cream-300: #EBE7E0;
+  --cream-400: #D9D5CE;
+  --copper-500: #D87665;
+  --copper-600: #C66555;
+  --copper-700: #AD5447;
+  --terminal-green: #00AA00;
+  --terminal-green-bright: #33FF33;
+  --ton-blue: #0088CC;
+  --text-primary: #2C2C2C;
+  --text-secondary: #666666;
+}
+
+@theme inline {
+  /* Cream colors (Tonny's body) */
+  --color-cream-200: var(--cream-200);
+  --color-cream-300: var(--cream-300);
+  --color-cream-400: var(--cream-400);
+
+  /* Copper colors (Tonny's accents) */
+  --color-copper-500: var(--copper-500);
+  --color-copper-600: var(--copper-600);
+  --color-copper-700: var(--copper-700);
+
+  /* Terminal colors */
+  --color-terminal-green: var(--terminal-green);
+  --color-terminal-green-bright: var(--terminal-green-bright);
+  --color-ton-blue: var(--ton-blue);
+
+  /* Text colors */
+  --color-text-primary: var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+
+  /* Fonts */
+  --font-heading: 'Space Grotesk', sans-serif;
+  --font-body: 'Inter', sans-serif;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--cream-200);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+}
+
+/* Focus styles for accessibility */
+*:focus-visible {
+  outline: 2px solid var(--copper-500);
+  outline-offset: 2px;
+}
+
+/* Skip to main content link for screen readers */
+.skip-to-main {
+  position: absolute;
+  top: -40px;
+  left: 0;
+  background: var(--copper-500);
+  color: var(--cream-200);
+  padding: 8px 16px;
+  text-decoration: none;
+  z-index: 100;
+}
+
+.skip-to-main:focus {
+  top: 0;
+}
+
+/* Retro CRT/Terminal Effects - Matching Mini-App */
+.terminal-texture {
+  position: relative;
+  overflow: hidden;
+}
+
+/* Scanline effect (like CRT monitors) */
+.terminal-texture::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: linear-gradient(
+    transparent 50%,
+    rgba(0, 0, 0, 0.06) 50%
+  );
+  background-size: 100% 4px;
+  pointer-events: none;
+  z-index: 1;
+  opacity: 0.5;
+}
+
+/* Paper texture with horizontal lines */
+.terminal-texture::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background:
+    repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0, 0, 0, 0.02) 2px,
+      rgba(0, 0, 0, 0.02) 3px
+    );
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Vignette effect for cards */
+.card-vignette {
+  position: relative;
+}
+
+.card-vignette::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background:
+    radial-gradient(
+      ellipse at center,
+      transparent 60%,
+      rgba(0, 0, 0, 0.05) 100%
+    );
+  pointer-events: none;
+  border-radius: inherit;
+}

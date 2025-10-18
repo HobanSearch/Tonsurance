@@ -1,0 +1,180 @@
+{
+  "_comment": "API Configuration Template for Tonsurance Market Data Integration",
+  "_note": "Copy this file to api_keys.json and fill in your actual API keys",
+  "_warning": "NEVER commit api_keys.json to version control!",
+
+  "chainlink": {
+    "rpc_endpoints": {
+      "ethereum": [
+        "https://eth-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
+        "https://mainnet.infura.io/v3/YOUR_INFURA_KEY",
+        "https://rpc.ankr.com/eth"
+      ],
+      "arbitrum": [
+        "https://arb-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
+        "https://arbitrum-mainnet.infura.io/v3/YOUR_INFURA_KEY"
+      ],
+      "base": [
+        "https://base-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
+        "https://mainnet.base.org"
+      ],
+      "polygon": [
+        "https://polygon-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
+        "https://polygon-rpc.com"
+      ]
+    },
+    "rate_limit_per_second": 10,
+    "timeout_seconds": 5.0,
+    "retry_attempts": 3,
+    "cache_ttl_seconds": 30
+  },
+
+  "coingecko": {
+    "_info": "Free tier: 10-50 req/min, Pro: $500/mo for 500 req/min",
+    "api_key": "YOUR_COINGECKO_PRO_KEY",
+    "base_url": "https://pro-api.coingecko.com/api/v3",
+    "rate_limit_per_minute": 500
+  },
+
+  "defillama": {
+    "_info": "Free, no API key required",
+    "api_key": null,
+    "base_url": "https://api.llama.fi",
+    "rate_limit_per_minute": 60
+  },
+
+  "l2beat": {
+    "_info": "Free, public API",
+    "api_url": "https://api.l2beat.com",
+    "rate_limit_per_minute": 120
+  },
+
+  "etherscan": {
+    "_info": "Free tier: 5 req/s, Standard: $99/mo for 10 req/s",
+    "api_key": "YOUR_ETHERSCAN_KEY",
+    "rate_limit_per_second": 5
+  },
+
+  "arbiscan": {
+    "_info": "Standard: $49/mo for 5 req/s",
+    "api_key": "YOUR_ARBISCAN_KEY",
+    "rate_limit_per_second": 5
+  },
+
+  "basescan": {
+    "_info": "Standard: $49/mo for 5 req/s",
+    "api_key": "YOUR_BASESCAN_KEY",
+    "rate_limit_per_second": 5
+  },
+
+  "polygonscan": {
+    "_info": "Standard: $49/mo for 5 req/s",
+    "api_key": "YOUR_POLYGONSCAN_KEY",
+    "rate_limit_per_second": 5
+  },
+
+  "cex_exchanges": {
+    "binance": {
+      "_info": "Free, requires account. Futures API: 1200 req/min",
+      "api_key": "YOUR_BINANCE_API_KEY",
+      "api_secret": "YOUR_BINANCE_API_SECRET",
+      "testnet": false
+    },
+    "bybit": {
+      "_info": "Free, requires account. API: 100 req/s",
+      "api_key": "YOUR_BYBIT_API_KEY",
+      "api_secret": "YOUR_BYBIT_API_SECRET",
+      "testnet": false
+    },
+    "okx": {
+      "_info": "Free, requires account. API: 20 req/2s",
+      "api_key": "YOUR_OKX_API_KEY",
+      "api_secret": "YOUR_OKX_API_SECRET",
+      "passphrase": "YOUR_OKX_PASSPHRASE",
+      "testnet": false
+    },
+    "deribit": {
+      "_info": "Free, requires account. API: 20 req/s",
+      "api_key": "YOUR_DERIBIT_API_KEY",
+      "api_secret": "YOUR_DERIBIT_API_SECRET",
+      "testnet": false
+    }
+  },
+
+  "blockchain_rpcs": {
+    "solana": {
+      "_info": "Free public RPC or QuickNode: $50/mo",
+      "rpc_url": "https://api.mainnet-beta.solana.com",
+      "ws_url": "wss://api.mainnet-beta.solana.com"
+    },
+    "ton": {
+      "_info": "Free for testnet, Mainnet requires API key",
+      "api_url": "https://toncenter.com/api/v2",
+      "api_key": "YOUR_TON_API_KEY",
+      "testnet": false
+    }
+  },
+
+  "redis": {
+    "_info": "For caching market data (30-60s TTL)",
+    "host": "localhost",
+    "port": 6379,
+    "password": null,
+    "db": 0,
+    "max_connections": 50
+  },
+
+  "timescaledb": {
+    "_info": "For historical time-series data storage",
+    "host": "localhost",
+    "port": 5432,
+    "database": "tonsurance",
+    "user": "postgres",
+    "password": "YOUR_DB_PASSWORD",
+    "pool_size": 20
+  },
+
+  "monitoring": {
+    "prometheus": {
+      "enabled": true,
+      "port": 9090
+    },
+    "grafana": {
+      "enabled": true,
+      "port": 3000
+    },
+    "log_level": "info"
+  },
+
+  "rate_limiting": {
+    "_info": "Global rate limiting to prevent API abuse",
+    "global_requests_per_minute": 400,
+    "per_source_requests_per_minute": 60,
+    "burst_allowance": 50
+  },
+
+  "circuit_breaker": {
+    "_info": "Circuit breaker settings for API resilience",
+    "failure_threshold": 5,
+    "success_threshold": 2,
+    "timeout_seconds": 60,
+    "half_open_requests": 3
+  },
+
+  "estimated_monthly_costs": {
+    "coingecko_pro": 500,
+    "etherscan_standard": 99,
+    "arbiscan_standard": 49,
+    "basescan_standard": 49,
+    "polygonscan_standard": 49,
+    "solana_rpc_quicknode": 50,
+    "cex_apis": 0,
+    "chainlink_rpcs": 0,
+    "defillama": 0,
+    "l2beat": 0,
+    "ton_api": 0,
+    "total_before_optimization": 845,
+    "total_after_caching": 200,
+    "_note": "Redis caching reduces API calls by ~70%, saving $645/mo"
+  }
+}

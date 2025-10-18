@@ -2,5 +2,5 @@ import { CompilerConfig } from '@ton/blueprint';
 
 export const compile: CompilerConfig = {
     lang: 'func',
-    targets: ['contracts/hedged/PricingOracle.fc'],
+    targets: ['contracts/hedged_old/PricingOracle.fc'],
 };

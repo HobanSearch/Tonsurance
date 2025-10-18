@@ -1,0 +1,338 @@
+;; Bonding Curves Library for Multi-Tranche Vault
+;; All functions use fixed-point arithmetic (9 decimals)
+;; Utilization: 0 to 1000000000 (0% to 100%)
+;; APY: in basis points (400 = 4%)
+
+#include "../imports/stdlib.fc";
+
+const int DECIMALS = 1000000000;  ;; 9 decimals for fixed-point (1.0)
+const int BASIS_POINTS_DECIMALS = 100;  ;; 100 = 1%
+
+;; Curve type constants (match MultiTrancheVault.fc)
+const int CURVE_FLAT = 1;
+const int CURVE_LOG = 2;
+const int CURVE_LINEAR = 3;
+const int CURVE_SIGMOIDAL = 4;
+const int CURVE_QUADRATIC = 5;
+const int CURVE_EXPONENTIAL = 6;
+
+;; Constants for approximations
+const int E_CONST = 2718281828;  ;; e ≈ 2.718281828 (9 decimals)
+const int LN2_CONST = 693147180;  ;; ln(2) ≈ 0.693147180 (9 decimals)
+
+;; =============================================================================
+;; FLAT CURVE (SURE-BTC)
+;; Always returns 4% APY regardless of utilization
+;; =============================================================================
+
+int calculate_flat_apy(int utilization) inline {
+    ;; Return constant 400 basis points (4%)
+    return 400;
+}
+
+;; =============================================================================
+;; LOGARITHMIC CURVE (SURE-SNR)
+;; Formula: min + (max - min) * log(1 + U) / log(2)
+;; Approximated using 10-segment piecewise linear interpolation
+;; =============================================================================
+
+int calculate_log_apy(int utilization, int min_apy, int max_apy) inline {
+    ;; Bounds checking
+    if (utilization <= 0) {
+        return min_apy;
+    }
+    if (utilization >= DECIMALS) {
+        return max_apy;
+    }
+
+    ;; Piecewise linear approximation of log(1 + U) / log(2)
+    ;; Pre-calculated values for 10 segments (0.0, 0.1, 0.2, ..., 1.0)
+    ;; Values are log2(1 + x) with 9 decimal precision
+
+    int segment = utilization / 100000000;  ;; Which 10% segment (0-9)
+    int remainder = utilization % 100000000;  ;; Position within segment
+
+    ;; log2(1+x) values at segment boundaries (9 decimals)
+    ;; [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    ;; [0.000, 0.138, 0.263, 0.379, 0.485, 0.585, 0.678, 0.766, 0.848, 0.926, 1.000]
+
+    int y0 = 0;
+    int y1 = 0;
+
+    if (segment == 0) {
+        y0 = 0;
+        y1 = 138000000;
+    } elseif (segment == 1) {
+        y0 = 138000000;
+        y1 = 263000000;
+    } elseif (segment == 2) {
+        y0 = 263000000;
+        y1 = 379000000;
+    } elseif (segment == 3) {
+        y0 = 379000000;
+        y1 = 485000000;
+    } elseif (segment == 4) {
+        y0 = 485000000;
+        y1 = 585000000;
+    } elseif (segment == 5) {
+        y0 = 585000000;
+        y1 = 678000000;
+    } elseif (segment == 6) {
+        y0 = 678000000;
+        y1 = 766000000;
+    } elseif (segment == 7) {
+        y0 = 766000000;
+        y1 = 848000000;
+    } elseif (segment == 8) {
+        y0 = 848000000;
+        y1 = 926000000;
+    } else {
+        y0 = 926000000;
+        y1 = 1000000000;
+    }
+
+    ;; Linear interpolation within segment
+    ;; log_factor = y0 + (y1 - y0) * (remainder / 100000000)
+    int delta_y = y1 - y0;
+    int log_factor = y0 + muldiv(delta_y, remainder, 100000000);
+
+    ;; APY = min + (max - min) * log_factor / DECIMALS
+    int apy_range = max_apy - min_apy;
+    int apy = min_apy + muldiv(apy_range, log_factor, DECIMALS);
+
+    ;; Ensure result is within bounds
+    if (apy < min_apy) {
+        return min_apy;
+    }
+    if (apy > max_apy) {
+        return max_apy;
+    }
+
+    return apy;
+}
+
+;; =============================================================================
+;; LINEAR CURVE (SURE-MEZZ)
+;; Formula: min + (max - min) * U
+;; Simple proportional increase with utilization
+;; =============================================================================
+
+int calculate_linear_apy(int utilization, int min_apy, int max_apy) inline {
+    ;; Bounds checking
+    if (utilization <= 0) {
+        return min_apy;
+    }
+    if (utilization >= DECIMALS) {
+        return max_apy;
+    }
+
+    ;; APY = min + (max - min) * (utilization / DECIMALS)
+    int apy_range = max_apy - min_apy;
+    int apy = min_apy + muldiv(apy_range, utilization, DECIMALS);
+
+    ;; Ensure result is within bounds
+    if (apy < min_apy) {
+        return min_apy;
+    }
+    if (apy > max_apy) {
+        return max_apy;
+    }
+
+    return apy;
+}
+
+;; =============================================================================
+;; SIGMOIDAL CURVE (SURE-JNR)
+;; Formula: min + (max - min) / (1 + e^(-10(U - 0.5)))
+;; S-curve approximated with 10-segment piecewise linear interpolation
+;; =============================================================================
+
+int calculate_sigmoidal_apy(int utilization, int min_apy, int max_apy) inline {
+    ;; Bounds checking
+    if (utilization <= 0) {
+        return min_apy;
+    }
+    if (utilization >= DECIMALS) {
+        return max_apy;
+    }
+
+    ;; Piecewise linear approximation of sigmoid function
+    ;; Pre-calculated values for 10 segments
+    ;; sigmoid(10*(x-0.5)) normalized to [0, 1] range (9 decimals)
+    ;; At x=0: ~0.007, x=0.5: 0.5, x=1.0: ~0.993
+
+    int segment = utilization / 100000000;  ;; Which 10% segment (0-9)
+    int remainder = utilization % 100000000;  ;; Position within segment
+
+    ;; Sigmoid values at segment boundaries (9 decimals)
+    ;; [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    ;; [0.007, 0.018, 0.047, 0.119, 0.269, 0.500, 0.731, 0.881, 0.953, 0.982, 0.993]
+
+    int y0 = 0;
+    int y1 = 0;
+
+    if (segment == 0) {
+        y0 = 7000000;
+        y1 = 18000000;
+    } elseif (segment == 1) {
+        y0 = 18000000;
+        y1 = 47000000;
+    } elseif (segment == 2) {
+        y0 = 47000000;
+        y1 = 119000000;
+    } elseif (segment == 3) {
+        y0 = 119000000;
+        y1 = 269000000;
+    } elseif (segment == 4) {
+        y0 = 269000000;
+        y1 = 500000000;
+    } elseif (segment == 5) {
+        y0 = 500000000;
+        y1 = 731000000;
+    } elseif (segment == 6) {
+        y0 = 731000000;
+        y1 = 881000000;
+    } elseif (segment == 7) {
+        y0 = 881000000;
+        y1 = 953000000;
+    } elseif (segment == 8) {
+        y0 = 953000000;
+        y1 = 982000000;
+    } else {
+        y0 = 982000000;
+        y1 = 993000000;
+    }
+
+    ;; Linear interpolation within segment
+    int delta_y = y1 - y0;
+    int sigmoid_factor = y0 + muldiv(delta_y, remainder, 100000000);
+
+    ;; APY = min + (max - min) * sigmoid_factor / DECIMALS
+    int apy_range = max_apy - min_apy;
+    int apy = min_apy + muldiv(apy_range, sigmoid_factor, DECIMALS);
+
+    ;; Ensure result is within bounds
+    if (apy < min_apy) {
+        return min_apy;
+    }
+    if (apy > max_apy) {
+        return max_apy;
+    }
+
+    return apy;
+}
+
+;; =============================================================================
+;; QUADRATIC CURVE (SURE-JNR+)
+;; Formula: min + (max - min) * U^2
+;; Accelerating growth (slow start, fast finish)
+;; =============================================================================
+
+int calculate_quadratic_apy(int utilization, int min_apy, int max_apy) inline {
+    ;; Bounds checking
+    if (utilization <= 0) {
+        return min_apy;
+    }
+    if (utilization >= DECIMALS) {
+        return max_apy;
+    }
+
+    ;; U^2 = (utilization / DECIMALS)^2
+    ;; = (utilization * utilization) / (DECIMALS * DECIMALS)
+    ;; Use muldiv to prevent overflow
+    int u_squared = muldiv(utilization, utilization, DECIMALS);
+
+    ;; APY = min + (max - min) * u_squared / DECIMALS
+    int apy_range = max_apy - min_apy;
+    int apy = min_apy + muldiv(apy_range, u_squared, DECIMALS);
+
+    ;; Ensure result is within bounds
+    if (apy < min_apy) {
+        return min_apy;
+    }
+    if (apy > max_apy) {
+        return max_apy;
+    }
+
+    return apy;
+}
+
+;; =============================================================================
+;; EXPONENTIAL CURVE (SURE-EQT)
+;; Formula: min + (max - min) * (e^(2U) - 1) / (e^2 - 1)
+;; Rapid acceleration at high utilization
+;; Approximated using 4th-order Taylor series
+;; =============================================================================
+
+int calculate_exponential_apy(int utilization, int min_apy, int max_apy) inline {
+    ;; Bounds checking
+    if (utilization <= 0) {
+        return min_apy;
+    }
+    if (utilization >= DECIMALS) {
+        return max_apy;
+    }
+
+    ;; e^(2U) approximation using Taylor series up to x^4 term
+    ;; e^x ≈ 1 + x + x^2/2! + x^3/3! + x^4/4!
+    ;; where x = 2U
+
+    ;; x = 2 * utilization (still in 9 decimals)
+    int x = 2 * utilization;
+
+    ;; Calculate powers of x using muldiv to prevent overflow
+    ;; x^2 / DECIMALS
+    int x2 = muldiv(x, x, DECIMALS);
+
+    ;; x^3 / DECIMALS^2
+    int x3 = muldiv(x2, x, DECIMALS);
+
+    ;; x^4 / DECIMALS^3
+    int x4 = muldiv(x3, x, DECIMALS);
+
+    ;; Taylor series: 1 + x + x^2/2 + x^3/6 + x^4/24
+    ;; All terms in 9 decimals
+    int term1 = DECIMALS;  ;; 1.0
+    int term2 = x;  ;; x
+    int term3 = x2 / 2;  ;; x^2/2!
+    int term4 = x3 / 6;  ;; x^3/3!
+    int term5 = x4 / 24;  ;; x^4/4!
+
+    int exp_2u = term1 + term2 + term3 + term4 + term5;
+
+    ;; e^2 ≈ 7.389056099 (9 decimals: 7389056099)
+    ;; e^2 - 1 ≈ 6.389056099 (9 decimals: 6389056099)
+    int e2_minus_1 = 6389056099;
+
+    ;; exp_factor = (e^(2U) - 1) / (e^2 - 1)
+    int numerator = exp_2u - DECIMALS;  ;; e^(2U) - 1
+
+    ;; Prevent division by zero and negative values
+    if (numerator < 0) {
+        numerator = 0;
+    }
+
+    int exp_factor = muldiv(numerator, DECIMALS, e2_minus_1);
+
+    ;; Clamp exp_factor to [0, DECIMALS]
+    if (exp_factor < 0) {
+        exp_factor = 0;
+    }
+    if (exp_factor > DECIMALS) {
+        exp_factor = DECIMALS;
+    }
+
+    ;; APY = min + (max - min) * exp_factor / DECIMALS
+    int apy_range = max_apy - min_apy;
+    int apy = min_apy + muldiv(apy_range, exp_factor, DECIMALS);
+
+    ;; Ensure result is within bounds
+    if (apy < min_apy) {
+        return min_apy;
+    }
+    if (apy > max_apy) {
+        return max_apy;
+    }
+
+    return apy;
+}

@@ -1,0 +1,342 @@
+# Prometheus Alerting Rules for Tonsurance
+# Severity levels: CRITICAL, HIGH, MEDIUM, LOW
+# Routes to: Slack, PagerDuty, Email
+
+groups:
+  # ============================================================================
+  # CRITICAL ALERTS - Immediate action required
+  # ============================================================================
+  - name: critical_alerts
+    interval: 30s
+    rules:
+      # Oracle update failures
+      - alert: OracleUpdateStale
+        expr: (time() - pricing_oracle_last_update_timestamp) > 300
+        for: 1m
+        labels:
+          severity: CRITICAL
+          component: pricing_oracle
+          impact: user_facing
+        annotations:
+          summary: "Pricing oracle not updated for 5+ minutes"
+          description: "Last oracle update was {{ $value }}s ago. Hedged insurance pricing unavailable."
+          runbook: "https://docs.tonsurance.com/runbooks/oracle-stale"
+          action: |
+            1. Check PricingOracleKeeper logs: kubectl logs -l app=pricing-keeper
+            2. Verify external API health: Polymarket, Binance, Allianz
+            3. Check keeper wallet balance (needs gas)
+            4. Restart keeper if necessary: kubectl rollout restart deployment/pricing-keeper
+            5. Notify #ops-critical in Slack
+
+      # Vault insolvency risk
+      - alert: VaultInsolvencyRisk
+        expr: (vault_total_coverage_sold / vault_total_capital) > 0.80
+        for: 5m
+        labels:
+          severity: CRITICAL
+          component: multi_tranche_vault
+          impact: financial
+        annotations:
+          summary: "Vault utilization >80% - insolvency risk"
+          description: "Vault utilization at {{ $value | humanizePercentage }}. Coverage sold exceeds safe limits."
+          runbook: "https://docs.tonsurance.com/runbooks/vault-insolvency"
+          action: |
+            1. Pause new policy sales immediately
+            2. Calculate exact shortfall: coverage - capital
+            3. Trigger emergency LP recruitment campaign
+            4. Activate protocol reserve funds
+            5. Notify governance multisig for emergency capital injection
+
+      # Claims processor failure
+      - alert: ClaimsProcessorDown
+        expr: up{job="claims_processor"} == 0
+        for: 2m
+        labels:
+          severity: CRITICAL
+          component: claims_processor
+          impact: user_facing
+        annotations:
+          summary: "ClaimsProcessor service is down"
+          description: "Claims cannot be processed. Users cannot receive payouts."
+          action: |
+            1. Check service health: kubectl get pods -l app=claims-processor
+            2. Check recent crashes: kubectl logs -l app=claims-processor --tail=100
+            3. Restart service: kubectl rollout restart deployment/claims-processor
+            4. Verify database connectivity
+            5. If persistent, deploy previous version
+
+      # Database connection pool exhausted
+      - alert: DatabaseConnectionPoolExhausted
+        expr: pg_stat_activity_count > 90
+        for: 2m
+        labels:
+          severity: CRITICAL
+          component: postgresql
+          impact: service_degradation
+        annotations:
+          summary: "PostgreSQL connection pool exhausted"
+          description: "{{ $value }} active connections (limit: 100). Services degraded."
+          action: |
+            1. Identify slow queries: SELECT * FROM pg_stat_activity WHERE state = 'active' ORDER BY query_start
+            2. Kill long-running queries if necessary
+            3. Check for connection leaks in application logs
+            4. Scale up connection pool size if legitimate traffic spike
+            5. Consider read replica offloading
+
+      # Circuit breaker triggered
+      - alert: CircuitBreakerTriggered
+        expr: vault_circuit_breaker_losses > (vault_total_capital * 0.30)
+        for: 1m
+        labels:
+          severity: CRITICAL
+          component: multi_tranche_vault
+          impact: financial
+        annotations:
+          summary: "Circuit breaker triggered - 30% losses in 24h"
+          description: "Vault losses: {{ $value }}. All operations halted."
+          action: |
+            1. Vault automatically paused - no action needed
+            2. Investigate root cause: exploit, oracle manipulation, or legitimate claims?
+            3. Convene emergency governance call
+            4. Audit all recent claims for legitimacy
+            5. Do NOT unpause until root cause identified
+
+  # ============================================================================
+  # HIGH SEVERITY - Urgent attention required
+  # ============================================================================
+  - name: high_severity_alerts
+    interval: 1m
+    rules:
+      # Test failures in CI
+      - alert: CITestFailures
+        expr: ci_test_failure_count > 0
+        for: 5m
+        labels:
+          severity: HIGH
+          component: ci_cd
+          impact: development
+        annotations:
+          summary: "CI tests failing on {{ $labels.branch }}"
+          description: "{{ $value }} test failures detected. Deployment blocked."
+          action: |
+            1. Check GitHub Actions logs
+            2. Reproduce locally: npm run test
+            3. Fix failing tests before merging
+            4. Do NOT bypass tests on mainnet deployments
+
+      # Bridge health degradation
+      - alert: BridgeHealthDegraded
+        expr: bridge_health_score < 0.70
+        for: 10m
+        labels:
+          severity: HIGH
+          component: bridge_monitor
+          impact: pricing
+        annotations:
+          summary: "{{ $labels.bridge_name }} health degraded to {{ $value }}"
+          description: "Bridge health below 70%. Pricing multipliers adjusted."
+          action: |
+            1. Check bridge monitor logs for specific issues
+            2. Verify bridge TVL and transaction volume
+            3. Check for recent exploits or incidents
+            4. Increase pricing multiplier for affected bridge
+            5. Consider pausing policies for this bridge
+
+      # High gas costs
+      - alert: HighGasCosts
+        expr: avg_gas_cost_ton > 0.5
+        for: 15m
+        labels:
+          severity: HIGH
+          component: contracts
+          impact: financial
+        annotations:
+          summary: "Gas costs elevated: {{ $value }} TON per operation"
+          description: "Keeper operations becoming expensive. Consider batching."
+          action: |
+            1. Check TON network congestion
+            2. Review recent contract operations for inefficiencies
+            3. Implement transaction batching if not already active
+            4. Consider increasing keeper update intervals temporarily
+            5. Monitor profitability impact
+
+      # Hedge execution delays
+      - alert: HedgeExecutionDelayed
+        expr: histogram_quantile(0.95, hedge_execution_latency_seconds_bucket) > 60
+        for: 5m
+        labels:
+          severity: HIGH
+          component: hedge_keepers
+          impact: financial
+        annotations:
+          summary: "Hedge execution taking >60s (p95)"
+          description: "Slow hedge execution increases protocol risk exposure."
+          action: |
+            1. Check Polymarket/Binance API latency
+            2. Verify keeper service health
+            3. Check for API rate limiting
+            4. Increase keeper concurrency if needed
+            5. Monitor slippage impact
+
+      # Abnormal claim rate
+      - alert: AbnormalClaimRate
+        expr: rate(claims_approved_total[1h]) > (rate(claims_approved_total[24h]) * 3)
+        for: 30m
+        labels:
+          severity: HIGH
+          component: claims_engine
+          impact: financial
+        annotations:
+          summary: "Claim rate 3x higher than normal"
+          description: "{{ $value }} claims/hour vs normal. Possible exploit or mass event."
+          action: |
+            1. Review all recent claims for patterns
+            2. Check if single coverage type affected
+            3. Verify oracle data integrity
+            4. Consider pausing affected coverage type
+            5. Investigate for coordinated attack
+
+  # ============================================================================
+  # MEDIUM SEVERITY - Important but not urgent
+  # ============================================================================
+  - name: medium_severity_alerts
+    interval: 2m
+    rules:
+      # Low keeper balance
+      - alert: KeeperLowBalance
+        expr: keeper_wallet_balance_ton < 10
+        for: 30m
+        labels:
+          severity: MEDIUM
+          component: keepers
+          impact: operational
+        annotations:
+          summary: "{{ $labels.keeper_name }} balance low: {{ $value }} TON"
+          description: "Keeper may run out of gas soon."
+          action: |
+            1. Top up keeper wallet
+            2. Set up auto-refill if not already configured
+            3. Monitor keeper spending rate
+
+      # High tranche utilization
+      - alert: HighTrancheUtilization
+        expr: (tranche_capital_deployed / tranche_total_capital) > 0.75
+        for: 1h
+        labels:
+          severity: MEDIUM
+          component: multi_tranche_vault
+          impact: operational
+        annotations:
+          summary: "{{ $labels.tranche_name }} utilization at {{ $value | humanizePercentage }}"
+          description: "Tranche approaching capacity. Need more LP deposits."
+          action: |
+            1. Increase APY for this tranche (bonding curve automatic)
+            2. Notify LP community of opportunity
+            3. Consider LP incentive campaign
+            4. Monitor for full capacity
+
+      # Slow database queries
+      - alert: SlowDatabaseQueries
+        expr: pg_stat_statements_mean_exec_time_seconds > 1.0
+        for: 10m
+        labels:
+          severity: MEDIUM
+          component: postgresql
+          impact: performance
+        annotations:
+          summary: "Slow queries detected: {{ $value }}s average"
+          description: "Database performance degraded."
+          action: |
+            1. Identify slow queries: SELECT * FROM pg_stat_statements ORDER BY mean_exec_time DESC LIMIT 10
+            2. Add missing indexes
+            3. Optimize query plans
+            4. Consider query result caching
+
+      # Redis memory usage high
+      - alert: RedisMemoryHigh
+        expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.80
+        for: 15m
+        labels:
+          severity: MEDIUM
+          component: redis
+          impact: performance
+        annotations:
+          summary: "Redis memory at {{ $value | humanizePercentage }}"
+          description: "Cache may start evicting keys prematurely."
+          action: |
+            1. Check cache hit rate
+            2. Review TTL settings
+            3. Identify memory-heavy keys: redis-cli --bigkeys
+            4. Consider scaling up Redis instance
+
+  # ============================================================================
+  # LOW SEVERITY - Informational
+  # ============================================================================
+  - name: low_severity_alerts
+    interval: 5m
+    rules:
+      # Contract deployment detected
+      - alert: ContractDeploymentDetected
+        expr: increase(contract_deployment_total[5m]) > 0
+        labels:
+          severity: LOW
+          component: contracts
+          impact: informational
+        annotations:
+          summary: "New contract deployed: {{ $labels.contract_name }}"
+          description: "Contract deployment detected. Verify intentional."
+
+      # Unusual user activity spike
+      - alert: UserActivitySpike
+        expr: rate(http_requests_total[5m]) > (rate(http_requests_total[1h]) * 2)
+        for: 10m
+        labels:
+          severity: LOW
+          component: api
+          impact: informational
+        annotations:
+          summary: "API traffic spike: {{ $value }}req/s"
+          description: "Traffic 2x higher than normal. Monitor for DoS."
+
+      # Keeper update interval increased
+      - alert: KeeperUpdateIntervalIncreased
+        expr: increase(pricing_oracle_update_interval_seconds[10m]) > 10
+        labels:
+          severity: LOW
+          component: pricing_oracle
+          impact: informational
+        annotations:
+          summary: "Oracle update interval increased to {{ $value }}s"
+          description: "Keeper may be rate-limited or experiencing issues."
+
+# ============================================================================
+# ALERT ROUTING CONFIGURATION
+# ============================================================================
+# Configure in alertmanager.yml (separate file):
+#
+# route:
+#   group_by: ['severity', 'component']
+#   receiver: 'slack-default'
+#   routes:
+#     - match:
+#         severity: CRITICAL
+#       receiver: 'pagerduty-critical'
+#       continue: true
+#     - match:
+#         severity: HIGH
+#       receiver: 'slack-urgent'
+#     - match:
+#         severity: MEDIUM
+#       receiver: 'slack-warnings'
+#
+# receivers:
+#   - name: 'pagerduty-critical'
+#     pagerduty_configs:
+#       - service_key: '<PAGERDUTY_SERVICE_KEY>'
+#
+#   - name: 'slack-urgent'
+#     slack_configs:
+#       - api_url: '<SLACK_WEBHOOK_URL>'
+#         channel: '#ops-urgent'
+#         title: '{{ .GroupLabels.severity }}: {{ .GroupLabels.alertname }}'
+#         text: '{{ range .Alerts }}{{ .Annotations.summary }}{{ end }}'

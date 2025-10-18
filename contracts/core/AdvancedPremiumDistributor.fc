@@ -1,0 +1,138 @@
+;; AdvancedPremiumDistributor Contract - Phase 2 (Refactored)
+;; Routes premiums to various parties, with a consolidated LP share for MultiTrancheVault
+
+#include "../imports/stdlib.fc";
+
+;; Storage
+global slice owner_address;
+global slice multi_tranche_vault_address;
+global slice referral_manager_address;
+global slice oracle_rewards_address;
+global slice protocol_treasury_address;
+
+;; Distribution Percentages (basis points)
+const int SHARE_LP = 6500; ;; 65% (45% + 20%)
+const int SHARE_REFERRER = 1000; ;; 10%
+const int SHARE_ORACLE = 300; ;; 3%
+const int SHARE_PROTOCOL = 700; ;; 7%
+const int BASIS_POINTS = 10000;
+
+() load_data() impure {
+    slice ds = get_data().begin_parse();
+    owner_address = ds~load_msg_addr();
+    multi_tranche_vault_address = ds~load_msg_addr();
+    referral_manager_address = ds~load_msg_addr();
+    oracle_rewards_address = ds~load_msg_addr();
+    protocol_treasury_address = ds~load_msg_addr();
+}
+
+() save_data() impure {
+    set_data(begin_cell()
+        .store_slice(owner_address)
+        .store_slice(multi_tranche_vault_address)
+        .store_slice(referral_manager_address)
+        .store_slice(oracle_rewards_address)
+        .store_slice(protocol_treasury_address)
+        .end_cell());
+}
+
+() check_owner(slice sender) impure { throw_unless(403, equal_slices_bits(sender, owner_address)); }
+
+() distribute_premium(int premium_amount, int policy_id, slice user_address) impure {
+    throw_unless(400, premium_amount > 0);
+
+    ;; Calculate shares
+    int lp_share = muldiv(premium_amount, SHARE_LP, BASIS_POINTS);
+    int referrer_share = muldiv(premium_amount, SHARE_REFERRER, BASIS_POINTS);
+    int oracle_share = muldiv(premium_amount, SHARE_ORACLE, BASIS_POINTS);
+    int protocol_share = muldiv(premium_amount, SHARE_PROTOCOL, BASIS_POINTS);
+
+    ;; Send to MultiTrancheVault
+    cell msg_lp = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(multi_tranche_vault_address)
+        .store_coins(lp_share)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(0x03, 32)  ;; op: distribute_premiums
+        .store_coins(lp_share)
+        .end_cell();
+    send_raw_message(msg_lp, 1);
+
+    ;; Send to ReferralManager
+    cell msg_referrer = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(referral_manager_address)
+        .store_coins(referrer_share)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(0x03, 32) ;; op: distribute_referral_rewards
+        .store_coins(referrer_share)
+        .store_slice(user_address)
+        .store_uint(policy_id, 64)
+        .end_cell();
+    send_raw_message(msg_referrer, 1);
+
+    ;; Send to OracleRewards
+    cell msg_oracle = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(oracle_rewards_address)
+        .store_coins(oracle_share)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(0x04, 32) ;; op: distribute_oracle_fee
+        .store_coins(oracle_share)
+        .end_cell();
+    send_raw_message(msg_oracle, 1);
+
+    ;; Send to ProtocolTreasury
+    cell msg_protocol = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(protocol_treasury_address)
+        .store_coins(protocol_share)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .end_cell();
+    send_raw_message(msg_protocol, 1);
+}
+
+() set_multi_tranche_vault(slice sender, slice new_address) impure {
+    check_owner(sender);
+    multi_tranche_vault_address = new_address;
+    save_data();
+}
+
+() set_referral_manager(slice sender, slice new_address) impure {
+    check_owner(sender);
+    referral_manager_address = new_address;
+    save_data();
+}
+
+() set_oracle_rewards(slice sender, slice new_address) impure {
+    check_owner(sender);
+    oracle_rewards_address = new_address;
+    save_data();
+}
+
+() set_protocol_treasury(slice sender, slice new_address) impure {
+    check_owner(sender);
+    protocol_treasury_address = new_address;
+    save_data();
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    slice cs = in_msg_full.begin_parse();
+    if (cs~load_uint(4) & 1) { return (); }
+    slice sender_address = cs~load_msg_addr();
+    load_data();
+    int op = in_msg_body~load_uint(32);
+
+    if (op == 0x01) { ;; distribute_premium
+        distribute_premium(in_msg_body~load_coins(), in_msg_body~load_uint(64), in_msg_body~load_msg_addr());
+    } elseif (op == 0x10) { ;; set_multi_tranche_vault
+        set_multi_tranche_vault(sender_address, in_msg_body~load_msg_addr());
+    } elseif (op == 0x11) { ;; set_referral_manager
+        set_referral_manager(sender_address, in_msg_body~load_msg_addr());
+    } elseif (op == 0x12) { ;; set_oracle_rewards
+        set_oracle_rewards(sender_address, in_msg_body~load_msg_addr());
+    } elseif (op == 0x13) { ;; set_protocol_treasury
+        set_protocol_treasury(sender_address, in_msg_body~load_msg_addr());
+    }
+    save_data();
+}

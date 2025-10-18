@@ -15,22 +15,9 @@
   yojson
   str
   types
-  collateral_manager
-  bridge_monitor
+  pool
+  monitoring
   pricing_engine))
-
-(library
- (name tonny_commands)
- (modules start help quote buy policies claim bridges tonny)
- (libraries
-  core
-  lwt
-  lwt.unix
-  types
-  tonny_lib
-  pricing_engine
-  collateral_manager
-  bridge_monitor))
 
 (executable
  (name tonny_bot)
@@ -43,7 +30,7 @@
   types
   tonny_lib
   tonny_commands
-  collateral_manager
-  bridge_monitor
+  pool
+  monitoring
   pricing_engine)
  (preprocess (pps ppx_jane ppx_deriving_yojson)))

@@ -4,6 +4,11 @@ import { useContracts } from '../hooks/useContracts';
 import { LineChart, Line, BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import { TerminalWindow, TerminalOutput } from '../components/terminal';
 
+const TRANCHE_NAMES = ['SURE-BTC', 'SURE-SNR', 'SURE-MEZZ', 'SURE-JNR', 'SURE-JNR+', 'SURE-EQT'];
+const TRANCHE_COLORS = ['#60A5FA', '#34D399', '#FBBF24', '#F97316', '#EF4444', '#A78BFA'];
+const TRANCHE_APY_MIN = [4.0, 6.5, 9.0, 12.5, 16.0, 15.0];
+const TRANCHE_RISK = ['SAFEST', 'VERY LOW', 'LOW', 'MEDIUM', 'HIGH', 'HIGHEST'];
+
 export const Analytics = () => {
   const { contracts, isConfigured } = useContracts();
   const [isLoading, setIsLoading] = useState(false);
@@ -12,43 +17,38 @@ export const Analytics = () => {
     activePolicies: 0,
     totalCoverage: 0,
     claimsPaid: 0,
-    primaryVaultTVL: 0,
-    secondaryVaultTVL: 0,
-    tradfiBufferTVL: 0,
+    trancheTVLs: [0, 0, 0, 0, 0, 0],
   });
 
   // Fetch analytics data from contracts
   useEffect(() => {
     const fetchAnalytics = async () => {
-      if (!isConfigured) return;
+      if (!isConfigured || !contracts.multiTrancheVault) return;
 
       setIsLoading(true);
       try {
+        const trancheIds = [1, 2, 3, 4, 5, 6]; // Tranche IDs are 1-6
+        const tranchePromises = trancheIds.map(id =>
+          contracts.multiTrancheVault!.getTrancheCapital(id).catch(() => 0n)
+        );
+
         const [
-          primaryTVL,
-          secondaryTVL,
-          tradfiTVL,
-          totalPolicies
+          totalPolicies,
+          ...trancheValues
         ] = await Promise.all([
-          contracts.primaryVault?.getTotalLpCapital().catch(() => 0n) || Promise.resolve(0n),
-          contracts.secondaryVault?.getTotalSureStaked().catch(() => 0n) || Promise.resolve(0n),
-          contracts.tradfiBuffer?.getTotalCapital().catch(() => 0n) || Promise.resolve(0n),
           contracts.policyFactory?.getTotalPoliciesCreated().catch(() => 0n) || Promise.resolve(0n),
+          ...tranchePromises
         ]);
 
-        const primaryValue = parseFloat(fromNano(primaryTVL));
-        const secondaryValue = parseFloat(fromNano(secondaryTVL));
-        const tradfiValue = parseFloat(fromNano(tradfiTVL));
-        const totalTVL = primaryValue + secondaryValue + tradfiValue;
+        const trancheTVLs = trancheValues.map(val => parseFloat(fromNano(val)));
+        const totalTVL = trancheTVLs.reduce((sum, current) => sum + current, 0);
 
         setStats({
           totalTVL,
           activePolicies: Number(totalPolicies),
-          totalCoverage: totalTVL * 2.5, // 250% capital efficiency
+          totalCoverage: totalTVL * 2.5, // Mocked assumption
           claimsPaid: 0, // Would need to query ClaimsProcessor
-          primaryVaultTVL: primaryValue,
-          secondaryVaultTVL: secondaryValue,
-          tradfiBufferTVL: tradfiValue,
+          trancheTVLs,
         });
       } catch (error) {
         console.error('Error fetching analytics:', error);
@@ -79,12 +79,9 @@ export const Analytics = () => {
     { month: 'Oct', core: 0, hedged: 0 },
   ];
 
-  const vaultAllocation = [
-    { name: 'Primary Vault', value: stats.primaryVaultTVL || 45, color: '#0ea5e9' },
-    { name: 'Secondary Vault', value: stats.secondaryVaultTVL || 20, color: '#d946ef' },
-    { name: 'TradFi Buffer', value: stats.tradfiBufferTVL || 10, color: '#8b5cf6' },
-    { name: 'Reserve', value: Math.max(0, stats.totalTVL - stats.primaryVaultTVL - stats.secondaryVaultTVL - stats.tradfiBufferTVL) || 25, color: '#6b7280' },
-  ];
+  const vaultAllocation = stats.trancheTVLs
+    .map((tvl, i) => ({ name: TRANCHE_NAMES[i], value: tvl, color: TRANCHE_COLORS[i] }))
+    .filter(item => item.value > 0);
 
   const coverageTypes = [
     { name: 'Depeg', policies: 0, coverage: 0 },
@@ -111,7 +108,7 @@ export const Analytics = () => {
           <TerminalOutput>
             <div className="text-xs text-text-secondary mb-1">TOTAL VALUE LOCKED</div>
             <div className="text-2xl font-bold text-terminal-green font-mono">
-              {isLoading ? '...' : `$${(stats.totalTVL / 1e6).toFixed(2)}M`}
+              {isLoading ? '...' : `${(stats.totalTVL / 1e6).toFixed(2)}M`}
             </div>
             <div className="text-xs text-text-tertiary mt-1 font-mono">
               {isConfigured ? '● LIVE' : 'OFFLINE'}
@@ -135,7 +132,7 @@ export const Analytics = () => {
           <TerminalOutput>
             <div className="text-xs text-text-secondary mb-1">TOTAL COVERAGE</div>
             <div className="text-2xl font-bold text-terminal-green font-mono">
-              {isLoading ? '...' : `$${(stats.totalCoverage / 1e6).toFixed(2)}M`}
+              {isLoading ? '...' : `${(stats.totalCoverage / 1e6).toFixed(2)}M`}
             </div>
             <div className="text-xs text-copper-500 mt-1 font-mono">
               250% EFFICIENT
@@ -186,7 +183,7 @@ export const Analytics = () => {
                 cx="50%"
                 cy="50%"
                 labelLine={false}
-                label={({ name, value }) => `${name}: ${value}%`}
+                label={({ name, value }) => `${name}: ${(value / stats.totalTVL * 100).toFixed(1)}%`}
                 outerRadius={80}
                 fill="#8884d8"
                 dataKey="value"
@@ -197,6 +194,7 @@ export const Analytics = () => {
               </Pie>
               <Tooltip
                 contentStyle={{ backgroundColor: '#1f2937', border: 'none', borderRadius: '8px' }}
+                formatter={(value, name) => [`${(value as number / 1e6).toFixed(2)}M`, name]}
               />
             </PieChart>
           </ResponsiveContainer>
@@ -252,107 +250,26 @@ export const Analytics = () => {
       <TerminalWindow title="VAULT_PERFORMANCE">
         <div className="mb-3 text-xs text-text-secondary font-mono">&gt; 6-TIER WATERFALL VAULT METRICS</div>
         <div className="grid md:grid-cols-3 gap-3">
-          <div className="space-y-2 p-3 bg-cream-300/30 border border-cream-400">
-            <div className="flex items-center justify-between text-xs font-mono">
-              <span className="font-semibold text-copper-500">🟦 SURE-BTC</span>
-              <span className="text-terminal-green font-bold">4.0% APY</span>
-            </div>
-            <div className="space-y-1 text-xs font-mono">
-              <div className="flex justify-between">
-                <span className="text-text-secondary">TVL:</span>
-                <span className="text-text-primary">$0M</span>
+          {stats.trancheTVLs.map((tvl, i) => (
+            <div key={i} className="space-y-2 p-3 bg-cream-300/30 border border-cream-400">
+              <div className="flex items-center justify-between text-xs font-mono">
+                <span className="font-semibold" style={{ color: TRANCHE_COLORS[i] }}>{TRANCHE_NAMES[i]}</span>
+                <span className="text-terminal-green font-bold">{TRANCHE_APY_MIN[i]}% APY</span>
               </div>
-              <div className="flex justify-between">
-                <span className="text-text-secondary">RISK:</span>
-                <span className="text-terminal-green">SAFEST</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="space-y-2 p-3 bg-cream-300/30 border border-cream-400">
-            <div className="flex items-center justify-between text-xs font-mono">
-              <span className="font-semibold text-copper-500">🟩 SURE-SNR</span>
-              <span className="text-terminal-green font-bold">6.5% APY</span>
-            </div>
-            <div className="space-y-1 text-xs font-mono">
-              <div className="flex justify-between">
-                <span className="text-text-secondary">TVL:</span>
-                <span className="text-text-primary">$0M</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-text-secondary">RISK:</span>
-                <span className="text-terminal-green">VERY LOW</span>
+              <div className="space-y-1 text-xs font-mono">
+                <div className="flex justify-between">
+                  <span className="text-text-secondary">TVL:</span>
+                  <span className="text-text-primary">${(tvl / 1e6).toFixed(2)}M</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-text-secondary">RISK:</span>
+                  <span className={TRANCHE_RISK[i] === 'MEDIUM' || TRANCHE_RISK[i] === 'HIGH' ? 'text-terminal-amber' : TRANCHE_RISK[i] === 'HIGHEST' ? 'text-terminal-red' : 'text-terminal-green'}>
+                    {TRANCHE_RISK[i]}
+                  </span>
+                </div>
               </div>
             </div>
-          </div>
-
-          <div className="space-y-2 p-3 bg-cream-300/30 border border-cream-400">
-            <div className="flex items-center justify-between text-xs font-mono">
-              <span className="font-semibold text-copper-500">🟨 SURE-MEZZ</span>
-              <span className="text-terminal-green font-bold">9.0% APY</span>
-            </div>
-            <div className="space-y-1 text-xs font-mono">
-              <div className="flex justify-between">
-                <span className="text-text-secondary">TVL:</span>
-                <span className="text-text-primary">$0M</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-text-secondary">RISK:</span>
-                <span className="text-terminal-green">LOW</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="space-y-2 p-3 bg-cream-300/30 border border-cream-400">
-            <div className="flex items-center justify-between text-xs font-mono">
-              <span className="font-semibold text-copper-500">🟧 SURE-JNR</span>
-              <span className="text-terminal-green font-bold">12.5% APY</span>
-            </div>
-            <div className="space-y-1 text-xs font-mono">
-              <div className="flex justify-between">
-                <span className="text-text-secondary">TVL:</span>
-                <span className="text-text-primary">$0M</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-text-secondary">RISK:</span>
-                <span className="text-terminal-amber">MEDIUM</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="space-y-2 p-3 bg-cream-300/30 border border-cream-400">
-            <div className="flex items-center justify-between text-xs font-mono">
-              <span className="font-semibold text-copper-500">🟥 SURE-JNR+</span>
-              <span className="text-terminal-green font-bold">16.0% APY</span>
-            </div>
-            <div className="space-y-1 text-xs font-mono">
-              <div className="flex justify-between">
-                <span className="text-text-secondary">TVL:</span>
-                <span className="text-text-primary">$0M</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-text-secondary">RISK:</span>
-                <span className="text-terminal-amber">HIGH</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="space-y-2 p-3 bg-cream-300/30 border border-cream-400">
-            <div className="flex items-center justify-between text-xs font-mono">
-              <span className="font-semibold text-copper-500">🟪 SURE-EQT</span>
-              <span className="text-terminal-green font-bold">20.0% APY</span>
-            </div>
-            <div className="space-y-1 text-xs font-mono">
-              <div className="flex justify-between">
-                <span className="text-text-secondary">TVL:</span>
-                <span className="text-text-primary">$0M</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-text-secondary">RISK:</span>
-                <span className="text-terminal-red">HIGHEST</span>
-              </div>
-            </div>
-          </div>
+          ))}
         </div>
       </TerminalWindow>
 

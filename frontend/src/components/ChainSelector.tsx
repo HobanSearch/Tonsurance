@@ -80,7 +80,7 @@ const CHAINS: Record<Blockchain, ChainInfo> = {
   solana: {
     name: 'Solana',
     icon: '◎',
-    color: 'text-green-400',
+    color: 'text-purple-500',
     supportedStablecoins: ['USDC', 'USDT', 'PYUSD', 'USDe']
   }
 };
@@ -123,8 +123,8 @@ export const ChainSelector = ({
     <div className="space-y-6">
       {/* Chain Selection */}
       <div>
-        <h3 className="text-green-400 font-mono text-sm mb-3">
-          SELECT BLOCKCHAIN NETWORK
+        <h3 className="text-text-secondary font-mono text-xs font-semibold mb-3 uppercase">
+          Select Blockchain Network
         </h3>
         <div className="grid grid-cols-4 gap-3">
           {Object.entries(CHAINS).map(([chain, info]) => {
@@ -140,16 +140,18 @@ export const ChainSelector = ({
                   }
                 }}
                 className={`
-                  relative p-4 border-2 transition-all font-mono text-sm
+                  relative p-4 border-3 transition-all font-mono text-sm
                   ${isSelected
-                    ? 'border-green-400 bg-green-400/10'
-                    : 'border-gray-600 hover:border-gray-500'}
+                    ? 'border-copper-500 bg-copper-50 shadow-[0_0_0_2px_#D87665]'
+                    : 'border-cream-400 hover:bg-cream-300 hover:border-copper-300'}
                 `}
               >
                 <div className={`text-2xl mb-2 ${info.color}`}>{info.icon}</div>
-                <div className="text-xs text-gray-300">{info.name}</div>
+                <div className="text-xs text-text-primary font-semibold">{info.name}</div>
                 {isSelected && (
-                  <div className="absolute top-1 right-1 text-green-400 text-xs">✓</div>
+                  <div className="absolute top-2 right-2 w-5 h-5 bg-copper-500 text-white rounded-full flex items-center justify-center text-xs font-bold">
+                    ✓
+                  </div>
                 )}
               </button>
             );
@@ -160,12 +162,12 @@ export const ChainSelector = ({
       {/* Stablecoin Selection */}
       <div>
         <div className="flex items-center justify-between mb-3">
-          <h3 className="text-green-400 font-mono text-sm">
-            SELECT STABLECOIN ({currentChainStablecoins.length} AVAILABLE)
+          <h3 className="text-text-secondary font-mono text-xs font-semibold uppercase">
+            Select Stablecoin ({currentChainStablecoins.length} Available)
           </h3>
           <button
             onClick={() => setShowStablecoinDetails(!showStablecoinDetails)}
-            className="text-xs text-gray-400 hover:text-green-400 font-mono"
+            className="text-xs text-text-tertiary hover:text-copper-500 font-mono transition-colors"
           >
             {showStablecoinDetails ? 'HIDE DETAILS' : 'SHOW DETAILS'}
           </button>
@@ -181,24 +183,26 @@ export const ChainSelector = ({
                 <button
                   onClick={() => onStablecoinChange(coin)}
                   className={`
-                    w-full p-3 border-2 transition-all font-mono text-xs
+                    w-full p-3 border-2 transition-all font-mono text-xs font-semibold
                     ${isSelected
-                      ? 'border-green-400 bg-green-400/10 text-green-400'
-                      : 'border-gray-600 hover:border-gray-500 text-gray-300'}
+                      ? 'border-copper-500 bg-copper-50 text-copper-500'
+                      : 'border-cream-400 hover:border-copper-300 hover:bg-cream-300 text-text-primary'}
                   `}
                 >
                   {coin}
                   {isSelected && (
-                    <div className="absolute -top-1 -right-1 text-green-400 text-xs">✓</div>
+                    <div className="absolute -top-1 -right-1 w-4 h-4 bg-copper-500 text-white rounded-full flex items-center justify-center text-[10px] font-bold">
+                      ✓
+                    </div>
                   )}
                 </button>
 
                 {/* Tooltip on hover */}
                 <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 hidden group-hover:block z-10">
-                  <div className="bg-black border border-gray-600 p-2 text-xs font-mono whitespace-nowrap shadow-lg">
-                    <div className="text-green-400">{info.name}</div>
-                    <div className="text-gray-400 text-[10px]">{info.issuer}</div>
-                    <div className="text-gray-500 text-[10px]">{info.type}</div>
+                  <div className="bg-cream-200 border-2 border-cream-400 p-2 text-xs font-mono whitespace-nowrap shadow-lg">
+                    <div className="text-copper-500 font-semibold">{info.name}</div>
+                    <div className="text-text-secondary text-[10px]">{info.issuer}</div>
+                    <div className="text-text-tertiary text-[10px]">{info.type}</div>
                   </div>
                 </div>
               </div>
@@ -208,25 +212,25 @@ export const ChainSelector = ({
 
         {/* Expanded stablecoin details */}
         {showStablecoinDetails && (
-          <div className="mt-4 border border-gray-700 bg-black/50 p-4">
+          <div className="mt-4 border-2 border-cream-400 bg-cream-300/50 p-4">
             <div className="grid grid-cols-2 gap-3 text-xs font-mono">
               {currentChainStablecoins.map(coin => {
                 const info = STABLECOIN_INFO[coin];
                 return (
                   <div
                     key={coin}
-                    className={`p-3 border ${
+                    className={`p-3 border-2 transition-all ${
                       coin === selectedStablecoin
-                        ? 'border-green-400 bg-green-400/5'
-                        : 'border-gray-700'
+                        ? 'border-copper-500 bg-copper-50'
+                        : 'border-cream-400 bg-cream-200'
                     }`}
                   >
                     <div className="flex items-center justify-between mb-1">
-                      <span className="text-green-400 font-bold">{coin}</span>
-                      <span className="text-gray-500 text-[10px]">{info.type}</span>
+                      <span className="text-copper-500 font-bold">{coin}</span>
+                      <span className="text-text-tertiary text-[10px]">{info.type}</span>
                     </div>
-                    <div className="text-gray-300">{info.name}</div>
-                    <div className="text-gray-500 text-[10px] mt-1">Issuer: {info.issuer}</div>
+                    <div className="text-text-primary font-semibold">{info.name}</div>
+                    <div className="text-text-tertiary text-[10px] mt-1">Issuer: {info.issuer}</div>
                   </div>
                 );
               })}
@@ -236,23 +240,23 @@ export const ChainSelector = ({
       </div>
 
       {/* Selection Summary */}
-      <div className="border border-green-400/30 bg-green-400/5 p-4">
+      <div className="border-2 border-copper-500/30 bg-copper-50/20 p-4">
         <div className="font-mono text-xs space-y-2">
           <div className="flex items-center justify-between">
-            <span className="text-gray-400">Network:</span>
-            <span className="text-green-400">
+            <span className="text-text-tertiary">Network:</span>
+            <span className="text-copper-500 font-semibold">
               {CHAINS[selectedChain].icon} {CHAINS[selectedChain].name}
             </span>
           </div>
           <div className="flex items-center justify-between">
-            <span className="text-gray-400">Asset:</span>
-            <span className="text-green-400">
+            <span className="text-text-tertiary">Asset:</span>
+            <span className="text-copper-500 font-semibold">
               {selectedStablecoin} ({STABLECOIN_INFO[selectedStablecoin].name})
             </span>
           </div>
           <div className="flex items-center justify-between">
-            <span className="text-gray-400">Type:</span>
-            <span className="text-gray-300">
+            <span className="text-text-tertiary">Type:</span>
+            <span className="text-text-primary">
               {STABLECOIN_INFO[selectedStablecoin].type}
             </span>
           </div>

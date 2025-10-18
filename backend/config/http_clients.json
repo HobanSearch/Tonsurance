@@ -1,0 +1,274 @@
+{
+  "ton_client": {
+    "name": "ton_rpc",
+    "endpoints": [
+      "https://toncenter.com/api/v2",
+      "https://ton-api.io/api/v2",
+      "https://ton-rpc.tg-labs.com/api/v2"
+    ],
+    "timeout_seconds": 30.0,
+    "retry_policy": {
+      "max_attempts": 3,
+      "base_delay_ms": 1000,
+      "max_delay_ms": 10000,
+      "backoff_multiplier": 2.0,
+      "jitter_factor": 0.2,
+      "retry_on_timeout": true,
+      "retry_on_connection_error": true,
+      "retry_on_5xx": true,
+      "retry_on_4xx": false
+    },
+    "circuit_breaker": {
+      "failure_threshold": 5,
+      "success_threshold": 3,
+      "timeout_seconds": 30.0,
+      "half_open_max_requests": 1
+    },
+    "pool": {
+      "max_connections": 10,
+      "max_idle_time_seconds": 300.0,
+      "connection_timeout_seconds": 5.0,
+      "health_check_interval_seconds": 60.0
+    },
+    "default_headers": [
+      ["User-Agent", "Tonsurance/1.0"],
+      ["Accept", "application/json"]
+    ]
+  },
+
+  "polymarket_client": {
+    "name": "polymarket_clob",
+    "endpoints": [
+      "https://clob.polymarket.com",
+      "https://api.polymarket.com"
+    ],
+    "timeout_seconds": 20.0,
+    "retry_policy": {
+      "max_attempts": 3,
+      "base_delay_ms": 500,
+      "max_delay_ms": 5000,
+      "backoff_multiplier": 2.0,
+      "jitter_factor": 0.3,
+      "retry_on_timeout": true,
+      "retry_on_connection_error": true,
+      "retry_on_5xx": true,
+      "retry_on_4xx": false
+    },
+    "circuit_breaker": {
+      "failure_threshold": 10,
+      "success_threshold": 3,
+      "timeout_seconds": 60.0,
+      "half_open_max_requests": 2
+    },
+    "pool": {
+      "max_connections": 15,
+      "max_idle_time_seconds": 180.0,
+      "connection_timeout_seconds": 3.0,
+      "health_check_interval_seconds": 45.0
+    },
+    "default_headers": [
+      ["User-Agent", "Tonsurance/1.0 HedgeBot"],
+      ["Accept", "application/json"],
+      ["Content-Type", "application/json"]
+    ],
+    "rate_limit": {
+      "requests_per_second": 10,
+      "burst_size": 20
+    }
+  },
+
+  "binance_futures_client": {
+    "name": "binance_futures",
+    "endpoints": [
+      "https://fapi.binance.com",
+      "https://fapi1.binance.com",
+      "https://fapi2.binance.com"
+    ],
+    "timeout_seconds": 15.0,
+    "retry_policy": {
+      "max_attempts": 4,
+      "base_delay_ms": 500,
+      "max_delay_ms": 8000,
+      "backoff_multiplier": 2.0,
+      "jitter_factor": 0.25,
+      "retry_on_timeout": true,
+      "retry_on_connection_error": true,
+      "retry_on_5xx": true,
+      "retry_on_4xx": false
+    },
+    "circuit_breaker": {
+      "failure_threshold": 8,
+      "success_threshold": 4,
+      "timeout_seconds": 45.0,
+      "half_open_max_requests": 2
+    },
+    "pool": {
+      "max_connections": 20,
+      "max_idle_time_seconds": 240.0,
+      "connection_timeout_seconds": 4.0,
+      "health_check_interval_seconds": 30.0
+    },
+    "default_headers": [
+      ["User-Agent", "Tonsurance/1.0 HedgeBot"],
+      ["Accept", "application/json"],
+      ["Content-Type", "application/json"]
+    ],
+    "rate_limit": {
+      "requests_per_second": 20,
+      "burst_size": 50,
+      "weight_based": true,
+      "max_weight_per_minute": 1200
+    }
+  },
+
+  "chainlink_client": {
+    "name": "chainlink_oracle",
+    "endpoints": [
+      "https://eth-mainnet.g.alchemy.com/v2/YOUR_API_KEY",
+      "https://mainnet.infura.io/v3/YOUR_API_KEY",
+      "https://rpc.ankr.com/eth"
+    ],
+    "timeout_seconds": 25.0,
+    "retry_policy": {
+      "max_attempts": 3,
+      "base_delay_ms": 800,
+      "max_delay_ms": 6000,
+      "backoff_multiplier": 2.0,
+      "jitter_factor": 0.2,
+      "retry_on_timeout": true,
+      "retry_on_connection_error": true,
+      "retry_on_5xx": true,
+      "retry_on_4xx": false
+    },
+    "circuit_breaker": {
+      "failure_threshold": 5,
+      "success_threshold": 2,
+      "timeout_seconds": 40.0,
+      "half_open_max_requests": 1
+    },
+    "pool": {
+      "max_connections": 8,
+      "max_idle_time_seconds": 300.0,
+      "connection_timeout_seconds": 5.0,
+      "health_check_interval_seconds": 60.0
+    },
+    "default_headers": [
+      ["User-Agent", "Tonsurance/1.0"],
+      ["Accept", "application/json"],
+      ["Content-Type", "application/json"]
+    ],
+    "rate_limit": {
+      "requests_per_second": 5,
+      "burst_size": 10
+    }
+  },
+
+  "pyth_client": {
+    "name": "pyth_network",
+    "endpoints": [
+      "https://hermes.pyth.network",
+      "https://xc-mainnet.pyth.network"
+    ],
+    "timeout_seconds": 10.0,
+    "retry_policy": {
+      "max_attempts": 3,
+      "base_delay_ms": 300,
+      "max_delay_ms": 3000,
+      "backoff_multiplier": 2.0,
+      "jitter_factor": 0.3,
+      "retry_on_timeout": true,
+      "retry_on_connection_error": true,
+      "retry_on_5xx": true,
+      "retry_on_4xx": false
+    },
+    "circuit_breaker": {
+      "failure_threshold": 5,
+      "success_threshold": 2,
+      "timeout_seconds": 30.0,
+      "half_open_max_requests": 1
+    },
+    "pool": {
+      "max_connections": 10,
+      "max_idle_time_seconds": 180.0,
+      "connection_timeout_seconds": 3.0,
+      "health_check_interval_seconds": 45.0
+    },
+    "default_headers": [
+      ["User-Agent", "Tonsurance/1.0"],
+      ["Accept", "application/json"]
+    ],
+    "rate_limit": {
+      "requests_per_second": 15,
+      "burst_size": 30
+    }
+  },
+
+  "bridge_health_client": {
+    "name": "bridge_health",
+    "endpoints": [
+      "https://api.llama.fi",
+      "https://l2beat.com/api"
+    ],
+    "timeout_seconds": 20.0,
+    "retry_policy": {
+      "max_attempts": 3,
+      "base_delay_ms": 1000,
+      "max_delay_ms": 5000,
+      "backoff_multiplier": 2.0,
+      "jitter_factor": 0.2,
+      "retry_on_timeout": true,
+      "retry_on_connection_error": true,
+      "retry_on_5xx": true,
+      "retry_on_4xx": false
+    },
+    "circuit_breaker": {
+      "failure_threshold": 5,
+      "success_threshold": 2,
+      "timeout_seconds": 60.0,
+      "half_open_max_requests": 1
+    },
+    "pool": {
+      "max_connections": 5,
+      "max_idle_time_seconds": 300.0,
+      "connection_timeout_seconds": 5.0,
+      "health_check_interval_seconds": 120.0
+    },
+    "default_headers": [
+      ["User-Agent", "Tonsurance/1.0"],
+      ["Accept", "application/json"]
+    ]
+  },
+
+  "general_http_client": {
+    "name": "general_purpose",
+    "endpoints": [],
+    "timeout_seconds": 30.0,
+    "retry_policy": {
+      "max_attempts": 3,
+      "base_delay_ms": 1000,
+      "max_delay_ms": 10000,
+      "backoff_multiplier": 2.0,
+      "jitter_factor": 0.2,
+      "retry_on_timeout": true,
+      "retry_on_connection_error": true,
+      "retry_on_5xx": true,
+      "retry_on_4xx": false
+    },
+    "circuit_breaker": {
+      "failure_threshold": 5,
+      "success_threshold": 3,
+      "timeout_seconds": 30.0,
+      "half_open_max_requests": 1
+    },
+    "pool": {
+      "max_connections": 10,
+      "max_idle_time_seconds": 300.0,
+      "connection_timeout_seconds": 5.0,
+      "health_check_interval_seconds": 60.0
+    },
+    "default_headers": [
+      ["User-Agent", "Tonsurance/1.0"],
+      ["Accept", "application/json"]
+    ]
+  }
+}

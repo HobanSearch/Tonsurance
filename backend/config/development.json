@@ -1,0 +1,57 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Development environment configuration - Loose limits for testing",
+  "version": "1.0.0",
+  "environment": "development",
+
+  "timeouts": {
+    "ton_client_seconds": 60,
+    "http_default_seconds": 30.0,
+    "oracle_update_interval_seconds": 120.0,
+    "daemon_health_check_seconds": 60.0
+  },
+
+  "gas": {
+    "environment_multiplier": 1.0,
+    "deploy_buffer_percent": 0
+  },
+
+  "retry": {
+    "max_attempts": 5,
+    "backoff_max_seconds": 30.0
+  },
+
+  "pools": {
+    "database_pool_size": 5,
+    "worker_threads": 2,
+    "max_concurrent_requests": 50,
+    "rate_limit_per_minute": 1000
+  },
+
+  "thresholds": {
+    "circuit_breaker_failures": 10,
+    "oracle_staleness_critical_seconds": 600,
+    "min_reserve_balance_ton": 10,
+    "utilization_critical_percent": 95.0
+  },
+
+  "logging": {
+    "level": "DEBUG",
+    "verbose_queries": true,
+    "trace_http_requests": true
+  },
+
+  "features": {
+    "enable_hot_reload": true,
+    "enable_test_endpoints": true,
+    "skip_signature_verification": true,
+    "mock_external_apis": true
+  },
+
+  "notes": [
+    "Development environment prioritizes debugging over performance",
+    "Loose limits allow for extensive testing",
+    "Longer timeouts reduce flaky tests",
+    "Mock APIs can be enabled for offline development"
+  ]
+}

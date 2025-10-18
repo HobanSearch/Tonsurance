@@ -1,0 +1,101 @@
+{
+  "database": {
+    "host": "localhost",
+    "port": 5432,
+    "database": "tonsurance",
+    "user": "postgres",
+    "password": "postgres",
+    "pool_size": 10,
+    "connection_timeout_ms": 5000
+  },
+  "redis": {
+    "host": "localhost",
+    "port": 6379,
+    "db": 0,
+    "password": null,
+    "max_connections": 20
+  },
+  "ton": {
+    "network": "testnet",
+    "endpoint": "https://testnet.toncenter.com/api/v2/jsonRPC",
+    "api_key": "",
+    "timeout_ms": 10000
+  },
+  "api": {
+    "host": "0.0.0.0",
+    "port": 8080,
+    "cors_origins": [
+      "http://localhost:5173",
+      "http://localhost:3000",
+      "http://127.0.0.1:5173"
+    ],
+    "rate_limit": {
+      "enabled": true,
+      "max_requests_per_minute": 100
+    }
+  },
+  "websocket": {
+    "host": "0.0.0.0",
+    "port": 8081,
+    "ping_interval_seconds": 30,
+    "max_clients": 1000
+  },
+  "pricing_oracle": {
+    "enabled": true,
+    "update_interval_seconds": 60,
+    "contract_address": "",
+    "keeper_private_key": "",
+    "gas_limit": 500000
+  },
+  "external_apis": {
+    "chainlink": {
+      "enabled": true,
+      "endpoints": [
+        "https://eth-mainnet.g.alchemy.com/v2/demo"
+      ],
+      "timeout_ms": 5000
+    },
+    "coingecko": {
+      "enabled": true,
+      "api_key": "",
+      "base_url": "https://api.coingecko.com/api/v3",
+      "timeout_ms": 5000,
+      "rate_limit_per_minute": 50
+    },
+    "defillama": {
+      "enabled": true,
+      "base_url": "https://api.llama.fi",
+      "timeout_ms": 5000
+    },
+    "l2beat": {
+      "enabled": true,
+      "base_url": "https://l2beat.com/api",
+      "timeout_ms": 5000
+    }
+  },
+  "monitoring": {
+    "bridge_monitor": {
+      "enabled": true,
+      "update_interval_seconds": 60,
+      "alert_threshold_health_score": 0.7
+    },
+    "risk_monitor": {
+      "enabled": true,
+      "update_interval_seconds": 60,
+      "ltv_breach_threshold": 0.80,
+      "reserve_low_threshold": 0.15
+    }
+  },
+  "logging": {
+    "level": "info",
+    "format": "json",
+    "output": "stdout",
+    "file": null
+  },
+  "features": {
+    "hedged_insurance": false,
+    "multi_tranche_vault": true,
+    "policy_sharding": false,
+    "dynamic_pricing": true
+  }
+}

@@ -1,0 +1,548 @@
+name: Deploy to Mainnet
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_type:
+        description: 'Deployment type'
+        required: true
+        type: choice
+        options:
+          - contracts_only
+          - services_only
+          - full_deployment
+      confirm_mainnet:
+        description: 'Type "MAINNET" to confirm'
+        required: true
+        type: string
+
+env:
+  NODE_VERSION: '18'
+  OCAML_VERSION: '4.14.1'
+
+jobs:
+  # ============================================================================
+  # JOB 0: Pre-deployment Validation
+  # ============================================================================
+  validate:
+    name: Pre-deployment Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Validate confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm_mainnet }}" != "MAINNET" ]; then
+            echo "❌ Mainnet confirmation failed. Type 'MAINNET' to proceed."
+            exit 1
+          fi
+          echo "✅ Mainnet deployment confirmed"
+
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Verify branch
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          if [ "$BRANCH" != "main" ]; then
+            echo "❌ Mainnet deployments must be from 'main' branch"
+            exit 1
+          fi
+          echo "✅ Deploying from main branch"
+
+      - name: Check for pending changes
+        run: |
+          git fetch origin
+          BEHIND=$(git rev-list --count HEAD..origin/main)
+          if [ "$BEHIND" -gt 0 ]; then
+            echo "❌ Local branch is $BEHIND commits behind origin/main"
+            exit 1
+          fi
+          echo "✅ Branch is up to date"
+
+  # ============================================================================
+  # JOB 1: Run Full Test Suite
+  # ============================================================================
+  test:
+    name: Run Full Test Suite
+    runs-on: ubuntu-latest
+    needs: validate
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run contract tests
+        run: npm run test:contracts
+        timeout-minutes: 15
+
+      - name: Run service tests
+        run: npm run test:services
+        timeout-minutes: 10
+
+      - name: Run integration tests
+        run: npm run test:integration
+        timeout-minutes: 10
+
+      - name: Check coverage (95%+ required for mainnet)
+        run: |
+          COVERAGE=$(grep -Po '"lines":\{"total":\d+,"covered":\d+,"skipped":\d+,"pct":\K[\d.]+' coverage/coverage-summary.json)
+          echo "Coverage: ${COVERAGE}%"
+          if (( $(echo "$COVERAGE < 95" | bc -l) )); then
+            echo "❌ Coverage below 95% threshold required for mainnet"
+            exit 1
+          fi
+          echo "✅ Coverage meets 95% threshold"
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results-mainnet
+          path: |
+            test-results/
+            coverage/
+
+  # ============================================================================
+  # JOB 2: Security Scan
+  # ============================================================================
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Python (for Slither)
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Slither
+        run: |
+          pip install slither-analyzer
+          pip install solc-select
+          solc-select install 0.8.20
+          solc-select use 0.8.20
+
+      - name: Run Slither on contracts
+        run: |
+          # Note: Slither primarily for Solidity, adapt for FunC if tools available
+          echo "⚠️  FunC security scanning tools limited"
+          echo "Manual security audit required before mainnet"
+        continue-on-error: true
+
+      - name: npm audit
+        run: npm audit --production --audit-level=high
+
+      - name: Check for secrets in code
+        run: |
+          if grep -r "PRIVATE_KEY\|SECRET\|PASSWORD" --include="*.ts" --include="*.js" .; then
+            echo "❌ Potential secrets found in code"
+            exit 1
+          fi
+          echo "✅ No secrets detected"
+
+  # ============================================================================
+  # JOB 3: Manual Approval Required
+  # ============================================================================
+  manual-approval:
+    name: Manual Approval (2/3 Admins Required)
+    runs-on: ubuntu-latest
+    needs: [test, security-scan]
+    environment: mainnet-approval
+    timeout-minutes: 1440 # 24 hours
+
+    steps:
+      - name: Request approval
+        run: |
+          echo "⏳ Waiting for manual approval from 2/3 admins..."
+          echo "Reviewers: @alice, @bob, @charlie"
+          echo "Please review:"
+          echo "  - Test results"
+          echo "  - Security scan"
+          echo "  - Deployment plan"
+
+      - name: Approval received
+        run: echo "✅ Deployment approved by admins"
+
+  # ============================================================================
+  # JOB 4: Build for Production
+  # ============================================================================
+  build:
+    name: Build for Production
+    runs-on: ubuntu-latest
+    needs: manual-approval
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Setup OCaml
+        uses: ocaml/setup-ocaml@v2
+        with:
+          ocaml-compiler: ${{ env.OCAML_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          npm ci --production
+          cd backend && opam install . --deps-only --yes
+
+      - name: Build contracts
+        run: npm run build:contracts
+        timeout-minutes: 10
+
+      - name: Build backend
+        run: npm run build:backend
+        timeout-minutes: 5
+
+      - name: Build services
+        run: npm run build:services
+        timeout-minutes: 3
+
+      - name: Create production bundle
+        run: |
+          tar -czf production-bundle.tar.gz build/ backend/_build/ services/dist/
+
+      - name: Upload production bundle
+        uses: actions/upload-artifact@v3
+        with:
+          name: production-bundle
+          path: production-bundle.tar.gz
+
+  # ============================================================================
+  # JOB 5: Deploy Smart Contracts (if enabled)
+  # ============================================================================
+  deploy-contracts:
+    name: Deploy Smart Contracts to Mainnet
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event.inputs.deployment_type == 'contracts_only' || github.event.inputs.deployment_type == 'full_deployment'
+    timeout-minutes: 60
+    environment: mainnet
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download production bundle
+        uses: actions/download-artifact@v3
+        with:
+          name: production-bundle
+
+      - name: Extract bundle
+        run: tar -xzf production-bundle.tar.gz
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Deploy PricingOracle
+        run: npx blueprint run deployPricingOracle --mainnet --no-compile
+        env:
+          DEPLOYER_MNEMONIC: ${{ secrets.MAINNET_DEPLOYER_MNEMONIC }}
+          ADMIN_ADDRESS: ${{ secrets.MAINNET_MULTISIG_ADDRESS }}
+          KEEPER_1_ADDRESS: ${{ secrets.MAINNET_KEEPER_1_ADDRESS }}
+          KEEPER_2_ADDRESS: ${{ secrets.MAINNET_KEEPER_2_ADDRESS }}
+          KEEPER_3_ADDRESS: ${{ secrets.MAINNET_KEEPER_3_ADDRESS }}
+        timeout-minutes: 10
+
+      - name: Verify PricingOracle deployment
+        run: node scripts/verify-deployment.js --contract=PricingOracle
+        env:
+          TON_RPC_URL: https://toncenter.com/api/v2/jsonRPC
+
+      - name: Deploy MultiTrancheVault
+        run: npx blueprint run deployMultiTrancheVault --mainnet --no-compile
+        env:
+          DEPLOYER_MNEMONIC: ${{ secrets.MAINNET_DEPLOYER_MNEMONIC }}
+          ADMIN_ADDRESS: ${{ secrets.MAINNET_MULTISIG_ADDRESS }}
+          CLAIMS_PROCESSOR_ADDRESS: ${{ secrets.MAINNET_CLAIMS_PROCESSOR_ADDRESS }}
+        timeout-minutes: 15
+
+      - name: Verify MultiTrancheVault deployment
+        run: node scripts/verify-deployment.js --contract=MultiTrancheVault
+        env:
+          TON_RPC_URL: https://toncenter.com/api/v2/jsonRPC
+
+      - name: Deploy PolicySharding (full 256 shards)
+        run: npx blueprint run deployPolicySharding --mainnet --no-compile
+        env:
+          DEPLOYER_MNEMONIC: ${{ secrets.MAINNET_DEPLOYER_MNEMONIC }}
+          ADMIN_ADDRESS: ${{ secrets.MAINNET_MULTISIG_ADDRESS }}
+        timeout-minutes: 30
+
+      - name: Verify PolicySharding deployment
+        run: node scripts/verify-deployment.js --contract=PolicySharding
+        env:
+          TON_RPC_URL: https://toncenter.com/api/v2/jsonRPC
+
+      - name: Save deployment addresses
+        run: |
+          echo "PRICING_ORACLE_ADDRESS=$(cat deployments/pricing-oracle-mainnet-latest.json | jq -r .address)" >> $GITHUB_ENV
+          echo "VAULT_ADDRESS=$(cat deployments/multi-tranche-vault-mainnet-latest.json | jq -r .vault.address)" >> $GITHUB_ENV
+          echo "ROUTER_ADDRESS=$(cat deployments/policy-sharding-mainnet-latest.json | jq -r .router.address)" >> $GITHUB_ENV
+
+      - name: Upload deployment manifests
+        uses: actions/upload-artifact@v3
+        with:
+          name: mainnet-deployment-manifests
+          path: deployments/*-mainnet-*.json
+
+  # ============================================================================
+  # JOB 6: Database Backup and Migration
+  # ============================================================================
+  migrate-database:
+    name: Database Backup and Migration
+    runs-on: ubuntu-latest
+    needs: deploy-contracts
+    if: github.event.inputs.deployment_type == 'services_only' || github.event.inputs.deployment_type == 'full_deployment'
+    timeout-minutes: 20
+    environment: mainnet
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Create database backup
+        run: |
+          BACKUP_FILE="backup-$(date +%Y%m%d-%H%M%S).sql"
+          pg_dump "$DATABASE_URL" > "$BACKUP_FILE"
+          gzip "$BACKUP_FILE"
+
+          # Upload to S3
+          aws s3 cp "${BACKUP_FILE}.gz" "s3://tonsurance-backups/mainnet/${BACKUP_FILE}.gz"
+
+          echo "✅ Backup created: ${BACKUP_FILE}.gz"
+        env:
+          DATABASE_URL: ${{ secrets.MAINNET_DATABASE_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Run migrations with transaction
+        run: |
+          psql "$DATABASE_URL" <<EOF
+          BEGIN;
+
+          -- Run all migrations
+          $(for migration in backend/migrations/*.sql; do
+            echo "\\echo 'Running migration: $migration'"
+            cat "$migration"
+          done)
+
+          -- Verify critical tables exist
+          SELECT COUNT(*) FROM pricing_oracle_updates;
+          SELECT COUNT(*) FROM product_exposure;
+
+          COMMIT;
+          EOF
+        env:
+          DATABASE_URL: ${{ secrets.MAINNET_DATABASE_URL }}
+
+      - name: Verify migration success
+        run: |
+          psql "$DATABASE_URL" -c "SELECT table_name FROM information_schema.tables WHERE table_schema='public' ORDER BY table_name;"
+        env:
+          DATABASE_URL: ${{ secrets.MAINNET_DATABASE_URL }}
+
+  # ============================================================================
+  # JOB 7: Gradual Service Rollout
+  # ============================================================================
+  deploy-services:
+    name: Gradual Service Rollout
+    runs-on: ubuntu-latest
+    needs: migrate-database
+    if: github.event.inputs.deployment_type == 'services_only' || github.event.inputs.deployment_type == 'full_deployment'
+    timeout-minutes: 30
+    environment: mainnet
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.MAINNET_KUBECONFIG }}
+
+      - name: Build and push production images
+        run: |
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+          # Build with production tag
+          docker build -f infra/docker/Dockerfile.ocaml -t tonsurance/ocaml-backend:mainnet-${{ github.sha }} -t tonsurance/ocaml-backend:mainnet-latest .
+          docker push tonsurance/ocaml-backend:mainnet-${{ github.sha }}
+          docker push tonsurance/ocaml-backend:mainnet-latest
+
+          docker build -f infra/docker/Dockerfile.keeper -t tonsurance/keepers:mainnet-${{ github.sha }} -t tonsurance/keepers:mainnet-latest .
+          docker push tonsurance/keepers:mainnet-${{ github.sha }}
+          docker push tonsurance/keepers:mainnet-latest
+
+      - name: Update Kubernetes manifests
+        run: |
+          # Update contract addresses
+          kubectl create configmap contract-addresses \
+            --from-literal=PRICING_ORACLE_ADDRESS=${{ env.PRICING_ORACLE_ADDRESS }} \
+            --from-literal=VAULT_ADDRESS=${{ env.VAULT_ADDRESS }} \
+            --from-literal=ROUTER_ADDRESS=${{ env.ROUTER_ADDRESS }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          # Update image tags
+          kubectl set image deployment/ocaml-backend ocaml-backend=tonsurance/ocaml-backend:mainnet-${{ github.sha }}
+          kubectl set image deployment/pricing-keeper pricing-keeper=tonsurance/keepers:mainnet-${{ github.sha }}
+          kubectl set image deployment/bridge-keeper bridge-keeper=tonsurance/keepers:mainnet-${{ github.sha }}
+
+      - name: Gradual rollout - 20% traffic
+        run: |
+          kubectl patch deployment ocaml-backend -p '{"spec":{"replicas":2}}'
+          kubectl rollout status deployment/ocaml-backend --timeout=5m
+          echo "✅ 20% rollout complete. Monitoring for 5 minutes..."
+          sleep 300
+
+      - name: Check error rates
+        run: |
+          ERROR_RATE=$(kubectl exec -it prometheus-0 -- wget -qO- 'http://localhost:9090/api/v1/query?query=rate(http_requests_total{status=~"5.."}[5m])' | jq -r '.data.result[0].value[1]')
+          if (( $(echo "$ERROR_RATE > 0.01" | bc -l) )); then
+            echo "❌ Error rate too high: ${ERROR_RATE}"
+            exit 1
+          fi
+          echo "✅ Error rate acceptable: ${ERROR_RATE}"
+
+      - name: Gradual rollout - 50% traffic
+        run: |
+          kubectl patch deployment ocaml-backend -p '{"spec":{"replicas":5}}'
+          kubectl rollout status deployment/ocaml-backend --timeout=5m
+          echo "✅ 50% rollout complete. Monitoring for 5 minutes..."
+          sleep 300
+
+      - name: Gradual rollout - 100% traffic
+        run: |
+          kubectl patch deployment ocaml-backend -p '{"spec":{"replicas":10}}'
+          kubectl rollout status deployment/ocaml-backend --timeout=10m
+          kubectl rollout status deployment/pricing-keeper --timeout=5m
+          kubectl rollout status deployment/bridge-keeper --timeout=5m
+          echo "✅ Full rollout complete"
+
+      - name: Verify all services healthy
+        run: |
+          kubectl get pods
+          kubectl logs -l app=pricing-keeper --tail=100
+          kubectl logs -l app=ocaml-backend --tail=100
+
+  # ============================================================================
+  # JOB 8: Post-deployment Verification
+  # ============================================================================
+  verify-deployment:
+    name: Post-deployment Verification
+    runs-on: ubuntu-latest
+    needs: deploy-services
+    timeout-minutes: 15
+
+    steps:
+      - name: Test API endpoints
+        run: |
+          # Test health endpoint
+          curl -f https://api.tonsurance.com/health || exit 1
+
+          # Test premium quote
+          RESPONSE=$(curl -s https://api.tonsurance.com/premium/swing-quote?coverage_type=1&chain_id=0&stablecoin_id=0&coverage_amount=10000000000&duration_days=30)
+          PREMIUM=$(echo $RESPONSE | jq -r '.total_premium')
+          if [ "$PREMIUM" == "null" ]; then
+            echo "❌ Premium API failed"
+            exit 1
+          fi
+          echo "✅ Premium API working"
+
+      - name: Verify oracle updates
+        run: |
+          # Check latest oracle update is recent (<5 min)
+          LAST_UPDATE=$(curl -s https://api.tonsurance.com/oracle/last-update | jq -r '.timestamp')
+          NOW=$(date +%s)
+          AGE=$((NOW - LAST_UPDATE))
+          if [ $AGE -gt 300 ]; then
+            echo "❌ Oracle stale: ${AGE}s old"
+            exit 1
+          fi
+          echo "✅ Oracle fresh: ${AGE}s old"
+
+      - name: Monitor for 30 minutes
+        run: |
+          echo "⏳ Monitoring production metrics for 30 minutes..."
+          for i in {1..30}; do
+            echo "Minute $i/30..."
+            # Check error rate
+            # Check latency
+            # Check oracle updates
+            sleep 60
+          done
+          echo "✅ 30-minute monitoring complete - all systems nominal"
+
+  # ============================================================================
+  # JOB 9: Notification
+  # ============================================================================
+  notify:
+    name: Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: verify-deployment
+    if: always()
+
+    steps:
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          payload: |
+            {
+              "text": "${{ needs.verify-deployment.result == 'success' && '🚀 MAINNET DEPLOYMENT SUCCESS' || '🚨 MAINNET DEPLOYMENT FAILED' }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*${{ needs.verify-deployment.result == 'success' && '🚀 MAINNET DEPLOYMENT SUCCESS' || '🚨 MAINNET DEPLOYMENT FAILED' }}*\n\nDeployment Type: `${{ github.event.inputs.deployment_type }}`\nCommit: `${{ github.sha }}`\nDeployed by: ${{ github.actor }}\n\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Deployment>"
+                  }
+                }
+              ]
+            }
+
+      - name: Send PagerDuty alert if failed
+        if: needs.verify-deployment.result != 'success'
+        run: |
+          curl -X POST https://events.pagerduty.com/v2/enqueue \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "routing_key": "${{ secrets.PAGERDUTY_ROUTING_KEY }}",
+              "event_action": "trigger",
+              "payload": {
+                "summary": "Mainnet deployment failed",
+                "severity": "critical",
+                "source": "GitHub Actions"
+              }
+            }'

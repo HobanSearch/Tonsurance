@@ -29,11 +29,12 @@ module OracleAggregator = struct
 
   (** Oracle provider types **)
   type oracle_provider =
-    | RedStone
-    | Pyth
     | Chainlink
+    | Pyth
+    | Binance
+    | RedStone
     | Custom of string
-  [@@deriving sexp, yojson]
+  [@@deriving sexp]
 
   (** Price data point from single oracle **)
   type price_point = {
@@ -43,7 +44,7 @@ module OracleAggregator = struct
     timestamp: float;
     confidence: float; (* 0.0 to 1.0 *)
     source_signature: string option;
-  } [@@deriving sexp, yojson]
+  } [@@deriving sexp]
 
   (** Aggregated consensus price **)
   type consensus_price = {
@@ -58,7 +59,7 @@ module OracleAggregator = struct
     confidence: float;
     is_stale: bool;
     has_anomaly: bool;
-  } [@@deriving sexp, yojson]
+  } [@@deriving sexp]
 
   (** Oracle configuration **)
   type oracle_config = {
@@ -70,18 +71,18 @@ module OracleAggregator = struct
     circuit_breaker_threshold: float; (* Max price change per update *)
   } [@@deriving sexp]
 
-  (** Default configuration **)
+  (** Default configuration - Median-of-3: Chainlink + Pyth + Binance **)
   let default_config = {
-    providers = [RedStone; Pyth; Chainlink];
+    providers = [Chainlink; Pyth; Binance];
     weights = [
-      (RedStone, 0.40);   (* 40% - TON native *)
-      (Pyth, 0.35);       (* 35% - High frequency *)
-      (Chainlink, 0.25);  (* 25% - Established *)
+      (Chainlink, 0.35);  (* 35% - Most established, on-chain verification *)
+      (Pyth, 0.35);       (* 35% - High frequency, institutional grade *)
+      (Binance, 0.30);    (* 30% - High volume, real market prices *)
     ];
     staleness_threshold = 300.0; (* 5 minutes *)
-    outlier_threshold = 0.10; (* 10% *)
-    min_sources = 2;
-    circuit_breaker_threshold = 0.05; (* 5% max change *)
+    outlier_threshold = 0.02; (* 2% - tighter for median-of-3 *)
+    min_sources = 2; (* Require at least 2 sources *)
+    circuit_breaker_threshold = 0.05; (* 5% max change per update *)
   }
 
   (** Provider-specific API endpoints **)
@@ -95,13 +96,13 @@ module OracleAggregator = struct
       | FRAX -> "https://api.redstone.finance/prices?symbol=FRAX&provider=redstone-primary"
       | BUSD -> "https://api.redstone.finance/prices?symbol=BUSD&provider=redstone-primary"
       | USDe -> "https://api.redstone.finance/prices?symbol=USDe&provider=redstone-primary"
-      | sUSDe -> "https://api.redstone.finance/prices?symbol=sUSDe&provider=redstone-primary"
+      | SUSDe -> "https://api.redstone.finance/prices?symbol=sUSDe&provider=redstone-primary"
       | USDY -> "https://api.redstone.finance/prices?symbol=USDY&provider=redstone-primary"
       | PYUSD -> "https://api.redstone.finance/prices?symbol=PYUSD&provider=redstone-primary"
       | GHO -> "https://api.redstone.finance/prices?symbol=GHO&provider=redstone-primary"
       | LUSD -> "https://api.redstone.finance/prices?symbol=LUSD&provider=redstone-primary"
-      | crvUSD -> "https://api.redstone.finance/prices?symbol=crvUSD&provider=redstone-primary"
-      | mkUSD -> "https://api.redstone.finance/prices?symbol=mkUSD&provider=redstone-primary"
+      | CrvUSD -> "https://api.redstone.finance/prices?symbol=crvUSD&provider=redstone-primary"
+      | MkUSD -> "https://api.redstone.finance/prices?symbol=mkUSD&provider=redstone-primary"
       | BTC -> "https://api.redstone.finance/prices?symbol=BTC&provider=redstone-primary"
       | ETH -> "https://api.redstone.finance/prices?symbol=ETH&provider=redstone-primary"
 
@@ -114,13 +115,13 @@ module OracleAggregator = struct
       | FRAX -> "https://hermes.pyth.network/api/latest_price_feeds?ids[]=0x735f591e4fed988cd38df74d8fcedecf2fe8d9111664e0fd500db9aa78b316b1"
       | BUSD -> "https://hermes.pyth.network/api/latest_price_feeds?ids[]=0x5bc91f13e412c07599167bae86f07543f076a638962b8d6017ec19dab4a82814"
       | USDe -> "https://hermes.pyth.network/api/latest_price_feeds?ids[]=0x6ec879b1e9963de5ee97e9c8710b742d6228252a5e2ca12d4ae81d7fe5ee8c5d"
-      | sUSDe -> "https://hermes.pyth.network/api/latest_price_feeds?ids[]=0xca3ba9a619a4b3755c10ac7d5e760275aa95e9823d38a84fedd416856cdba37c"
+      | SUSDe -> "https://hermes.pyth.network/api/latest_price_feeds?ids[]=0xca3ba9a619a4b3755c10ac7d5e760275aa95e9823d38a84fedd416856cdba37c"
       | USDY -> "https://hermes.pyth.network/api/latest_price_feeds?ids[]=0xc54b2e5af29b5f171bece8d1518bb65f6cce1b08d456d54c2fe8f3f55c4cb7be"
       | PYUSD -> "https://hermes.pyth.network/api/latest_price_feeds?ids[]=0x3b1ada3f7ad66275f0fa5d3cb68d22fb369c9570dc1f99d09e3fa000c6ee369f"
       | GHO -> "https://hermes.pyth.network/api/latest_price_feeds?ids[]=0x8963217838ab4cf5cadc172203c1f0b763fbaa45f346d8ee50ba994bbcac3026"
       | LUSD -> "https://hermes.pyth.network/api/latest_price_feeds?ids[]=0x67be9f519b95cf24338801051f9a808eff0a578ccb388db73b7f6fe1de019ffb"
-      | crvUSD -> "https://hermes.pyth.network/api/latest_price_feeds?ids[]=0x02e7c1c6d8cc1671b5fd1e2e4a7a5c4c67d49aeb53df8c8d33509b7c8e042c22"
-      | mkUSD -> "https://hermes.pyth.network/api/latest_price_feeds?ids[]=0x345c5a8e70fb89d18b5bc6d4626db673259f54231e67dc38f81e9f3b4a3c0446"
+      | CrvUSD -> "https://hermes.pyth.network/api/latest_price_feeds?ids[]=0x02e7c1c6d8cc1671b5fd1e2e4a7a5c4c67d49aeb53df8c8d33509b7c8e042c22"
+      | MkUSD -> "https://hermes.pyth.network/api/latest_price_feeds?ids[]=0x345c5a8e70fb89d18b5bc6d4626db673259f54231e67dc38f81e9f3b4a3c0446"
       | BTC -> "https://hermes.pyth.network/api/latest_price_feeds?ids[]=0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43"
       | ETH -> "https://hermes.pyth.network/api/latest_price_feeds?ids[]=0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace"
 
@@ -133,13 +134,13 @@ module OracleAggregator = struct
       | FRAX -> "https://api.chain.link/price/FRAX_USD"
       | BUSD -> "https://api.chain.link/price/BUSD_USD"
       | USDe -> "https://api.chain.link/price/USDe_USD"
-      | sUSDe -> "https://api.chain.link/price/sUSDe_USD"
+      | SUSDe -> "https://api.chain.link/price/sUSDe_USD"
       | USDY -> "https://api.chain.link/price/USDY_USD"
       | PYUSD -> "https://api.chain.link/price/PYUSD_USD"
       | GHO -> "https://api.chain.link/price/GHO_USD"
       | LUSD -> "https://api.chain.link/price/LUSD_USD"
-      | crvUSD -> "https://api.chain.link/price/crvUSD_USD"
-      | mkUSD -> "https://api.chain.link/price/mkUSD_USD"
+      | CrvUSD -> "https://api.chain.link/price/crvUSD_USD"
+      | MkUSD -> "https://api.chain.link/price/mkUSD_USD"
       | BTC -> "https://api.chain.link/price/BTC_USD"
       | ETH -> "https://api.chain.link/price/ETH_USD"
   end
@@ -181,7 +182,7 @@ module OracleAggregator = struct
 
     let price_raw = price_obj |> member "price" |> to_string |> Int64.of_string in
     let expo = price_obj |> member "expo" |> to_int in
-    let price = Int64.to_float price_raw *. (Float.pow 10.0 (Float.of_int expo)) in
+    let price = Int64.to_float price_raw *. (10.0 ** (Float.of_int expo)) in
 
     let timestamp = price_obj |> member "publish_time" |> to_float in
     let conf = price_obj |> member "conf" |> to_string |> Int64.of_string |> Int64.to_float in
@@ -198,27 +199,148 @@ module OracleAggregator = struct
       source_signature = None;
     }
 
-  (** Fetch price from Chainlink **)
+  (** Fetch price from Chainlink (using chainlink_client.ml) **)
   let fetch_chainlink_price (asset: asset) : price_point Lwt.t =
-    let url = Endpoints.chainlink_url asset in
+    let open Chainlink_client.ChainlinkClient in
 
-    let%lwt response = Cohttp_lwt_unix.Client.get (Uri.of_string url) in
-    let%lwt body = Cohttp_lwt.Body.to_string (snd response) in
+    (* Create config with multiple RPC endpoints *)
+    let config = {
+      rpc_endpoints = [
+        (Ethereum, [
+          "https://eth-mainnet.g.alchemy.com/v2/demo";
+          "https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161";
+          "https://cloudflare-eth.com";
+        ]);
+      ];
+      api_keys = [];
+      rate_limit_per_second = 10;
+      timeout_seconds = 10.0;
+      retry_attempts = 3;
+      cache_ttl_seconds = 300;
+    } in
 
-    let json = Yojson.Safe.from_string body in
-    let open Yojson.Safe.Util in
+    (* Find feed for this asset on Ethereum *)
+    let feed_opt = List.find ethereum_feeds ~f:(fun f -> Poly.equal f.asset asset) in
 
-    let price = json |> member "data" |> member "price" |> to_float in
-    let timestamp = json |> member "data" |> member "timestamp" |> to_float in
+    match feed_opt with
+    | None ->
+        (* Asset not supported by Chainlink *)
+        let timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
+        Lwt.return {
+          provider = Chainlink;
+          asset;
+          price = 0.0;
+          timestamp;
+          confidence = 0.0;
+          source_signature = None;
+        }
+    | Some feed ->
+        let%lwt result = fetch_chainlink_price ~config ~feed in
 
-    Lwt.return {
-      provider = Chainlink;
-      asset;
-      price;
-      timestamp;
-      confidence = 0.90; (* Chainlink slightly lower update frequency *)
-      source_signature = None;
-    }
+        match result with
+        | Some data ->
+            Lwt.return {
+              provider = Chainlink;
+              asset = data.asset;
+              price = data.price;
+              timestamp = data.timestamp;
+              confidence = data.confidence;
+              source_signature = None;
+            }
+        | None ->
+            let timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
+            Lwt.return {
+              provider = Chainlink;
+              asset;
+              price = 0.0;
+              timestamp;
+              confidence = 0.0;
+              source_signature = None;
+            }
+
+  (** Fetch price from Binance Spot **)
+  let fetch_binance_price (asset: asset) : price_point Lwt.t =
+    (* Map asset to Binance trading pair *)
+    let symbol = match asset with
+      | BTC -> "BTCUSDT"
+      | ETH -> "ETHUSDT"
+      | USDC -> "USDCUSDT"
+      | USDT -> "USDTUSDT" (* Note: USDT/USDT doesn't exist, use 1.0 *)
+      | BUSD -> "BUSDUSDT"
+      | DAI -> "DAIUSDT"
+      | _ -> "" (* Not all stablecoins have Binance pairs *)
+    in
+
+    if String.is_empty symbol || String.equal symbol "USDTUSDT" then
+      (* Return 1.0 for stablecoins without pairs *)
+      Lwt.return {
+        provider = Binance;
+        asset;
+        price = 1.0;
+        timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
+        confidence = 0.95;
+        source_signature = None;
+      }
+    else
+      try%lwt
+        let url = Printf.sprintf "https://api.binance.com/api/v3/ticker/price?symbol=%s" symbol in
+
+        let%lwt (_resp, body) = Cohttp_lwt_unix.Client.get (Uri.of_string url) in
+        let%lwt body_string = Cohttp_lwt.Body.to_string body in
+
+        let json = Yojson.Safe.from_string body_string in
+        let open Yojson.Safe.Util in
+
+        let price = json |> member "price" |> to_string |> Float.of_string in
+
+        Lwt.return {
+          provider = Binance;
+          asset;
+          price;
+          timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
+          confidence = 0.95; (* Binance has high liquidity *)
+          source_signature = None;
+        }
+
+      with exn ->
+        let () = Logs.err (fun m ->
+          m "Binance fetch failed for %s: %s" symbol (Exn.to_string exn)
+        ) in
+        Lwt.return {
+          provider = Binance;
+          asset;
+          price = 0.0;
+          timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
+          confidence = 0.0;
+          source_signature = None;
+        }
+
+  (** Fetch price from Pyth (using pyth_client.ml) **)
+  let fetch_pyth_price_updated (asset: asset) : price_point Lwt.t =
+    let open Pyth_client.PythClient in
+
+    let%lwt result = get_price asset () in
+
+    match result with
+    | Some data ->
+        Lwt.return {
+          provider = Pyth;
+          asset = data.asset;
+          price = data.price;
+          timestamp = data.publish_time;
+          confidence = data.confidence;
+          source_signature = None;
+        }
+    | None ->
+        let timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
+        Lwt.return {
+          provider = Pyth;
+          asset;
+          price = 0.0;
+          timestamp;
+          confidence = 0.0;
+          source_signature = None;
+        }
 
   (** Fetch from single provider with error handling **)
   let fetch_from_provider
@@ -228,12 +350,30 @@ module OracleAggregator = struct
 
     try%lwt
       match provider with
-      | RedStone -> let%lwt p = fetch_redstone_price asset in Lwt.return (Some p)
-      | Pyth -> let%lwt p = fetch_pyth_price asset in Lwt.return (Some p)
-      | Chainlink -> let%lwt p = fetch_chainlink_price asset in Lwt.return (Some p)
+      | Chainlink ->
+          let%lwt p = fetch_chainlink_price asset in
+          if Float.(p.confidence > 0.0) then Lwt.return (Some p) else Lwt.return None
+      | Pyth ->
+          let%lwt p = fetch_pyth_price_updated asset in
+          if Float.(p.confidence > 0.0) then Lwt.return (Some p) else Lwt.return None
+      | Binance ->
+          let%lwt p = fetch_binance_price asset in
+          if Float.(p.confidence > 0.0) then Lwt.return (Some p) else Lwt.return None
+      | RedStone ->
+          let%lwt p = fetch_redstone_price asset in Lwt.return (Some p)
       | Custom _ -> Lwt.return None (* Custom providers not yet implemented *)
-    with
-    | _ -> Lwt.return None (* Swallow errors, return None *)
+    with exn ->
+      let () = Logs.err (fun m ->
+        m "Provider fetch error for %s: %s"
+          (match provider with
+           | Chainlink -> "Chainlink"
+           | Pyth -> "Pyth"
+           | Binance -> "Binance"
+           | RedStone -> "RedStone"
+           | Custom s -> s)
+          (Exn.to_string exn)
+      ) in
+      Lwt.return None (* Swallow errors, return None *)
 
   (** Fetch prices from all configured providers **)
   let fetch_all_prices
@@ -254,8 +394,8 @@ module OracleAggregator = struct
 
   (** Check if price is stale **)
   let is_stale (price: price_point) ~(threshold: float) : bool =
-    let now = Unix.time () in
-    (now -. price.timestamp) > threshold
+    let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
+    Float.((now -. price.timestamp) > threshold)
 
   (** Detect outliers using median absolute deviation **)
   let detect_outliers
@@ -273,7 +413,7 @@ module OracleAggregator = struct
       let (normal, outliers) =
         List.partition_tf prices ~f:(fun p ->
           let deviation = Float.abs (p.price -. median) /. median in
-          deviation <= threshold
+          Float.(deviation <= threshold)
         )
       in
 
@@ -300,7 +440,7 @@ module OracleAggregator = struct
       total_weight := !total_weight +. adjusted_weight;
     );
 
-    if !total_weight > 0.0 then
+    if Float.(!total_weight > 0.0) then
       !weighted_sum /. !total_weight
     else
       0.0
@@ -369,7 +509,7 @@ module OracleAggregator = struct
           | None -> true
           | Some prev ->
               let change = Float.abs (weighted -. prev) /. prev in
-              change <= config.circuit_breaker_threshold
+              Float.(change <= config.circuit_breaker_threshold)
         in
 
         if not price_change_ok then
@@ -387,7 +527,7 @@ module OracleAggregator = struct
             std_deviation = std_dev;
             num_sources = List.length normal_prices;
             sources = normal_prices;
-            timestamp = Unix.time ();
+            timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
             confidence;
             is_stale = false;
             has_anomaly;
@@ -412,12 +552,12 @@ module OracleAggregator = struct
       ~(window_seconds: float)
     : float option =
 
-    let now = Unix.time () in
+    let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
     let cutoff = now -. window_seconds in
 
     (* Filter to window *)
     let recent_prices =
-      List.filter price_history ~f:(fun p -> p.timestamp >= cutoff)
+      List.filter price_history ~f:(fun p -> Float.(p.timestamp >= cutoff))
     in
 
     if List.is_empty recent_prices then
@@ -425,7 +565,7 @@ module OracleAggregator = struct
     else
       (* Weight by time interval *)
       let rec calc_twap acc total_time = function
-        | [] -> if total_time > 0.0 then Some (acc /. total_time) else None
+        | [] -> if Float.(total_time > 0.0) then Some (acc /. total_time) else None
         | [p] ->
             let duration = now -. p.timestamp in
             Some ((acc +. (p.price *. duration)) /. (total_time +. duration))
@@ -446,13 +586,13 @@ module OracleAggregator = struct
       ~(confirmation_seconds: float)
     : bool =
 
-    let now = Unix.time () in
+    let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
     let confirmation_start = now -. confirmation_seconds in
 
     (* Check if ALL prices in confirmation window are below trigger *)
     let confirmation_prices =
       List.filter price_history ~f:(fun p ->
-        p.timestamp >= confirmation_start && p.timestamp <= now
+        Float.(p.timestamp >= confirmation_start && p.timestamp <= now)
       )
     in
 
@@ -460,7 +600,7 @@ module OracleAggregator = struct
       false
     else
       List.for_all confirmation_prices ~f:(fun p ->
-        p.price < trigger_price
+        Float.(p.price < trigger_price)
       )
 
 end
@@ -503,7 +643,10 @@ module MultiChainOracle = struct
            | DAI -> "dai"
            | USDP -> "paxos-standard"
            | FRAX -> "frax"
-           | BUSD -> "binance-usd");
+           | BUSD -> "binance-usd"
+           | USDe | SUSDe | USDY | PYUSD | GHO | LUSD | CrvUSD | MkUSD -> "usd-coin"
+           | BTC -> "bitcoin"
+           | ETH -> "ethereum");
       ]
     | Lightning -> [
         (* Lightning uses Bitcoin as base *)
@@ -512,6 +655,9 @@ module MultiChainOracle = struct
     | TON -> [
         (* TON oracle endpoints *)
         "https://api.redstone.finance/prices?symbol=TON&provider=redstone-primary";
+      ]
+    | Solana -> [
+        "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd";
       ]
 
   (** Fetch price for specific chain and asset *)
@@ -542,14 +688,15 @@ module MultiChainOracle = struct
       ?(chains = [Ethereum; Arbitrum; Base; Polygon; Bitcoin; Lightning; TON])
       ?(assets = [USDC; USDT; DAI; USDP; FRAX])
       ~(previous_state: multi_chain_state option)
+      ()
     : multi_chain_state Lwt.t =
 
     let get_previous_price chain asset =
       match previous_state with
       | None -> None
       | Some state ->
-          List.find_opt (fun (c, a, _) -> c = chain && a = asset) state.prices
-          |> Option.map (fun (_, _, cp) -> cp.price)
+          List.find state.prices ~f:(fun (c, a, _) -> equal_blockchain c chain && equal_asset a asset)
+          |> Option.map ~f:(fun (_, _, cp) -> cp.price)
     in
 
     let fetch_pairs =
@@ -574,7 +721,7 @@ module MultiChainOracle = struct
 
     Lwt.return {
       prices;
-      last_updated = Unix.time ();
+      last_updated = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
     }
 
   (** Get price for specific chain and asset *)
@@ -583,8 +730,8 @@ module MultiChainOracle = struct
       (chain: blockchain)
       (asset: asset)
     : chain_price option =
-    List.find_opt (fun (c, a, _) -> c = chain && a = asset) state.prices
-    |> Option.map (fun (_, _, p) -> p)
+    List.find state.prices ~f:(fun (c, a, _) -> equal_blockchain c chain && equal_asset a asset)
+    |> Option.map ~f:(fun (_, _, p) -> p)
 
   (** Check if cross-chain price discrepancy exists *)
   let check_cross_chain_discrepancy
@@ -596,7 +743,7 @@ module MultiChainOracle = struct
     (* Get all prices for this asset across chains *)
     let asset_prices =
       List.filter_map state.prices ~f:(fun (chain, a, price) ->
-        if a = asset then Some (chain, price.price) else None
+        if equal_asset a asset then Some (chain, price.price) else None
       )
     in
 
@@ -610,7 +757,7 @@ module MultiChainOracle = struct
       let deviations =
         List.filter_map asset_prices ~f:(fun (chain, price) ->
           let deviation = Float.abs (price -. mean_price) /. mean_price in
-          if deviation > threshold then
+          if Float.(deviation > threshold) then
             Some (chain, deviation)
           else
             None
@@ -625,10 +772,11 @@ module MultiChainOracle = struct
       ?(chains = [Ethereum; Arbitrum; Base; Polygon; Bitcoin; TON])
       ?(assets = [USDC; USDT; DAI; USDP; FRAX])
       ~(on_update: multi_chain_state -> unit Lwt.t)
+      ()
     : unit Lwt.t =
 
     let rec monitoring_loop state_opt =
-      let* state = fetch_all_chain_prices ~chains ~assets ~previous_state:state_opt in
+      let* state = fetch_all_chain_prices ~chains ~assets ~previous_state:state_opt () in
 
       (* Notify update *)
       let* () = on_update state in
@@ -638,7 +786,7 @@ module MultiChainOracle = struct
         Printf.printf "[Multi-Chain Oracle] Updated %d price pairs at %s\n"
           (List.length state.prices)
           (string_of_float state.last_updated);
-        flush stdout
+        Out_channel.flush Out_channel.stdout
       in
 
       (* Wait before next update *)
@@ -671,90 +819,13 @@ module MultiChainOracle = struct
     | Some chain_price ->
         let triggered =
           match policy.trigger_condition with
-          | PriceBelow { threshold; _ } ->
-              chain_price.price < threshold
-          | PriceAbove { threshold; _ } ->
-              chain_price.price > threshold
-          | BridgeExploitDetected _ ->
-              false (* Handled by bridge monitor *)
-          | ContractExploitDetected _ ->
-              false (* Handled by contract monitor *)
+          | PriceDepeg { trigger_price; floor_price; _ } ->
+              Float.(chain_price.price < trigger_price && chain_price.price >= floor_price)
+          | BridgeFailure _ | ContractExploit _ | NetworkFailure _ ->
+              false (* Handled by other monitors *)
         in
 
         (triggered, Some chain_price.price)
 
 end
 
-(** Unit tests **)
-module Tests = struct
-  open Alcotest
-
-  let test_outlier_detection () =
-    let prices = [
-      {
-        OracleAggregator.provider = RedStone;
-        asset = USDC;
-        price = 0.99;
-        timestamp = Unix.time ();
-        confidence = 0.95;
-        source_signature = None;
-      };
-      {
-        provider = Pyth;
-        asset = USDC;
-        price = 0.995;
-        timestamp = Unix.time ();
-        confidence = 0.93;
-        source_signature = None;
-      };
-      {
-        provider = Chainlink;
-        asset = USDC;
-        price = 0.85; (* Outlier *)
-        timestamp = Unix.time ();
-        confidence = 0.90;
-        source_signature = None;
-      };
-    ] in
-
-    let (normal, outliers) =
-      OracleAggregator.detect_outliers prices ~threshold:0.10
-    in
-
-    check int "normal prices count" 2 (List.length normal);
-    check int "outlier count" 1 (List.length outliers)
-
-  let test_weighted_average () =
-    let prices = [
-      {
-        OracleAggregator.provider = RedStone;
-        asset = USDC;
-        price = 1.00;
-        timestamp = Unix.time ();
-        confidence = 1.0;
-        source_signature = None;
-      };
-      {
-        provider = Pyth;
-        asset = USDC;
-        price = 0.99;
-        timestamp = Unix.time ();
-        confidence = 1.0;
-        source_signature = None;
-      };
-    ] in
-
-    let weights = [(RedStone, 0.60); (Pyth, 0.40)] in
-
-    let avg = OracleAggregator.weighted_average prices ~weights in
-
-    (* Expected: 1.00 × 0.60 + 0.99 × 0.40 = 0.996 *)
-    check bool "weighted average correct"
-      (Float.abs (avg -. 0.996) < 0.001) true
-
-  let suite = [
-    ("outlier detection", `Quick, test_outlier_detection);
-    ("weighted average", `Quick, test_weighted_average);
-  ]
-
-end

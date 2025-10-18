@@ -1,5 +1,10 @@
 (library
  (name integration)
  (public_name tonsurance.integration)
- (libraries core types math caqti caqti-lwt caqti-driver-postgresql lwt lwt.unix cohttp cohttp-lwt-unix yojson logs logs.lwt)
- (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
+ (modules database ton_client oracle_aggregator pyth_client
+          http_client resilient_http_client
+          polymarket_http_client binance_http_client chainlink_http_client
+          chainlink_client bridge_health_client cex_liquidation_client chain_metrics_client
+          escrow_oracle_client chain_event_client binance_futures_client)
+ (libraries core types math caqti caqti-lwt.unix lwt lwt.unix cohttp cohttp-lwt-unix yojson logs logs.lwt logs.fmt digestif uri)
+ (preprocess (pps lwt_ppx ppx_jane ppx_yojson_conv)))

@@ -1,0 +1,164 @@
+{
+  "version": "1.0.0",
+  "description": "Tonsurance API v2 Security Configuration",
+
+  "cors": {
+    "enabled": true,
+    "allowed_origins": [
+      "http://localhost:3000",
+      "http://localhost:5173",
+      "https://tonsurance.io",
+      "https://app.tonsurance.io",
+      "https://staging.tonsurance.io"
+    ],
+    "allowed_methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    "allowed_headers": ["Content-Type", "Authorization"],
+    "max_age_seconds": 86400
+  },
+
+  "rate_limiting": {
+    "enabled": true,
+    "per_ip_per_minute": 100,
+    "per_key_per_minute": 500,
+    "redis": {
+      "host": "127.0.0.1",
+      "port": 6379,
+      "fallback_to_memory": true
+    },
+    "endpoint_limits": [
+      {
+        "path": "/api/v2/quote/*",
+        "limit_per_minute": 60,
+        "burst_allowance": 10,
+        "description": "Premium quote endpoints"
+      },
+      {
+        "path": "/api/v2/policies",
+        "limit_per_minute": 20,
+        "burst_allowance": 5,
+        "description": "Policy purchase endpoint (write operation)"
+      },
+      {
+        "path": "/api/v2/claims",
+        "limit_per_minute": 10,
+        "burst_allowance": 2,
+        "description": "Claims filing endpoint (write operation)"
+      },
+      {
+        "path": "/api/v2/vault/deposit",
+        "limit_per_minute": 30,
+        "burst_allowance": 5,
+        "description": "Vault deposit endpoint"
+      },
+      {
+        "path": "/api/v2/vault/withdraw",
+        "limit_per_minute": 30,
+        "burst_allowance": 5,
+        "description": "Vault withdrawal endpoint"
+      }
+    ]
+  },
+
+  "authentication": {
+    "enabled": true,
+    "api_key_header": "Authorization",
+    "api_key_prefix": "Bearer ",
+    "protected_routes": [
+      {
+        "path": "/api/v2/policies",
+        "methods": ["POST"],
+        "required_scope": "write"
+      },
+      {
+        "path": "/api/v2/claims",
+        "methods": ["POST"],
+        "required_scope": "write"
+      },
+      {
+        "path": "/api/v2/vault/deposit",
+        "methods": ["POST"],
+        "required_scope": "write"
+      },
+      {
+        "path": "/api/v2/vault/withdraw",
+        "methods": ["POST"],
+        "required_scope": "write"
+      },
+      {
+        "path": "/api/v2/admin/*",
+        "methods": ["GET", "POST", "PUT", "DELETE"],
+        "required_scope": "admin"
+      }
+    ]
+  },
+
+  "api_keys": [
+    {
+      "key": "tonsure_dev_1234567890abcdef1234567890abcdef",
+      "name": "Development Key",
+      "scopes": ["read", "write"],
+      "created_at": 1697564800.0,
+      "expires_at": null,
+      "revoked": false,
+      "environment": "development"
+    },
+    {
+      "key": "tonsure_test_abcdef1234567890abcdef1234567890",
+      "name": "Test Suite Key",
+      "scopes": ["read", "write", "admin"],
+      "created_at": 1697564800.0,
+      "expires_at": null,
+      "revoked": false,
+      "environment": "test"
+    }
+  ],
+
+  "request_limits": {
+    "max_body_size_bytes": 10485760,
+    "max_body_size_human": "10MB",
+    "max_header_size_bytes": 8192,
+    "max_uri_length": 2048
+  },
+
+  "security_headers": {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "X-XSS-Protection": "1; mode=block",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains"
+  },
+
+  "input_validation": {
+    "max_string_length": 1000,
+    "max_array_length": 100,
+    "allowed_content_types": [
+      "application/json",
+      "application/x-www-form-urlencoded"
+    ]
+  },
+
+  "api_key_rotation": {
+    "rotation_interval_days": 90,
+    "warning_before_expiry_days": 7,
+    "auto_revoke_on_expiry": true
+  },
+
+  "monitoring": {
+    "log_failed_auth_attempts": true,
+    "log_rate_limit_hits": true,
+    "log_cors_violations": true,
+    "alert_on_suspicious_activity": true,
+    "suspicious_activity_threshold": {
+      "failed_auth_per_ip_per_hour": 10,
+      "rate_limit_hits_per_ip_per_hour": 50
+    }
+  },
+
+  "notes": [
+    "This is the default development configuration.",
+    "For production, generate new API keys using: backend/scripts/generate_api_key.sh",
+    "Store production keys in AWS Secrets Manager or similar.",
+    "Update CORS allowed_origins for production domain.",
+    "Enable Redis for distributed rate limiting in production.",
+    "Rotate API keys every 90 days or when compromised."
+  ]
+}

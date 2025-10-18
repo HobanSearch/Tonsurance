@@ -1,5 +1,28 @@
 (library
  (name daemons)
  (public_name tonsurance.daemons)
- (libraries core types math pool monitoring claims_engine integration lwt lwt.unix logs logs.lwt)
+ (modules trigger_monitor risk_management_daemon etl_orchestrator)
+ (libraries
+   core
+   types
+   math
+   pool
+   monitoring
+   claims_engine
+   integration
+   etl
+   reporting
+   monte_carlo_enhanced
+   caqti
+   caqti-lwt
+   lwt
+   lwt.unix
+   logs
+   logs.lwt)
+ (preprocess (pps lwt_ppx ppx_sexp_conv ppx_deriving_yojson)))
+
+(executable
+ (name integration_daemon)
+ (modules integration_daemon)
+ (libraries core types pool monitoring integration lwt lwt.unix logs logs.lwt)
  (preprocess (pps lwt_ppx ppx_sexp_conv)))

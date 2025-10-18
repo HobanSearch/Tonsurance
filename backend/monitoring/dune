@@ -2,4 +2,4 @@
  (name monitoring)
  (public_name tonsurance.monitoring)
  (libraries core types math risk_model pool lwt lwt.unix logs logs.lwt)
- (preprocess (pps lwt_ppx ppx_sexp_conv)))
+ (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv ppx_compare)))

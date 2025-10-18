@@ -1,0 +1,551 @@
+;; ParametricEscrow Contract - Conditional Payment Escrow System
+;; Holds funds on-chain and releases based on backend oracle verification
+;; Supports multi-party distribution, timeout actions, and dispute freezing
+;; Integrates with off-chain escrow_engine.ml for condition monitoring
+
+#include "../imports/stdlib.fc";
+
+;; ==================== STORAGE STRUCTURE ====================
+;; Main storage:
+;;   - escrow_id (uint64)
+;;   - payer_address (MsgAddress)
+;;   - payee_address (MsgAddress)
+;;   - oracle_address (MsgAddress) - backend oracle that can release funds
+;;   - amount (Coins)
+;;   - status (uint8): 0=pending, 1=active, 2=released, 3=cancelled, 4=disputed, 5=timed_out
+;;   - created_at (uint32)
+;;   - timeout_at (uint32)
+;;   - timeout_action (uint8): 0=refund_payer, 1=release_payee, 2=split
+;;   - split_percentage (uint8) - percentage to payee if split (0-100)
+;;   - condition_hash (uint256) - hash of all conditions (verified off-chain)
+;;   - additional_parties (dict) - party_index -> (address, percentage)
+;;   - protection_policy_id (uint64) - optional insurance policy for this escrow
+
+;; Storage globals
+global int escrow_id;
+global slice payer_address;
+global slice payee_address;
+global slice oracle_address;
+global int amount;
+global int status;
+global int created_at;
+global int timeout_at;
+global int timeout_action;
+global int split_percentage;
+global int condition_hash;
+global cell additional_parties;  ;; dict: uint8 -> (address, percentage)
+global int protection_policy_id;
+
+;; Status constants
+const int STATUS_PENDING = 0;
+const int STATUS_ACTIVE = 1;
+const int STATUS_RELEASED = 2;
+const int STATUS_CANCELLED = 3;
+const int STATUS_DISPUTED = 4;
+const int STATUS_TIMED_OUT = 5;
+
+;; Timeout action constants
+const int TIMEOUT_REFUND_PAYER = 0;
+const int TIMEOUT_RELEASE_PAYEE = 1;
+const int TIMEOUT_SPLIT = 2;
+
+;; Operation codes
+const int OP_INITIALIZE = 1;
+const int OP_RELEASE = 2;
+const int OP_CANCEL = 3;
+const int OP_HANDLE_TIMEOUT = 4;
+const int OP_FREEZE = 5;
+const int OP_MULTI_PARTY_RELEASE = 6;
+const int OP_UPDATE_ORACLE = 7;
+const int OP_EMERGENCY_WITHDRAW = 8;
+
+;; Error codes
+const int ERROR_UNAUTHORIZED = 401;
+const int ERROR_ORACLE_ONLY = 402;
+const int ERROR_NOT_ACTIVE = 403;
+const int ERROR_INVALID_CONDITION_HASH = 404;
+const int ERROR_INVALID_CANCELLER = 405;
+const int ERROR_ALREADY_ACTIVE = 406;
+const int ERROR_NOT_TIMED_OUT = 407;
+const int ERROR_INVALID_TIMEOUT_ACTION = 408;
+const int ERROR_ALREADY_INITIALIZED = 409;
+const int ERROR_INVALID_STATUS = 410;
+const int ERROR_PAYER_ONLY = 411;
+
+;; ==================== STORAGE OPERATIONS ====================
+
+() load_data() impure {
+    slice ds = get_data().begin_parse();
+
+    escrow_id = ds~load_uint(64);
+    payer_address = ds~load_msg_addr();
+    payee_address = ds~load_msg_addr();
+    oracle_address = ds~load_msg_addr();
+    amount = ds~load_coins();
+    status = ds~load_uint(8);
+    created_at = ds~load_uint(32);
+    timeout_at = ds~load_uint(32);
+    timeout_action = ds~load_uint(8);
+    split_percentage = ds~load_uint(8);
+
+    ;; Load additional data from reference cell (moved condition_hash here to avoid cell overflow)
+    slice ref_data = ds~load_ref().begin_parse();
+    condition_hash = ref_data~load_uint(256);
+    additional_parties = ref_data~load_dict();
+    protection_policy_id = ref_data~load_uint(64);
+}
+
+() save_data() impure {
+    ;; Pack additional data into reference cell (including condition_hash to avoid overflow)
+    cell ref_data = begin_cell()
+        .store_uint(condition_hash, 256)
+        .store_dict(additional_parties)
+        .store_uint(protection_policy_id, 64)
+        .end_cell();
+
+    set_data(begin_cell()
+        .store_uint(escrow_id, 64)
+        .store_slice(payer_address)
+        .store_slice(payee_address)
+        .store_slice(oracle_address)
+        .store_coins(amount)
+        .store_uint(status, 8)
+        .store_uint(created_at, 32)
+        .store_uint(timeout_at, 32)
+        .store_uint(timeout_action, 8)
+        .store_uint(split_percentage, 8)
+        .store_ref(ref_data)
+        .end_cell());
+}
+
+;; ==================== HELPER FUNCTIONS ====================
+
+() check_payer(slice sender_address) impure {
+    throw_unless(ERROR_PAYER_ONLY, equal_slices_bits(sender_address, payer_address));
+}
+
+() check_oracle(slice sender_address) impure {
+    throw_unless(ERROR_ORACLE_ONLY, equal_slices_bits(sender_address, oracle_address));
+}
+
+() check_payer_or_payee(slice sender_address) impure {
+    int is_payer = equal_slices_bits(sender_address, payer_address);
+    int is_payee = equal_slices_bits(sender_address, payee_address);
+    throw_unless(ERROR_INVALID_CANCELLER, is_payer | is_payee);
+}
+
+() check_active() impure {
+    throw_unless(ERROR_NOT_ACTIVE, status == STATUS_ACTIVE);
+}
+
+int is_timed_out() inline {
+    return now() >= timeout_at;
+}
+
+() send_tons(slice to_address, int send_amount, int mode) impure {
+    ;; Send message with TONs
+    var msg = begin_cell()
+        .store_uint(0x18, 6)  ;; nobounce
+        .store_slice(to_address)
+        .store_coins(send_amount)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)  ;; default message headers
+        .end_cell();
+
+    send_raw_message(msg, mode);
+}
+
+() send_notification(slice to_address, int op_code, int query_id) impure {
+    ;; Send notification message
+    var msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(to_address)
+        .store_coins(0)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(op_code, 32)
+        .store_uint(query_id, 64)
+        .end_cell();
+
+    send_raw_message(msg, 64);  ;; Carry remaining value
+}
+
+;; ==================== CORE OPERATIONS ====================
+
+() initialize_escrow(slice sender_address, int msg_value, slice in_msg_body) impure {
+    ;; Only payer can initialize
+    check_payer(sender_address);
+
+    ;; Check not already initialized
+    throw_if(ERROR_ALREADY_INITIALIZED, status != STATUS_PENDING);
+
+    ;; The message value becomes the escrowed amount
+    amount = msg_value;
+
+    ;; Update status to active
+    status = STATUS_ACTIVE;
+
+    ;; Save updated state
+    save_data();
+}
+
+() release_escrow(slice sender_address, slice in_msg_body) impure {
+    ;; Only oracle can release
+    check_oracle(sender_address);
+
+    ;; Must be active
+    check_active();
+
+    ;; Verify condition hash
+    int provided_hash = in_msg_body~load_uint(256);
+    throw_unless(ERROR_INVALID_CONDITION_HASH, condition_hash == provided_hash);
+
+    ;; Check if there are additional parties
+    int has_additional = ~ cell_null?(additional_parties);
+
+    if (has_additional) {
+        ;; Will be handled by multi-party release
+        throw(ERROR_INVALID_STATUS);
+    } else {
+        ;; Simple release to payee (100%)
+        send_tons(payee_address, amount, 128);  ;; Send all remaining balance
+
+        ;; Update status
+        status = STATUS_RELEASED;
+        save_data();
+
+        ;; Send notification to payer
+        send_notification(payer_address, OP_RELEASE, escrow_id);
+    }
+}
+
+() multi_party_release(slice sender_address, slice in_msg_body) impure {
+    ;; Only oracle can release
+    check_oracle(sender_address);
+
+    ;; Must be active
+    check_active();
+
+    ;; Verify condition hash
+    int provided_hash = in_msg_body~load_uint(256);
+    throw_unless(ERROR_INVALID_CONDITION_HASH, condition_hash == provided_hash);
+
+    ;; Read party count from message
+    int party_count = in_msg_body~load_uint(8);
+
+    ;; Calculate total percentage allocated to additional parties
+    int total_additional_pct = 0;
+    int i = 0;
+
+    ;; Send to each additional party
+    while (i < party_count) {
+        slice party_address = in_msg_body~load_msg_addr();
+        int party_pct = in_msg_body~load_uint(8);
+
+        ;; Calculate party amount
+        int party_amount = (amount * party_pct) / 100;
+
+        ;; Send to party
+        send_tons(party_address, party_amount, 0);
+
+        total_additional_pct += party_pct;
+        i += 1;
+    }
+
+    ;; Calculate remaining amount for primary payee
+    int payee_pct = 100 - total_additional_pct;
+    int payee_amount = (amount * payee_pct) / 100;
+
+    ;; Send to primary payee
+    send_tons(payee_address, payee_amount, 0);
+
+    ;; Update status
+    status = STATUS_RELEASED;
+    save_data();
+
+    ;; Send notification to payer
+    send_notification(payer_address, OP_MULTI_PARTY_RELEASE, escrow_id);
+}
+
+() cancel_escrow(slice sender_address) impure {
+    ;; Only payer or payee can cancel
+    check_payer_or_payee(sender_address);
+
+    ;; Must be active
+    check_active();
+
+    ;; Refund to payer
+    send_tons(payer_address, amount, 128);  ;; Send all remaining balance
+
+    ;; Update status
+    status = STATUS_CANCELLED;
+    save_data();
+
+    ;; Send notification to other party
+    slice notify_address = equal_slices_bits(sender_address, payer_address) ? payee_address : payer_address;
+    send_notification(notify_address, OP_CANCEL, escrow_id);
+}
+
+() handle_timeout(slice sender_address, slice in_msg_body) impure {
+    ;; Anyone can trigger timeout handling
+
+    ;; Must be active
+    check_active();
+
+    ;; Check if timed out
+    throw_unless(ERROR_NOT_TIMED_OUT, is_timed_out());
+
+    ;; Handle based on timeout action
+    if (timeout_action == TIMEOUT_REFUND_PAYER) {
+        ;; Refund to payer
+        send_tons(payer_address, amount, 128);
+        status = STATUS_TIMED_OUT;
+
+    } elseif (timeout_action == TIMEOUT_RELEASE_PAYEE) {
+        ;; Release to payee
+        send_tons(payee_address, amount, 128);
+        status = STATUS_TIMED_OUT;
+
+    } elseif (timeout_action == TIMEOUT_SPLIT) {
+        ;; Split between payer and payee
+        int payee_amount = (amount * split_percentage) / 100;
+        int payer_amount = amount - payee_amount;
+
+        send_tons(payee_address, payee_amount, 0);
+        send_tons(payer_address, payer_amount, 128);
+        status = STATUS_TIMED_OUT;
+
+    } else {
+        throw(ERROR_INVALID_TIMEOUT_ACTION);
+    }
+
+    save_data();
+
+    ;; Notify both parties
+    send_notification(payer_address, OP_HANDLE_TIMEOUT, escrow_id);
+    send_notification(payee_address, OP_HANDLE_TIMEOUT, escrow_id);
+}
+
+() freeze_escrow(slice sender_address) impure {
+    ;; Only oracle can freeze (for dispute)
+    check_oracle(sender_address);
+
+    ;; Must be active
+    check_active();
+
+    ;; Update status to disputed
+    status = STATUS_DISPUTED;
+    save_data();
+
+    ;; Notify both parties
+    send_notification(payer_address, OP_FREEZE, escrow_id);
+    send_notification(payee_address, OP_FREEZE, escrow_id);
+}
+
+() update_oracle(slice sender_address, slice in_msg_body) impure {
+    ;; Only current oracle can update
+    check_oracle(sender_address);
+
+    ;; Read new oracle address
+    slice new_oracle = in_msg_body~load_msg_addr();
+
+    ;; Update oracle address
+    oracle_address = new_oracle;
+    save_data();
+}
+
+() emergency_withdraw(slice sender_address) impure {
+    ;; Only payer can emergency withdraw
+    check_payer(sender_address);
+
+    ;; Must be disputed status
+    throw_unless(ERROR_INVALID_STATUS, status == STATUS_DISPUTED);
+
+    ;; Check enough time has passed (30 days)
+    throw_unless(ERROR_NOT_TIMED_OUT, now() >= (created_at + 2592000));
+
+    ;; Refund to payer
+    send_tons(payer_address, amount, 128);
+
+    ;; Update status
+    status = STATUS_CANCELLED;
+    save_data();
+}
+
+;; ==================== MAIN RECEIVER ====================
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    ;; Return if empty message
+    if (in_msg_body.slice_empty?()) {
+        return ();
+    }
+
+    ;; Parse message
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+
+    ;; Return if bounced message
+    if (flags & 1) {
+        return ();
+    }
+
+    slice sender_address = cs~load_msg_addr();
+
+    ;; Load storage
+    load_data();
+
+    ;; Parse operation
+    int op = in_msg_body~load_uint(32);
+    int query_id = in_msg_body~load_uint(64);
+
+    ;; Route operation
+    if (op == OP_INITIALIZE) {
+        initialize_escrow(sender_address, msg_value, in_msg_body);
+        return ();
+    }
+
+    if (op == OP_RELEASE) {
+        release_escrow(sender_address, in_msg_body);
+        return ();
+    }
+
+    if (op == OP_MULTI_PARTY_RELEASE) {
+        multi_party_release(sender_address, in_msg_body);
+        return ();
+    }
+
+    if (op == OP_CANCEL) {
+        cancel_escrow(sender_address);
+        return ();
+    }
+
+    if (op == OP_HANDLE_TIMEOUT) {
+        handle_timeout(sender_address, in_msg_body);
+        return ();
+    }
+
+    if (op == OP_FREEZE) {
+        freeze_escrow(sender_address);
+        return ();
+    }
+
+    if (op == OP_UPDATE_ORACLE) {
+        update_oracle(sender_address, in_msg_body);
+        return ();
+    }
+
+    if (op == OP_EMERGENCY_WITHDRAW) {
+        emergency_withdraw(sender_address);
+        return ();
+    }
+
+    ;; Unknown operation - throw error
+    throw(0xffff);
+}
+
+;; ==================== GET METHODS ====================
+
+;; Get complete escrow data
+(int, slice, slice, slice, int, int, int, int) get_escrow_data() method_id {
+    load_data();
+    return (
+        escrow_id,
+        payer_address,
+        payee_address,
+        oracle_address,
+        amount,
+        status,
+        timeout_at,
+        timeout_action
+    );
+}
+
+;; Get escrow status
+int get_status() method_id {
+    load_data();
+    return status;
+}
+
+;; Check if timed out
+int get_is_timed_out() method_id {
+    load_data();
+    return is_timed_out();
+}
+
+;; Get escrow amount
+int get_amount() method_id {
+    load_data();
+    return amount;
+}
+
+;; Get condition hash
+int get_condition_hash() method_id {
+    load_data();
+    return condition_hash;
+}
+
+;; Get additional parties count
+int get_additional_parties_count() method_id {
+    load_data();
+
+    if (cell_null?(additional_parties)) {
+        return 0;
+    }
+
+    ;; Count entries in dictionary
+    int count = 0;
+    int index = -1;
+
+    do {
+        (index, slice party_data, int found) = additional_parties.udict_get_next?(8, index);
+        if (found) {
+            count += 1;
+        }
+    } until (~ found);
+
+    return count;
+}
+
+;; Get additional party by index
+(slice, int) get_additional_party(int party_index) method_id {
+    load_data();
+
+    (slice party_data, int found) = additional_parties.udict_get?(8, party_index);
+
+    if (~ found) {
+        ;; Return null address and 0 percentage if not found
+        return (begin_cell().store_uint(0, 2).end_cell().begin_parse(), 0);
+    }
+
+    slice party_address = party_data~load_msg_addr();
+    int party_percentage = party_data~load_uint(8);
+
+    return (party_address, party_percentage);
+}
+
+;; Get protection policy ID
+int get_protection_policy_id() method_id {
+    load_data();
+    return protection_policy_id;
+}
+
+;; Get timeout details
+(int, int, int) get_timeout_details() method_id {
+    load_data();
+    return (timeout_at, timeout_action, split_percentage);
+}
+
+;; Get created timestamp
+int get_created_at() method_id {
+    load_data();
+    return created_at;
+}
+
+;; Get time remaining until timeout (in seconds, 0 if timed out)
+int get_time_remaining() method_id {
+    load_data();
+
+    if (now() >= timeout_at) {
+        return 0;
+    }
+
+    return timeout_at - now();
+}

@@ -1,0 +1,411 @@
+;; CEXOracleAdapter.fc
+;; Centralized Exchange Liquidation Oracle Adapter
+;;
+;; Purpose: Verifies CEX liquidation claims by validating oracle-submitted proofs
+;; Coverage Type: 5 (CEX_LIQUIDATION)
+;;
+;; This contract acts as the trust layer between off-chain CEX APIs and on-chain claims.
+;; It accepts cryptographically signed proofs from a trusted oracle service that monitors
+;; Binance, OKX, and Bybit for liquidation events.
+
+#include "../imports/stdlib.fc";
+
+;; ================================
+;; STORAGE STRUCTURE
+;; ================================
+
+;; Storage layout:
+;; - owner_address: slice         - Contract owner (can update oracle)
+;; - trusted_oracle: slice         - Oracle address authorized to submit proofs
+;; - verified_cex_platforms: cell  - Dict<string_hash, cex_id> mapping
+;; - liquidation_threshold: int    - Margin call threshold (basis points, e.g., 500 = 5%)
+;; - liquidation_proofs: cell      - Dict<policy_id, proof_data>
+;; - total_proofs_submitted: int   - Counter for analytics
+;; - total_proofs_verified: int    - Counter for analytics
+
+global slice owner_address;
+global slice trusted_oracle;
+global cell verified_cex_platforms;
+global int liquidation_threshold;
+global cell liquidation_proofs;
+global int total_proofs_submitted;
+global int total_proofs_verified;
+
+;; ================================
+;; CONSTANTS
+;; ================================
+
+const int op::submit_liquidation_proof = 0x4c495150;  ;; "LIQP"
+const int op::verify_claim = 0x56455249;              ;; "VERI"
+const int op::update_oracle = 0x5550444f;             ;; "UPDO"
+const int op::add_cex_platform = 0x41444443;          ;; "ADDC"
+const int op::remove_cex_platform = 0x52454d43;       ;; "REMC"
+
+const int error::unauthorized = 401;
+const int error::invalid_signature = 402;
+const int error::unsupported_cex = 403;
+const int error::claim_expired = 404;
+const int error::proof_not_found = 405;
+const int error::invalid_proof_data = 406;
+
+const int CEX_BINANCE = 1;
+const int CEX_OKX = 2;
+const int CEX_BYBIT = 3;
+
+;; Maximum time between liquidation and claim (24 hours)
+const int MAX_CLAIM_DELAY = 86400;
+
+;; ================================
+;; STORAGE LOAD/SAVE
+;; ================================
+
+() load_data() impure inline {
+    slice ds = get_data().begin_parse();
+
+    owner_address = ds~load_msg_addr();
+    trusted_oracle = ds~load_msg_addr();
+    verified_cex_platforms = ds~load_dict();
+    liquidation_threshold = ds~load_uint(16);
+    liquidation_proofs = ds~load_dict();
+    total_proofs_submitted = ds~load_uint(64);
+    total_proofs_verified = ds~load_uint(64);
+}
+
+() save_data() impure inline {
+    set_data(begin_cell()
+        .store_slice(owner_address)
+        .store_slice(trusted_oracle)
+        .store_dict(verified_cex_platforms)
+        .store_uint(liquidation_threshold, 16)
+        .store_dict(liquidation_proofs)
+        .store_uint(total_proofs_submitted, 64)
+        .store_uint(total_proofs_verified, 64)
+        .end_cell()
+    );
+}
+
+;; ================================
+;; UTILITY FUNCTIONS
+;; ================================
+
+;; Hash CEX platform name to uint256 for dictionary key
+int hash_cex_name(slice cex_name) inline {
+    return slice_hash(cex_name);
+}
+
+;; Build hash of liquidation data for signature verification
+int hash_liquidation_data(
+    int policy_id,
+    slice cex_platform,
+    slice user_cex_id,
+    int position_id,
+    int liquidation_price,
+    int liquidation_time
+) inline {
+    cell data = begin_cell()
+        .store_uint(policy_id, 64)
+        .store_slice(cex_platform)
+        .store_slice(user_cex_id)
+        .store_uint(position_id, 128)
+        .store_coins(liquidation_price)
+        .store_uint(liquidation_time, 32)
+        .end_cell();
+
+    return cell_hash(data);
+}
+
+;; Verify Ed25519 signature
+int check_ed25519_signature(int hash, slice signature, slice public_key_slice) inline {
+    ;; public_key_slice should contain a 256-bit public key
+    int public_key = public_key_slice~load_uint(256);
+    return check_signature(hash, signature, public_key);
+}
+
+;; ================================
+;; CORE OPERATIONS
+;; ================================
+
+;; Submit liquidation proof from trusted oracle
+() submit_liquidation_proof(
+    slice sender_address,
+    int policy_id,
+    slice cex_platform,
+    slice user_cex_id,
+    int position_id,
+    int liquidation_price,
+    int liquidation_time,
+    int liquidation_value,
+    slice trade_history_merkle_root,
+    slice oracle_signature
+) impure {
+    ;; 1. Verify sender is trusted oracle
+    throw_unless(error::unauthorized, equal_slice_bits(sender_address, trusted_oracle));
+
+    ;; 2. Hash liquidation data
+    int data_hash = hash_liquidation_data(
+        policy_id,
+        cex_platform,
+        user_cex_id,
+        position_id,
+        liquidation_price,
+        liquidation_time
+    );
+
+    ;; 3. Verify oracle signature
+    int signature_valid = check_ed25519_signature(
+        data_hash,
+        oracle_signature,
+        trusted_oracle
+    );
+    throw_unless(error::invalid_signature, signature_valid);
+
+    ;; 4. Verify CEX platform is supported
+    int cex_hash = hash_cex_name(cex_platform);
+    (slice cex_data, int found) = verified_cex_platforms.udict_get?(256, cex_hash);
+    throw_unless(error::unsupported_cex, found);
+
+    int cex_id = cex_data~load_uint(8);
+
+    ;; 5. Build and store proof
+    cell proof = begin_cell()
+        .store_uint(cex_id, 8)
+        .store_slice(cex_platform)
+        .store_slice(user_cex_id)
+        .store_uint(position_id, 128)
+        .store_coins(liquidation_price)
+        .store_uint(liquidation_time, 32)
+        .store_coins(liquidation_value)
+        .store_slice(trade_history_merkle_root)
+        .store_uint(1, 1)  ;; verified flag
+        .store_uint(now(), 32)  ;; verification timestamp
+        .end_cell();
+
+    liquidation_proofs~udict_set(64, policy_id, proof.begin_parse());
+
+    ;; 6. Update counters
+    total_proofs_submitted += 1;
+    total_proofs_verified += 1;
+
+    ;; 7. Emit verification event
+    emit_log(0x4c495156,  ;; "LIQV" = Liquidation Verified (shortened)
+        begin_cell()
+            .store_uint(policy_id, 64)
+            .store_uint(position_id, 128)
+            .store_coins(liquidation_value)
+            .store_uint(liquidation_time, 32)
+            .end_cell().begin_parse()
+    );
+}
+
+;; Update trusted oracle address (owner only)
+() update_oracle(slice sender_address, slice new_oracle) impure {
+    throw_unless(error::unauthorized, equal_slice_bits(sender_address, owner_address));
+
+    trusted_oracle = new_oracle;
+
+    emit_log(0x4f524348,  ;; "ORCH" = Oracle Changed
+        begin_cell()
+            .store_slice(new_oracle)
+            .end_cell().begin_parse()
+    );
+}
+
+;; Add supported CEX platform (owner only)
+() add_cex_platform(slice sender_address, slice cex_name, int cex_id) impure {
+    throw_unless(error::unauthorized, equal_slice_bits(sender_address, owner_address));
+
+    int cex_hash = hash_cex_name(cex_name);
+
+    cell cex_data = begin_cell()
+        .store_uint(cex_id, 8)
+        .store_slice(cex_name)
+        .end_cell();
+
+    verified_cex_platforms~udict_set(256, cex_hash, cex_data.begin_parse());
+
+    emit_log(0x43455841,  ;; "CEXA" = CEX Added
+        begin_cell()
+            .store_uint(cex_id, 8)
+            .store_slice(cex_name)
+            .end_cell().begin_parse()
+    );
+}
+
+;; Remove CEX platform (owner only)
+() remove_cex_platform(slice sender_address, slice cex_name) impure {
+    throw_unless(error::unauthorized, equal_slice_bits(sender_address, owner_address));
+
+    int cex_hash = hash_cex_name(cex_name);
+    verified_cex_platforms~udict_delete?(256, cex_hash);
+
+    emit_log(0x43455852,  ;; "CEXR" = CEX Removed
+        begin_cell()
+            .store_slice(cex_name)
+            .end_cell().begin_parse()
+    );
+}
+
+;; ================================
+;; MESSAGE HANDLERS
+;; ================================
+
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) {
+        return ();  ;; Ignore empty messages
+    }
+
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+
+    if (flags & 1) {
+        return ();  ;; Ignore bounced messages
+    }
+
+    slice sender_address = cs~load_msg_addr();
+
+    int op = in_msg_body~load_uint(32);
+
+    load_data();
+
+    if (op == op::submit_liquidation_proof) {
+        int policy_id = in_msg_body~load_uint(64);
+        slice cex_platform = in_msg_body~load_msg_addr();
+        slice user_cex_id = in_msg_body~load_msg_addr();
+        int position_id = in_msg_body~load_uint(128);
+        int liquidation_price = in_msg_body~load_coins();
+        int liquidation_time = in_msg_body~load_uint(32);
+        int liquidation_value = in_msg_body~load_coins();
+        slice merkle_root = in_msg_body~load_bits(256);
+        slice signature = in_msg_body~load_bits(512);
+
+        submit_liquidation_proof(
+            sender_address,
+            policy_id,
+            cex_platform,
+            user_cex_id,
+            position_id,
+            liquidation_price,
+            liquidation_time,
+            liquidation_value,
+            merkle_root,
+            signature
+        );
+
+        save_data();
+        return ();
+    }
+
+    if (op == op::update_oracle) {
+        slice new_oracle = in_msg_body~load_msg_addr();
+        update_oracle(sender_address, new_oracle);
+        save_data();
+        return ();
+    }
+
+    if (op == op::add_cex_platform) {
+        slice cex_name = in_msg_body~load_msg_addr();
+        int cex_id = in_msg_body~load_uint(8);
+        add_cex_platform(sender_address, cex_name, cex_id);
+        save_data();
+        return ();
+    }
+
+    if (op == op::remove_cex_platform) {
+        slice cex_name = in_msg_body~load_msg_addr();
+        remove_cex_platform(sender_address, cex_name);
+        save_data();
+        return ();
+    }
+
+    throw(0xffff);  ;; Unknown operation
+}
+
+;; ================================
+;; GET METHODS
+;; ================================
+
+;; Verify if a claim is valid for a given policy
+(int, int, int) verify_claim(int policy_id, int claim_time) method_id {
+    load_data();
+
+    ;; Retrieve proof
+    (slice proof_slice, int found) = liquidation_proofs.udict_get?(64, policy_id);
+
+    if (~ found) {
+        return (0, 0, 0);  ;; Not verified - returns (verified, liquidation_value, liquidation_time)
+    }
+
+    ;; Parse proof
+    int cex_id = proof_slice~load_uint(8);
+    slice cex_platform = proof_slice~load_msg_addr();
+    slice user_cex_id = proof_slice~load_msg_addr();
+    int position_id = proof_slice~load_uint(128);
+    int liquidation_price = proof_slice~load_coins();
+    int liquidation_time = proof_slice~load_uint(32);
+    int liquidation_value = proof_slice~load_coins();
+    slice merkle_root = proof_slice~load_bits(256);
+    int verified = proof_slice~load_uint(1);
+    int verification_timestamp = proof_slice~load_uint(32);
+
+    ;; Check claim is within valid time window (24 hours after liquidation)
+    if ((claim_time - liquidation_time) > MAX_CLAIM_DELAY) {
+        return (0, 0, 0);  ;; Claim expired
+    }
+
+    return (verified, liquidation_value, liquidation_time);
+}
+
+;; Get proof details for a policy
+(int, slice, int, int, int, int) get_proof(int policy_id) method_id {
+    load_data();
+
+    (slice proof_slice, int found) = liquidation_proofs.udict_get?(64, policy_id);
+
+    if (~ found) {
+        return (0, begin_cell().end_cell().begin_parse(), 0, 0, 0, 0);
+    }
+
+    int cex_id = proof_slice~load_uint(8);
+    slice cex_platform = proof_slice~load_msg_addr();
+    proof_slice~skip_bits(267);  ;; Skip user_cex_id
+    int position_id = proof_slice~load_uint(128);
+    int liquidation_price = proof_slice~load_coins();
+    int liquidation_time = proof_slice~load_uint(32);
+    int liquidation_value = proof_slice~load_coins();
+
+    return (1, cex_platform, position_id, liquidation_price, liquidation_time, liquidation_value);
+}
+
+;; Check if CEX platform is supported
+int is_cex_supported(slice cex_name) method_id {
+    load_data();
+
+    int cex_hash = hash_cex_name(cex_name);
+    (slice cex_data, int found) = verified_cex_platforms.udict_get?(256, cex_hash);
+
+    return found;
+}
+
+;; Get contract statistics
+(int, int, slice, int) get_stats() method_id {
+    load_data();
+
+    return (
+        total_proofs_submitted,
+        total_proofs_verified,
+        trusted_oracle,
+        liquidation_threshold
+    );
+}
+
+;; Get owner address
+slice get_owner() method_id {
+    load_data();
+    return owner_address;
+}
+
+;; Get trusted oracle address
+slice get_oracle() method_id {
+    load_data();
+    return trusted_oracle;
+}

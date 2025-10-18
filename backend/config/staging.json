@@ -1,0 +1,57 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Staging environment configuration - Production-like settings for testing",
+  "version": "1.0.0",
+  "environment": "staging",
+
+  "timeouts": {
+    "ton_client_seconds": 30,
+    "http_default_seconds": 10.0,
+    "oracle_update_interval_seconds": 60.0,
+    "daemon_health_check_seconds": 30.0
+  },
+
+  "gas": {
+    "environment_multiplier": 1.1,
+    "deploy_buffer_percent": 10
+  },
+
+  "retry": {
+    "max_attempts": 3,
+    "backoff_max_seconds": 16.0
+  },
+
+  "pools": {
+    "database_pool_size": 10,
+    "worker_threads": 4,
+    "max_concurrent_requests": 100,
+    "rate_limit_per_minute": 500
+  },
+
+  "thresholds": {
+    "circuit_breaker_failures": 7,
+    "oracle_staleness_critical_seconds": 450,
+    "min_reserve_balance_ton": 100,
+    "utilization_critical_percent": 90.0
+  },
+
+  "logging": {
+    "level": "INFO",
+    "verbose_queries": false,
+    "trace_http_requests": false
+  },
+
+  "features": {
+    "enable_hot_reload": true,
+    "enable_test_endpoints": true,
+    "skip_signature_verification": false,
+    "mock_external_apis": false
+  },
+
+  "notes": [
+    "Staging mirrors production configuration",
+    "Used for final testing before mainnet deployment",
+    "Real external APIs but testnet contracts",
+    "Moderate resource allocation"
+  ]
+}

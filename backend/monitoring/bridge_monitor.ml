@@ -43,6 +43,7 @@ let known_bridges = [
   ("wormhole_arb_ton", Arbitrum, TON);
   ("wormhole_base_ton", Base, TON);
   ("wormhole_poly_ton", Polygon, TON);
+  ("wormhole_sol_ton", Solana, TON);
   ("multichain_eth_ton", Ethereum, TON);
   ("orbit_eth_ton", Ethereum, TON);
   ("celer_eth_ton", Ethereum, TON);
@@ -142,7 +143,7 @@ let detect_tvl_drop ~previous_tvl ~current_tvl ~time_elapsed : bridge_alert opti
 
 (** Check oracle consensus for bridge state *)
 let check_oracle_consensus
-    ~bridge_id
+    ~(bridge_id: string)
     ~(oracle_sources: (string * float) list) : float * bridge_alert option =
 
   if List.length oracle_sources < 2 then
@@ -191,9 +192,9 @@ let check_oracle_consensus
 
 (** Fetch bridge TVL from multiple oracles *)
 let fetch_bridge_tvl
-    ~(bridge_id: string)
-    ~(source_chain: blockchain)
-    ~(dest_chain: blockchain) : (usd_cents * (string * float) list) Lwt.t =
+    ~(_bridge_id: string)
+    ~(_source_chain: blockchain)
+    ~(_dest_chain: blockchain) : (usd_cents * (string * float) list) Lwt.t =
 
   (* Mock oracle responses - in production, fetch from actual oracles *)
   let* oracle_responses = Lwt.return [
@@ -211,13 +212,13 @@ let fetch_bridge_tvl
 
 (** Monitor a single bridge *)
 let monitor_bridge
-    ~(bridge_id: string)
-    ~(source_chain: blockchain)
-    ~(dest_chain: blockchain)
+    ~(_bridge_id: string)
+    ~(_source_chain: blockchain)
+    ~(_dest_chain: blockchain)
     ~(previous_health: bridge_health option) : bridge_health Lwt.t =
 
   let* (current_tvl, oracle_responses) =
-    fetch_bridge_tvl ~bridge_id ~source_chain ~dest_chain
+    fetch_bridge_tvl ~_bridge_id ~_source_chain:_source_chain ~_dest_chain:_dest_chain
   in
 
   let previous_tvl =
@@ -237,7 +238,7 @@ let monitor_bridge
 
   (* Check oracle consensus *)
   let (oracle_consensus, oracle_alert) =
-    check_oracle_consensus ~bridge_id ~oracle_sources:oracle_responses
+    check_oracle_consensus ~bridge_id:_bridge_id ~oracle_sources:oracle_responses
   in
 
   (* Mock transaction success rate - in production, query actual data *)
@@ -271,9 +272,9 @@ let monitor_bridge
   in
 
   Lwt.return {
-    bridge_id;
-    source_chain;
-    dest_chain;
+    bridge_id = _bridge_id;
+    source_chain = _source_chain;
+    dest_chain = _dest_chain;
     current_tvl_usd = current_tvl;
     previous_tvl_usd = previous_tvl;
     health_score;
@@ -288,7 +289,7 @@ let monitor_all_bridges
 
   let monitor_bridge_with_state (bridge_id, source, dest) =
     let previous = List.assoc_opt bridge_id previous_states in
-    monitor_bridge ~bridge_id ~source_chain:source ~dest_chain:dest ~previous_health:previous
+    monitor_bridge ~_bridge_id:bridge_id ~_source_chain:source ~_dest_chain:dest ~previous_health:previous
   in
 
   Lwt_list.map_p monitor_bridge_with_state known_bridges

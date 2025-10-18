@@ -1,0 +1,90 @@
+(executable
+ (name test_unified_risk_monitor)
+ (modules test_unified_risk_monitor)
+ (libraries core alcotest alcotest-lwt lwt lwt.unix tonsurance.risk_model tonsurance.monte_carlo_enhanced tonsurance.chain_risk_calculator tonsurance.monitoring)
+ (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
+
+(rule
+ (alias runtest)
+ (action (run %{exe:test_unified_risk_monitor.exe})))
+
+(executable
+ (name tranche_pricing_test)
+ (modules tranche_pricing_test)
+ (libraries core ounit2 tranche_pricing)
+ (preprocess (pps ppx_sexp_conv ppx_yojson_conv)))
+
+(executable
+ (name utilization_tracker_test)
+ (modules utilization_tracker_test)
+ (libraries core pool tranche_pricing integration alcotest alcotest-lwt lwt lwt.unix)
+ (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
+
+(executable
+ (name waterfall_simulator_test)
+ (modules waterfall_simulator_test)
+ (libraries core pool tranche_pricing types ounit2)
+ (preprocess (pps ppx_sexp_conv ppx_yojson_conv)))
+
+(executable
+ (name test_dispute_resolution)
+ (modules test_dispute_resolution)
+ (libraries core types escrow lwt lwt.unix str)
+ (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
+
+; TODO: Re-enable after fixing config type mismatches
+; (executable
+;  (name ton_client_write_test)
+;  (modules ton_client_write_test)
+;  (libraries core integration alcotest alcotest-lwt lwt lwt.unix yojson)
+;  (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
+;
+; (executable
+;  (name binance_futures_client_test)
+;  (modules binance_futures_client_test)
+;  (libraries core integration lwt lwt.unix yojson digestif)
+;  (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
+;
+; (executable
+;  (name api_security_test)
+;  (modules api_security_test)
+;  (libraries core security_middleware ounit2 lwt lwt.unix base64)
+;  (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
+;
+; (executable
+;  (name resilient_http_client_test)
+;  (modules resilient_http_client_test)
+;  (libraries core integration lwt lwt.unix logs logs.fmt logs.lwt yojson cohttp cohttp-lwt-unix digestif uri)
+;  (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
+
+(rule
+ (alias runtest)
+ (action (run %{exe:tranche_pricing_test.exe})))
+
+(rule
+ (alias runtest)
+ (action (run %{exe:utilization_tracker_test.exe})))
+
+(rule
+ (alias runtest)
+ (action (run %{exe:waterfall_simulator_test.exe})))
+
+(rule
+ (alias runtest)
+ (action (run %{exe:test_dispute_resolution.exe})))
+
+; (rule
+;  (alias runtest)
+;  (action (run %{exe:ton_client_write_test.exe})))
+;
+; (rule
+;  (alias runtest)
+;  (action (run %{exe:binance_futures_client_test.exe})))
+;
+; (rule
+;  (alias runtest)
+;  (action (run %{exe:api_security_test.exe})))
+;
+; (rule
+;  (alias runtest)
+;  (action (run %{exe:resilient_http_client_test.exe})))

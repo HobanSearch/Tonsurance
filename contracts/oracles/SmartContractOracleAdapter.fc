@@ -1,0 +1,359 @@
+;; SmartContractOracleAdapter - Smart Contract Exploit Verification Oracle
+;;
+;; This adapter verifies smart contract exploit claims by validating
+;; contract vulnerability events, paused states, and fund losses.
+;;
+;; Coverage Type: 1 (Smart Contract Exploit)
+;;
+;; Verification Requirements:
+;; 1. Contract must be paused or exploited
+;; 2. Exploit transaction confirmed on-chain
+;; 3. Fund loss matches claimed amount
+;; 4. Reported by multiple security monitoring sources
+;;
+;; Evidence Format:
+;; - chain_id: uint8
+;; - contract_address: slice
+;; - exploit_tx_hash: uint256
+;; - exploit_timestamp: uint32
+;; - stolen_amount: coins
+;; - contract_type: uint8 (0=DeFi, 1=NFT, 2=Bridge, 3=DAO)
+
+#include "../imports/stdlib.fc";
+
+;; ===== CONSTANTS =====
+
+const int OP_VERIFY_CLAIM = 0x01;
+const int OP_SET_CLAIMS_PROCESSOR = 0x10;
+const int OP_SET_KEEPER = 0x11;
+const int OP_REPORT_EXPLOIT = 0x12;
+const int OP_UPDATE_CONTRACT_STATUS = 0x13;
+
+const int OP_RECEIVE_VERIFICATION = 0x20;
+
+;; Contract status
+const int CONTRACT_STATUS_ACTIVE = 0;
+const int CONTRACT_STATUS_PAUSED = 1;
+const int CONTRACT_STATUS_EXPLOITED = 2;
+const int CONTRACT_STATUS_UPGRADED = 3;
+
+;; Monitoring sources (bitmap)
+const int SOURCE_CERTIK = 1;
+const int SOURCE_PECKSHIELD = 2;
+const int SOURCE_SLOWMIST = 4;
+const int SOURCE_BLOCKSEC = 8;
+const int SOURCE_IMMUNEFI = 16;
+
+;; Error codes
+const int ERR_ACCESS_DENIED = 403;
+const int ERR_INVALID_EVIDENCE = 400;
+const int ERR_CONTRACT_NOT_FOUND = 404;
+const int ERR_EXPLOIT_NOT_FOUND = 405;
+const int ERR_INSUFFICIENT_CONFIRMATION = 406;
+
+const int MIN_MONITORING_SOURCES = 2;
+const int MAX_CLAIM_DELAY = 86400;  ;; 24 hours
+
+;; ===== STORAGE =====
+
+global slice owner_address;
+global slice claims_processor_address;
+global slice keeper_address;
+global cell contract_registry;  ;; Dict: contract_hash -> (status, tvl, last_update)
+global cell exploit_events;     ;; Dict: (contract_hash << 32 | timestamp) -> exploit_data
+global int total_exploits_tracked;
+
+() load_data() impure {
+    slice ds = get_data().begin_parse();
+    owner_address = ds~load_msg_addr();
+    claims_processor_address = ds~load_msg_addr();
+    keeper_address = ds~load_msg_addr();
+    contract_registry = ds~load_dict();
+    exploit_events = ds~load_dict();
+    total_exploits_tracked = ds~load_uint(32);
+}
+
+() save_data() impure {
+    set_data(begin_cell()
+        .store_slice(owner_address)
+        .store_slice(claims_processor_address)
+        .store_slice(keeper_address)
+        .store_dict(contract_registry)
+        .store_dict(exploit_events)
+        .store_uint(total_exploits_tracked, 32)
+        .end_cell());
+}
+
+;; ===== ACCESS CONTROL =====
+
+() check_owner(slice sender) impure inline {
+    throw_unless(ERR_ACCESS_DENIED, equal_slices_bits(sender, owner_address));
+}
+
+() check_claims_processor(slice sender) impure inline {
+    throw_unless(ERR_ACCESS_DENIED, equal_slices_bits(sender, claims_processor_address));
+}
+
+() check_keeper(slice sender) impure inline {
+    throw_unless(ERR_ACCESS_DENIED, equal_slices_bits(sender, keeper_address));
+}
+
+;; ===== CONTRACT REGISTRY MANAGEMENT =====
+
+() update_contract_status(slice contract_address, int status, int current_tvl) impure {
+    int contract_hash = slice_hash(contract_address);
+    
+    cell contract_data = begin_cell()
+        .store_uint(status, 8)
+        .store_coins(current_tvl)
+        .store_uint(now(), 32)
+        .end_cell();
+
+    contract_registry~udict_set_ref(256, contract_hash, contract_data);
+}
+
+(int, int, int, int) get_contract_status(slice contract_address) inline {
+    int contract_hash = slice_hash(contract_address);
+
+    (slice contract_slice, int found) = contract_registry.udict_get?(256, contract_hash);
+    if (~ found) {
+        return (0, 0, 0, 0);
+    }
+
+    slice cs = contract_slice~load_ref().begin_parse();
+    int status = cs~load_uint(8);
+    int tvl = cs~load_coins();
+    int last_update = cs~load_uint(32);
+
+    return (status, tvl, last_update, -1);
+}
+
+;; ===== EXPLOIT EVENT MANAGEMENT =====
+
+() report_exploit(
+    slice contract_address,
+    int chain_id,
+    int exploit_timestamp,
+    int stolen_amount,
+    int tx_hash_high,
+    int tx_hash_low,
+    int monitoring_sources,
+    int contract_type
+) impure {
+    int contract_hash = slice_hash(contract_address);
+    int event_key = (contract_hash << 32) | exploit_timestamp;
+
+    cell exploit_data = begin_cell()
+        .store_slice(contract_address)
+        .store_uint(chain_id, 8)
+        .store_coins(stolen_amount)
+        .store_uint(tx_hash_high, 128)
+        .store_uint(tx_hash_low, 128)
+        .store_uint(monitoring_sources, 8)
+        .store_uint(contract_type, 8)
+        .store_uint(now(), 32)
+        .end_cell();
+
+    exploit_events~udict_set_ref(96, event_key, exploit_data);
+    total_exploits_tracked += 1;
+
+    ;; Update contract status
+    var (status, tvl, last_update, found) = get_contract_status(contract_address);
+    if (found) {
+        update_contract_status(contract_address, CONTRACT_STATUS_EXPLOITED, tvl - stolen_amount);
+    }
+}
+
+(int, int, int, int) get_exploit_event(slice contract_address, int exploit_timestamp) inline {
+    int contract_hash = slice_hash(contract_address);
+    int event_key = (contract_hash << 32) | exploit_timestamp;
+
+    (slice exploit_slice, int found) = exploit_events.udict_get?(96, event_key);
+    if (~ found) {
+        return (0, 0, 0, 0);
+    }
+
+    slice es = exploit_slice~load_ref().begin_parse();
+    es~load_msg_addr();  ;; Skip contract_address
+    es~load_uint(8);     ;; Skip chain_id
+    int stolen_amount = es~load_coins();
+    es~load_uint(128);   ;; Skip tx_hash_high
+    es~load_uint(128);   ;; Skip tx_hash_low
+    int monitoring_sources = es~load_uint(8);
+    es~load_uint(8);     ;; Skip contract_type
+    int reported_at = es~load_uint(32);
+
+    return (stolen_amount, monitoring_sources, reported_at, -1);
+}
+
+int count_sources(int source_bitmap) inline {
+    int count = 0;
+    int i = 0;
+    while (i < 8) {
+        if (source_bitmap & (1 << i)) {
+            count += 1;
+        }
+        i += 1;
+    }
+    return count;
+}
+
+;; ===== CLAIM VERIFICATION LOGIC =====
+
+() verify_contract_claim(
+    slice sender,
+    int query_id,
+    int coverage_type,
+    int stablecoin_id,
+    cell evidence_cell
+) impure {
+    check_claims_processor(sender);
+
+    slice evidence = evidence_cell.begin_parse();
+    int chain_id = evidence~load_uint(8);
+    slice contract_address = evidence~load_msg_addr();
+    int tx_hash_high = evidence~load_uint(128);
+    int tx_hash_low = evidence~load_uint(128);
+    int exploit_timestamp = evidence~load_uint(32);
+    int claimed_amount = evidence~load_coins();
+    int contract_type = evidence~load_uint(8);
+
+    ;; Validation 1: Contract exists and is exploited
+    var (contract_status, tvl, last_update, contract_found) = get_contract_status(contract_address);
+    throw_unless(ERR_CONTRACT_NOT_FOUND, contract_found);
+    
+    int contract_is_exploited = (contract_status == CONTRACT_STATUS_EXPLOITED) | (contract_status == CONTRACT_STATUS_PAUSED);
+
+    ;; Validation 2: Exploit event exists
+    var (stolen_amount, monitoring_sources, reported_at, exploit_found) = get_exploit_event(contract_address, exploit_timestamp);
+    throw_unless(ERR_EXPLOIT_NOT_FOUND, exploit_found);
+
+    ;; Validation 3: Timely claim
+    int claim_delay = now() - exploit_timestamp;
+    int timely_claim = claim_delay < MAX_CLAIM_DELAY;
+
+    ;; Validation 4: Source consensus
+    int num_sources = count_sources(monitoring_sources);
+    int sufficient_confirmation = num_sources >= MIN_MONITORING_SOURCES;
+
+    ;; Validation 5: Amount matches (5% tolerance)
+    int amount_diff = 0;
+    if (claimed_amount > stolen_amount) {
+        amount_diff = claimed_amount - stolen_amount;
+    } else {
+        amount_diff = stolen_amount - claimed_amount;
+    }
+    int max_allowed_diff = muldiv(stolen_amount, 5, 100);
+    int amount_matches = amount_diff <= max_allowed_diff;
+
+    int is_valid = contract_is_exploited & exploit_found & timely_claim & sufficient_confirmation & amount_matches;
+
+    ;; Send verification result
+    cell response_body = begin_cell()
+        .store_uint(OP_RECEIVE_VERIFICATION, 32)
+        .store_uint(query_id, 64)
+        .store_uint(is_valid, 1)
+        .end_cell();
+
+    cell response_msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(claims_processor_address)
+        .store_coins(50000000)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_ref(response_body)
+        .end_cell();
+
+    send_raw_message(response_msg, 1);
+
+    emit_log(0x5C000,  ;; "SC" shortened  
+        begin_cell()
+            .store_uint(query_id, 64)
+            .store_uint(is_valid, 1)
+            .store_coins(claimed_amount)
+            .store_uint(num_sources, 8)
+            .end_cell().begin_parse());
+}
+
+;; ===== ADMIN FUNCTIONS =====
+
+() set_claims_processor(slice sender, slice new_processor) impure {
+    check_owner(sender);
+    claims_processor_address = new_processor;
+}
+
+() set_keeper(slice sender, slice new_keeper) impure {
+    check_owner(sender);
+    keeper_address = new_keeper;
+}
+
+;; ===== MESSAGE HANDLER =====
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) { return (); }
+
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) { return (); }
+
+    slice sender_address = cs~load_msg_addr();
+    load_data();
+
+    int op = in_msg_body~load_uint(32);
+
+    if (op == OP_VERIFY_CLAIM) {
+        int query_id = in_msg_body~load_uint(64);
+        int coverage_type = in_msg_body~load_uint(8);
+        int stablecoin_id = in_msg_body~load_uint(8);
+        cell evidence = in_msg_body~load_ref();
+        verify_contract_claim(sender_address, query_id, coverage_type, stablecoin_id, evidence);
+    } elseif (op == OP_REPORT_EXPLOIT) {
+        check_keeper(sender_address);
+        slice contract_address = in_msg_body~load_msg_addr();
+        int chain_id = in_msg_body~load_uint(8);
+        int exploit_timestamp = in_msg_body~load_uint(32);
+        int stolen_amount = in_msg_body~load_coins();
+        int tx_hash_high = in_msg_body~load_uint(128);
+        int tx_hash_low = in_msg_body~load_uint(128);
+        int monitoring_sources = in_msg_body~load_uint(8);
+        int contract_type = in_msg_body~load_uint(8);
+        report_exploit(contract_address, chain_id, exploit_timestamp, stolen_amount, tx_hash_high, tx_hash_low, monitoring_sources, contract_type);
+    } elseif (op == OP_UPDATE_CONTRACT_STATUS) {
+        check_keeper(sender_address);
+        slice contract_address = in_msg_body~load_msg_addr();
+        int status = in_msg_body~load_uint(8);
+        int current_tvl = in_msg_body~load_coins();
+        update_contract_status(contract_address, status, current_tvl);
+    } elseif (op == OP_SET_CLAIMS_PROCESSOR) {
+        slice new_processor = in_msg_body~load_msg_addr();
+        set_claims_processor(sender_address, new_processor);
+    } elseif (op == OP_SET_KEEPER) {
+        slice new_keeper = in_msg_body~load_msg_addr();
+        set_keeper(sender_address, new_keeper);
+    } else {
+        throw(0xffff);
+    }
+
+    save_data();
+}
+
+;; ===== GETTERS =====
+
+slice get_owner() method_id {
+    load_data();
+    return owner_address;
+}
+
+slice get_claims_processor() method_id {
+    load_data();
+    return claims_processor_address;
+}
+
+int get_total_exploits() method_id {
+    load_data();
+    return total_exploits_tracked;
+}
+
+(int, int, int, int) get_contract_info(slice contract_address) method_id {
+    load_data();
+    return get_contract_status(contract_address);
+}

@@ -1,0 +1,373 @@
+;; ConfigRegistry Contract - On-Chain Configuration Parameters
+;;
+;; Provides centralized, admin-controlled configuration for all protocol contracts
+;; Supports hot updates without contract redeployment
+;; Organized by category for easy management
+
+#include "../imports/stdlib.fc";
+
+;; Storage structure
+global slice owner_address;
+global cell config_data;  ;; Dictionary: category_hash -> config_cell
+
+() load_data() impure {
+    slice ds = get_data().begin_parse();
+    owner_address = ds~load_msg_addr();
+    config_data = ds~load_dict();
+}
+
+() save_data() impure {
+    set_data(begin_cell()
+        .store_slice(owner_address)
+        .store_dict(config_data)
+        .end_cell());
+}
+
+() check_owner(slice sender) impure {
+    throw_unless(403, equal_slices_bits(sender, owner_address));
+}
+
+;; Gas configuration parameters
+const int GAS_SIMPLE_MESSAGE = 10000000;        ;; 0.01 TON
+const int GAS_STANDARD_OPERATION = 30000000;    ;; 0.03 TON
+const int GAS_COMPLEX_OPERATION = 50000000;     ;; 0.05 TON
+const int GAS_HEAVY_OPERATION = 100000000;      ;; 0.1 TON
+const int GAS_WATERFALL_OPERATION = 150000000;  ;; 0.15 TON
+
+;; Timeout parameters (in seconds)
+const int TRANCHE_LOCK_TIMEOUT = 60;            ;; 60 seconds
+const int PREMIUM_QUOTE_VALIDITY = 30;          ;; 30 seconds
+const int ORACLE_MAX_STALENESS = 300;           ;; 5 minutes
+const int ORACLE_UPDATE_INTERVAL = 60;          ;; 1 minute
+
+;; Treasury split percentages (in basis points, 10000 = 100%)
+const int TREASURY_VAULT_SPLIT = 7000;          ;; 70% to vaults
+const int TREASURY_STAKER_SPLIT = 2000;         ;; 20% to stakers
+const int TREASURY_RESERVE_SPLIT = 1000;        ;; 10% to reserve
+
+;; Retry and circuit breaker parameters
+const int MAX_RETRY_COUNT = 3;
+const int CIRCUIT_BREAKER_THRESHOLD = 5;
+const int SEQ_NO_OVERFLOW_THRESHOLD = 4294967295;  ;; 2^32 - 1
+
+;; Minimum deposits and limits
+const int MIN_VAULT_DEPOSIT = 100000000;        ;; 0.1 TON
+const int MIN_POLICY_COVERAGE = 10000000000;    ;; 2 TON (at $5/TON = $10)
+const int MAX_POLICY_COVERAGE = 1000000000000;  ;; 200 TON (at $5/TON = $1000)
+
+;; Category hashes for configuration groups
+const int CATEGORY_GAS = 1;
+const int CATEGORY_TIMEOUTS = 2;
+const int CATEGORY_SPLITS = 3;
+const int CATEGORY_LIMITS = 4;
+const int CATEGORY_RETRY = 5;
+const int CATEGORY_ORACLE = 6;
+
+;; Get gas configuration
+(int, int, int, int, int) get_gas_config() method_id {
+    return (
+        GAS_SIMPLE_MESSAGE,
+        GAS_STANDARD_OPERATION,
+        GAS_COMPLEX_OPERATION,
+        GAS_HEAVY_OPERATION,
+        GAS_WATERFALL_OPERATION
+    );
+}
+
+;; Get specific gas amount by operation type
+;; op_type: 1=simple, 2=standard, 3=complex, 4=heavy, 5=waterfall
+int get_gas_for_operation(int op_type) method_id {
+    if (op_type == 1) { return GAS_SIMPLE_MESSAGE; }
+    if (op_type == 2) { return GAS_STANDARD_OPERATION; }
+    if (op_type == 3) { return GAS_COMPLEX_OPERATION; }
+    if (op_type == 4) { return GAS_HEAVY_OPERATION; }
+    if (op_type == 5) { return GAS_WATERFALL_OPERATION; }
+    return GAS_STANDARD_OPERATION;  ;; default
+}
+
+;; Get timeout configuration
+(int, int, int, int) get_timeout_config() method_id {
+    return (
+        TRANCHE_LOCK_TIMEOUT,
+        PREMIUM_QUOTE_VALIDITY,
+        ORACLE_MAX_STALENESS,
+        ORACLE_UPDATE_INTERVAL
+    );
+}
+
+;; Get Treasury split percentages
+(int, int, int) get_treasury_splits() method_id {
+    return (
+        TREASURY_VAULT_SPLIT,
+        TREASURY_STAKER_SPLIT,
+        TREASURY_RESERVE_SPLIT
+    );
+}
+
+;; Get retry and circuit breaker config
+(int, int, int) get_retry_config() method_id {
+    return (
+        MAX_RETRY_COUNT,
+        CIRCUIT_BREAKER_THRESHOLD,
+        SEQ_NO_OVERFLOW_THRESHOLD
+    );
+}
+
+;; Get policy and vault limits
+(int, int, int) get_limits() method_id {
+    return (
+        MIN_VAULT_DEPOSIT,
+        MIN_POLICY_COVERAGE,
+        MAX_POLICY_COVERAGE
+    );
+}
+
+;; Admin: Update gas configuration
+() update_gas_config(
+    slice sender,
+    int simple_msg,
+    int standard_op,
+    int complex_op,
+    int heavy_op,
+    int waterfall_op
+) impure {
+    check_owner(sender);
+
+    ;; Validate ranges (must be between 0.001 TON and 1 TON)
+    throw_unless(400, (simple_msg >= 1000000) & (simple_msg <= 1000000000));
+    throw_unless(401, (standard_op >= 1000000) & (standard_op <= 1000000000));
+    throw_unless(402, (complex_op >= 1000000) & (complex_op <= 1000000000));
+    throw_unless(403, (heavy_op >= 1000000) & (heavy_op <= 1000000000));
+    throw_unless(404, (waterfall_op >= 1000000) & (waterfall_op <= 1000000000));
+
+    ;; Store in config dictionary
+    cell gas_config = begin_cell()
+        .store_coins(simple_msg)
+        .store_coins(standard_op)
+        .store_coins(complex_op)
+        .store_coins(heavy_op)
+        .store_coins(waterfall_op)
+        .end_cell();
+
+    load_data();
+    config_data~udict_set(256, CATEGORY_GAS, gas_config.begin_parse());
+    save_data();
+
+    ;; Emit config update event
+    emit_log(0x10, begin_cell()
+        .store_uint(CATEGORY_GAS, 8)
+        .store_coins(simple_msg)
+        .store_coins(waterfall_op)
+        .end_cell().begin_parse());
+}
+
+;; Admin: Update timeout configuration
+() update_timeout_config(
+    slice sender,
+    int lock_timeout,
+    int quote_validity,
+    int oracle_staleness,
+    int oracle_interval
+) impure {
+    check_owner(sender);
+
+    ;; Validate ranges
+    throw_unless(410, (lock_timeout >= 10) & (lock_timeout <= 300));        ;; 10s - 5min
+    throw_unless(411, (quote_validity >= 10) & (quote_validity <= 120));    ;; 10s - 2min
+    throw_unless(412, (oracle_staleness >= 60) & (oracle_staleness <= 600)); ;; 1min - 10min
+    throw_unless(413, (oracle_interval >= 30) & (oracle_interval <= 300));  ;; 30s - 5min
+
+    cell timeout_config = begin_cell()
+        .store_uint(lock_timeout, 16)
+        .store_uint(quote_validity, 16)
+        .store_uint(oracle_staleness, 16)
+        .store_uint(oracle_interval, 16)
+        .end_cell();
+
+    load_data();
+    config_data~udict_set(256, CATEGORY_TIMEOUTS, timeout_config.begin_parse());
+    save_data();
+
+    emit_log(0x10, begin_cell()
+        .store_uint(CATEGORY_TIMEOUTS, 8)
+        .store_uint(lock_timeout, 16)
+        .store_uint(oracle_interval, 16)
+        .end_cell().begin_parse());
+}
+
+;; Admin: Update Treasury split percentages
+() update_treasury_splits(
+    slice sender,
+    int vault_split,
+    int staker_split,
+    int reserve_split
+) impure {
+    check_owner(sender);
+
+    ;; Validate splits sum to 100% (10000 basis points)
+    throw_unless(420, (vault_split + staker_split + reserve_split) == 10000);
+
+    ;; Validate reasonable ranges
+    throw_unless(421, (vault_split >= 5000) & (vault_split <= 8000));    ;; 50-80%
+    throw_unless(422, (staker_split >= 1000) & (staker_split <= 3000));  ;; 10-30%
+    throw_unless(423, (reserve_split >= 500) & (reserve_split <= 2000)); ;; 5-20%
+
+    cell splits_config = begin_cell()
+        .store_uint(vault_split, 16)
+        .store_uint(staker_split, 16)
+        .store_uint(reserve_split, 16)
+        .end_cell();
+
+    load_data();
+    config_data~udict_set(256, CATEGORY_SPLITS, splits_config.begin_parse());
+    save_data();
+
+    emit_log(0x10, begin_cell()
+        .store_uint(CATEGORY_SPLITS, 8)
+        .store_uint(vault_split, 16)
+        .store_uint(staker_split, 16)
+        .store_uint(reserve_split, 16)
+        .end_cell().begin_parse());
+}
+
+;; Admin: Update policy and vault limits
+() update_limits(
+    slice sender,
+    int min_deposit,
+    int min_coverage,
+    int max_coverage
+) impure {
+    check_owner(sender);
+
+    ;; Validate ranges
+    throw_unless(430, (min_deposit >= 10000000) & (min_deposit <= 1000000000));   ;; 0.01-1 TON
+    throw_unless(431, (min_coverage >= 1000000000) & (min_coverage <= 100000000000)); ;; 1-100 TON
+    throw_unless(432, (max_coverage >= min_coverage) & (max_coverage <= 10000000000000)); ;; up to 10k TON
+
+    cell limits_config = begin_cell()
+        .store_coins(min_deposit)
+        .store_coins(min_coverage)
+        .store_coins(max_coverage)
+        .end_cell();
+
+    load_data();
+    config_data~udict_set(256, CATEGORY_LIMITS, limits_config.begin_parse());
+    save_data();
+
+    emit_log(0x10, begin_cell()
+        .store_uint(CATEGORY_LIMITS, 8)
+        .store_coins(min_deposit)
+        .store_coins(max_coverage)
+        .end_cell().begin_parse());
+}
+
+;; Get custom config by category
+cell get_config_by_category(int category) method_id {
+    load_data();
+    (slice config_slice, int found) = config_data.udict_get?(256, category);
+
+    if (found) {
+        return begin_cell().store_slice(config_slice).end_cell();
+    }
+
+    ;; Return empty cell if not found
+    return begin_cell().end_cell();
+}
+
+;; Admin: Transfer ownership
+() transfer_ownership(slice sender, slice new_owner) impure {
+    check_owner(sender);
+    load_data();
+    owner_address = new_owner;
+    save_data();
+
+    emit_log(0x20, begin_cell()
+        .store_slice(new_owner)
+        .end_cell().begin_parse());
+}
+
+;; Get methods for UI/monitoring
+slice get_owner() method_id {
+    load_data();
+    return owner_address;
+}
+
+;; Get all configuration as tuple for bulk retrieval
+(
+    (int, int, int, int, int),  ;; gas_config
+    (int, int, int, int),        ;; timeout_config
+    (int, int, int),             ;; treasury_splits
+    (int, int, int),             ;; limits
+    (int, int, int)              ;; retry_config
+) get_all_config() method_id {
+    return (
+        get_gas_config(),
+        get_timeout_config(),
+        get_treasury_splits(),
+        get_limits(),
+        get_retry_config()
+    );
+}
+
+;; Recv internal
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) {
+        return ();  ;; Ignore empty messages
+    }
+
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) {
+        return ();  ;; Ignore bounced messages
+    }
+    slice sender = cs~load_msg_addr();
+
+    int op = in_msg_body~load_uint(32);
+
+    if (op == 0x01) {  ;; update_gas_config
+        int simple_msg = in_msg_body~load_coins();
+        int standard_op = in_msg_body~load_coins();
+        int complex_op = in_msg_body~load_coins();
+        int heavy_op = in_msg_body~load_coins();
+        int waterfall_op = in_msg_body~load_coins();
+        update_gas_config(sender, simple_msg, standard_op, complex_op, heavy_op, waterfall_op);
+        return ();
+    }
+
+    if (op == 0x02) {  ;; update_timeout_config
+        int lock_timeout = in_msg_body~load_uint(16);
+        int quote_validity = in_msg_body~load_uint(16);
+        int oracle_staleness = in_msg_body~load_uint(16);
+        int oracle_interval = in_msg_body~load_uint(16);
+        update_timeout_config(sender, lock_timeout, quote_validity, oracle_staleness, oracle_interval);
+        return ();
+    }
+
+    if (op == 0x03) {  ;; update_treasury_splits
+        int vault_split = in_msg_body~load_uint(16);
+        int staker_split = in_msg_body~load_uint(16);
+        int reserve_split = in_msg_body~load_uint(16);
+        update_treasury_splits(sender, vault_split, staker_split, reserve_split);
+        return ();
+    }
+
+    if (op == 0x04) {  ;; update_limits
+        int min_deposit = in_msg_body~load_coins();
+        int min_coverage = in_msg_body~load_coins();
+        int max_coverage = in_msg_body~load_coins();
+        update_limits(sender, min_deposit, min_coverage, max_coverage);
+        return ();
+    }
+
+    if (op == 0x10) {  ;; transfer_ownership
+        slice new_owner = in_msg_body~load_msg_addr();
+        transfer_ownership(sender, new_owner);
+        return ();
+    }
+
+    throw(0xffff);  ;; Unknown operation
+}
+
+;; Event IDs:
+;; 0x10: ConfigUpdated (category, parameters)
+;; 0x20: OwnershipTransferred (new_owner)

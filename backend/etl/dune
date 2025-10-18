@@ -1,0 +1,22 @@
+(library
+ (name etl)
+ (public_name tonsurance.etl)
+ (libraries
+   core
+   lwt
+   lwt.unix
+   logs
+   logs.lwt
+   cohttp
+   cohttp-lwt-unix
+   yojson
+   caqti
+   caqti-lwt.unix
+   caqti-driver-postgresql
+   math)
+ (modules
+   depeg_event_ingestion
+   correlation_matrix_updater
+   data_validation)
+ (flags (:standard -w -49))
+ (preprocess (pps lwt_ppx ppx_sexp_conv ppx_deriving_yojson)))

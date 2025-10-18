@@ -89,6 +89,18 @@ export const BridgeHealthIndicator = ({
           last_updated: Date.now() / 1000,
           exploit_detected: false,
           status: 'poor'
+        },
+        {
+          bridge_id: 'wormhole_sol_ton',
+          source_chain: 'Solana',
+          dest_chain: 'TON',
+          current_tvl_usd: 22_000_000,
+          previous_tvl_usd: 21_000_000,
+          health_score: 0.85,
+          risk_multiplier: 1.15,
+          last_updated: Date.now() / 1000,
+          exploit_detected: false,
+          status: 'good'
         }
       ];
 
@@ -112,12 +124,12 @@ export const BridgeHealthIndicator = ({
 
   const getHealthColor = (status: string) => {
     switch (status) {
-      case 'excellent': return 'text-green-400';
-      case 'good': return 'text-green-300';
-      case 'moderate': return 'text-yellow-400';
-      case 'poor': return 'text-orange-400';
-      case 'critical': return 'text-red-400';
-      default: return 'text-gray-400';
+      case 'excellent': return 'text-terminal-green';
+      case 'good': return 'text-terminal-green';
+      case 'moderate': return 'text-copper-500';
+      case 'poor': return 'text-copper-700';
+      case 'critical': return 'text-terminal-red';
+      default: return 'text-text-tertiary';
     }
   };
 
@@ -147,8 +159,8 @@ export const BridgeHealthIndicator = ({
 
   if (isLoading) {
     return (
-      <div className="border border-gray-700 bg-black/50 p-4">
-        <div className="font-mono text-sm text-gray-400 animate-pulse">
+      <div className="border-2 border-cream-400 bg-cream-300/30 p-4">
+        <div className="font-mono text-sm text-text-secondary animate-pulse">
           Loading bridge health data...
         </div>
       </div>
@@ -157,8 +169,8 @@ export const BridgeHealthIndicator = ({
 
   if (bridgeHealth.length === 0) {
     return (
-      <div className="border border-gray-700 bg-black/50 p-4">
-        <div className="font-mono text-sm text-gray-400">
+      <div className="border-2 border-cream-400 bg-cream-300/30 p-4">
+        <div className="font-mono text-sm text-text-secondary">
           No bridge data available
         </div>
       </div>
@@ -168,12 +180,12 @@ export const BridgeHealthIndicator = ({
   return (
     <div className="space-y-4">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <h3 className="text-green-400 font-mono text-sm">
-          BRIDGE HEALTH MONITOR
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="text-text-secondary font-mono text-xs font-semibold uppercase">
+          Bridge Health Monitor
         </h3>
-        <div className="text-xs text-gray-500 font-mono">
-          Last updated: {formatTimeAgo(lastUpdate.getTime() / 1000)}
+        <div className="text-xs text-text-tertiary font-mono">
+          Updated: {formatTimeAgo(lastUpdate.getTime() / 1000)}
         </div>
       </div>
 
@@ -187,12 +199,12 @@ export const BridgeHealthIndicator = ({
             <div
               key={bridge.bridge_id}
               className={`
-                border-2 p-4 transition-all
-                ${bridge.status === 'excellent' ? 'border-green-400/30 bg-green-400/5' :
-                  bridge.status === 'good' ? 'border-green-400/20 bg-green-400/3' :
-                  bridge.status === 'moderate' ? 'border-yellow-400/30 bg-yellow-400/5' :
-                  bridge.status === 'poor' ? 'border-orange-400/30 bg-orange-400/5' :
-                  'border-red-400/50 bg-red-400/10'}
+                border-3 p-4 transition-all
+                ${bridge.status === 'excellent' ? 'border-terminal-green/40 bg-terminal-green/5' :
+                  bridge.status === 'good' ? 'border-terminal-green/30 bg-terminal-green/3' :
+                  bridge.status === 'moderate' ? 'border-copper-400/40 bg-copper-50/30' :
+                  bridge.status === 'poor' ? 'border-copper-600/50 bg-copper-100/30' :
+                  'border-terminal-red/50 bg-terminal-red/10'}
               `}
             >
               {/* Bridge Header */}
@@ -200,17 +212,17 @@ export const BridgeHealthIndicator = ({
                 <div className="flex items-center gap-3">
                   <span className="text-2xl">{getHealthEmoji(bridge.status)}</span>
                   <div className="font-mono">
-                    <div className="text-sm text-gray-300">
+                    <div className="text-sm text-text-primary font-semibold">
                       {bridge.source_chain} → {bridge.dest_chain}
                     </div>
-                    <div className="text-xs text-gray-500">{bridge.bridge_id}</div>
+                    <div className="text-xs text-text-tertiary">{bridge.bridge_id}</div>
                   </div>
                 </div>
                 <div className="text-right">
                   <div className={`text-lg font-bold font-mono ${getHealthColor(bridge.status)}`}>
                     {(bridge.health_score * 100).toFixed(0)}%
                   </div>
-                  <div className="text-xs text-gray-400 font-mono uppercase">
+                  <div className="text-xs text-text-tertiary font-mono uppercase">
                     {bridge.status}
                   </div>
                 </div>
@@ -219,34 +231,34 @@ export const BridgeHealthIndicator = ({
               {/* Bridge Metrics */}
               <div className="grid grid-cols-3 gap-4 font-mono text-xs">
                 <div>
-                  <div className="text-gray-500 mb-1">TVL</div>
-                  <div className="text-gray-300">{formatTVL(bridge.current_tvl_usd)}</div>
-                  <div className={`text-[10px] ${tvlChange >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  <div className="text-text-tertiary mb-1">TVL</div>
+                  <div className="text-text-primary font-semibold">{formatTVL(bridge.current_tvl_usd)}</div>
+                  <div className={`text-[10px] ${tvlChange >= 0 ? 'text-terminal-green' : 'text-terminal-red'}`}>
                     {tvlChange >= 0 ? '+' : ''}{tvlChangePercent.toFixed(1)}%
                   </div>
                 </div>
 
                 <div>
-                  <div className="text-gray-500 mb-1">Risk Multiplier</div>
-                  <div className={`${getHealthColor(bridge.status)}`}>
+                  <div className="text-text-tertiary mb-1">Risk Multiplier</div>
+                  <div className={`font-semibold ${getHealthColor(bridge.status)}`}>
                     {bridge.risk_multiplier.toFixed(1)}x
                   </div>
-                  <div className="text-[10px] text-gray-500">
+                  <div className="text-[10px] text-text-tertiary">
                     {bridge.risk_multiplier > 1.5 ? 'High risk' :
                      bridge.risk_multiplier > 1.2 ? 'Moderate risk' : 'Low risk'}
                   </div>
                 </div>
 
                 <div>
-                  <div className="text-gray-500 mb-1">Status</div>
-                  <div className="text-gray-300">
+                  <div className="text-text-tertiary mb-1">Status</div>
+                  <div className="text-text-primary">
                     {bridge.exploit_detected ? (
-                      <span className="text-red-400">⚠️ Alert</span>
+                      <span className="text-terminal-red font-semibold">⚠️ Alert</span>
                     ) : (
-                      <span className="text-green-400">✓ Normal</span>
+                      <span className="text-terminal-green font-semibold">✓ Normal</span>
                     )}
                   </div>
-                  <div className="text-[10px] text-gray-500">
+                  <div className="text-[10px] text-text-tertiary">
                     {formatTimeAgo(bridge.last_updated)}
                   </div>
                 </div>
@@ -254,8 +266,8 @@ export const BridgeHealthIndicator = ({
 
               {/* Warning for high risk */}
               {bridge.risk_multiplier > 1.5 && (
-                <div className="mt-3 pt-3 border-t border-gray-700">
-                  <div className="text-xs text-orange-400 font-mono">
+                <div className="mt-3 pt-3 border-t-2 border-cream-400">
+                  <div className="text-xs text-copper-600 font-mono font-semibold">
                     ⚠️ Bridge showing elevated risk - premiums increased by {((bridge.risk_multiplier - 1) * 100).toFixed(0)}%
                   </div>
                 </div>
@@ -263,8 +275,8 @@ export const BridgeHealthIndicator = ({
 
               {/* Critical alert */}
               {bridge.exploit_detected && (
-                <div className="mt-3 pt-3 border-t border-red-400">
-                  <div className="text-xs text-red-400 font-mono font-bold">
+                <div className="mt-3 pt-3 border-t-2 border-terminal-red">
+                  <div className="text-xs text-terminal-red font-mono font-bold">
                     🚨 SECURITY ALERT: Potential exploit detected. New policies temporarily suspended.
                   </div>
                 </div>
@@ -275,29 +287,29 @@ export const BridgeHealthIndicator = ({
       </div>
 
       {/* Overall summary */}
-      <div className="border border-gray-700 bg-black/50 p-4">
+      <div className="border-2 border-cream-400 bg-cream-300/50 p-4">
         <div className="font-mono text-xs space-y-2">
-          <div className="text-gray-400 mb-2">NETWORK SUMMARY</div>
+          <div className="text-text-secondary font-semibold mb-2 uppercase">Network Summary</div>
           <div className="grid grid-cols-4 gap-4">
             <div>
-              <div className="text-gray-500">Total Bridges</div>
-              <div className="text-green-400 text-lg">{bridgeHealth.length}</div>
+              <div className="text-text-tertiary mb-1">Total Bridges</div>
+              <div className="text-copper-500 text-lg font-bold">{bridgeHealth.length}</div>
             </div>
             <div>
-              <div className="text-gray-500">Healthy</div>
-              <div className="text-green-400 text-lg">
+              <div className="text-text-tertiary mb-1">Healthy</div>
+              <div className="text-terminal-green text-lg font-bold">
                 {bridgeHealth.filter(b => b.status === 'excellent' || b.status === 'good').length}
               </div>
             </div>
             <div>
-              <div className="text-gray-500">At Risk</div>
-              <div className="text-yellow-400 text-lg">
+              <div className="text-text-tertiary mb-1">At Risk</div>
+              <div className="text-copper-500 text-lg font-bold">
                 {bridgeHealth.filter(b => b.status === 'moderate' || b.status === 'poor').length}
               </div>
             </div>
             <div>
-              <div className="text-gray-500">Critical</div>
-              <div className="text-red-400 text-lg">
+              <div className="text-text-tertiary mb-1">Critical</div>
+              <div className="text-terminal-red text-lg font-bold">
                 {bridgeHealth.filter(b => b.status === 'critical').length}
               </div>
             </div>

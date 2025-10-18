@@ -1,0 +1,488 @@
+;; PolicyRouter Contract - Entry Point for Sharded Policy System
+;; Routes policy operations to 256 PolicyShard contracts
+;; Maintains shard registry and sequential policy ID assignment
+;; Gas target: <20k per routing operation (O(1) lookup)
+
+#include "../imports/stdlib.fc";
+#include "../libs/async_helpers.fc";
+#include "../libs/risk_multipliers.fc";
+
+;; ===== STORAGE STRUCTURE =====
+;; owner_address: slice
+;; next_policy_id: uint64 (sequential counter, monotonically increasing)
+;; total_policies: uint64 (aggregate count across all shards)
+;; paused: uint1 (emergency pause flag)
+;; shard_addresses: cell (dict<uint8, slice> - 256 entries, shard_id -> shard_address)
+;; treasury_address: slice (receives premiums)
+;; pending_txs: cell (for async operation tracking)
+;; seq_no: uint32 (sequence number for 2PC transactions)
+
+global slice owner_address;
+global int next_policy_id;
+global int total_policies;
+global int paused;
+global cell shard_addresses;
+global slice treasury_address;
+global cell pending_txs;
+global int seq_no;
+
+() load_data() impure {
+    slice ds = get_data().begin_parse();
+    owner_address = ds~load_msg_addr();
+    next_policy_id = ds~load_uint(64);
+    total_policies = ds~load_uint(64);
+    paused = ds~load_uint(1);
+    shard_addresses = ds~load_dict();
+    treasury_address = ds~load_msg_addr();
+    pending_txs = ds~load_dict();
+    seq_no = ds~load_uint(32);
+}
+
+() save_data() impure {
+    set_data(begin_cell()
+        .store_slice(owner_address)
+        .store_uint(next_policy_id, 64)
+        .store_uint(total_policies, 64)
+        .store_uint(paused, 1)
+        .store_dict(shard_addresses)
+        .store_slice(treasury_address)
+        .store_dict(pending_txs)
+        .store_uint(seq_no, 32)
+        .end_cell());
+}
+
+;; ===== ACCESS CONTROL =====
+
+() check_owner(slice sender_address) impure inline {
+    throw_unless(403, equal_slices_bits(sender_address, owner_address));
+}
+
+() check_not_paused() impure inline {
+    throw_if(423, paused);
+}
+
+;; ===== ROUTING LOGIC =====
+
+;; Calculate shard ID for a given policy ID
+;; Formula: shard_id = policy_id % 256
+;; Gas: O(1), ~100 gas
+int get_shard_id(int policy_id) inline {
+    return policy_id % 256;
+}
+
+;; Get shard address for a given shard ID
+;; Gas: O(1) dict lookup in 256-entry dict, ~1,000 gas
+(slice, int) get_shard_address(int shard_id) inline {
+    (slice shard_address, int found) = shard_addresses.udict_get?(8, shard_id);
+    return (shard_address, found);
+}
+
+;; ===== POLICY CREATION =====
+
+;; Create policy (routes to appropriate shard)
+;; Gas target: <20k (routing + message creation)
+() create_policy(
+    int msg_value,
+    slice user_address,
+    int coverage_type,
+    int chain_id,
+    int stablecoin_id,
+    int coverage_amount,
+    int duration_days
+) impure {
+    check_not_paused();
+
+    ;; Validate inputs (same as PolicyFactory)
+    throw_unless(400, coverage_amount >= 10000000000);   ;; Min $10
+    throw_unless(401, coverage_amount <= 1000000000000); ;; Max $1000
+    validate_coverage_type(coverage_type);
+    validate_chain_id(chain_id);
+    validate_stablecoin_id(stablecoin_id);
+    throw_unless(406,
+        (duration_days == 30) | (duration_days == 90) | (duration_days == 180)
+    );
+    int is_valid_pair = validate_chain_stablecoin_pair(chain_id, stablecoin_id);
+    throw_unless(407, is_valid_pair);
+
+    ;; Calculate premium (same logic as PolicyFactory)
+    int calculated_premium = calculate_multi_dimensional_premium(
+        coverage_type,
+        chain_id,
+        stablecoin_id,
+        coverage_amount,
+        duration_days
+    );
+
+    ;; Verify user paid enough
+    int min_payment = calculated_premium + 100000000;  ;; Premium + 0.1 TON gas for routing
+    throw_unless(404, msg_value >= min_payment);
+
+    ;; Assign sequential policy ID
+    int policy_id = next_policy_id;
+    next_policy_id += 1;
+    total_policies += 1;
+
+    ;; Route to appropriate shard (O(1))
+    int shard_id = get_shard_id(policy_id);
+    var (shard_address, found) = get_shard_address(shard_id);
+    throw_unless(408, found);  ;; Shard not registered
+
+    ;; Track transaction for bounce handling
+    int tx_id = init_2pc_transaction(seq_no);
+    seq_no += 1;
+
+    pending_txs = store_tx_state(
+        pending_txs,
+        tx_id,
+        TX_STATE_INITIATED,
+        0,
+        now(),
+        0x60,  ;; op::create_policy_sharded
+        calculated_premium,
+        shard_address
+    );
+
+    ;; Send async message to PolicyShard
+    ;; Includes all policy data to minimize cross-contract calls
+    cell msg = begin_cell()
+        .store_uint(0x18, 6)                          ;; bounceable
+        .store_slice(shard_address)                   ;; destination shard
+        .store_coins(80000000)                        ;; 0.08 TON for gas (shard operation + user confirmation)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)  ;; message headers
+        .store_uint(0x60, 32)                         ;; op::create_policy_sharded
+        .store_uint(policy_id, 64)
+        .store_slice(user_address)
+        .store_uint(coverage_type, 8)
+        .store_uint(chain_id, 8)
+        .store_uint(stablecoin_id, 8)
+        .store_coins(coverage_amount)
+        .store_uint(duration_days, 16)
+        .store_coins(calculated_premium)
+        .end_cell();
+    send_raw_message(msg, 1);
+
+    ;; Forward premium to treasury (same as PolicyFactory)
+    cell premium_msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(treasury_address)
+        .store_coins(calculated_premium)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(0x01, 32)  ;; op: receive_premium
+        .store_uint(tx_id, 64)
+        .store_uint(policy_id, 64)
+        .store_coins(calculated_premium)
+        .end_cell();
+    send_raw_message(premium_msg, 1);
+
+    save_data();
+
+    ;; Refund excess payment to user
+    int excess = msg_value - calculated_premium - 100000000;
+    if (excess > 0) {
+        cell refund_msg = begin_cell()
+            .store_uint(0x18, 6)
+            .store_slice(user_address)
+            .store_coins(excess)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .end_cell();
+        send_raw_message(refund_msg, 1);
+    }
+
+    ;; Emit PolicyRoutedToShard event for tracking
+    emit_log(0x54, begin_cell()
+        .store_uint(policy_id, 64)
+        .store_uint(shard_id, 8)
+        .store_slice(user_address)
+        .store_uint(coverage_type, 8)
+        .store_uint(chain_id, 8)
+        .store_uint(stablecoin_id, 8)
+        .store_coins(coverage_amount)
+        .store_uint(duration_days, 16)
+        .store_coins(calculated_premium)
+        .end_cell().begin_parse());
+}
+
+;; ===== SHARD MANAGEMENT =====
+
+;; Register shard address (owner only, during deployment)
+() register_shard(slice sender_address, int shard_id, slice shard_address) impure {
+    check_owner(sender_address);
+    throw_unless(400, (shard_id >= 0) & (shard_id < 256));
+
+    ;; Check if shard already registered (prevent accidental override)
+    var (existing, found) = shard_addresses.udict_get?(8, shard_id);
+    if (found) {
+        ;; Shard already registered - require special override permission
+        ;; In production, this would check a timelock or multi-sig
+        throw(409);  ;; Conflict - shard already registered
+    }
+
+    shard_addresses~udict_set(8, shard_id, shard_address);
+    save_data();
+
+    emit_log(0x55, begin_cell()
+        .store_uint(shard_id, 8)
+        .store_slice(shard_address)
+        .end_cell().begin_parse());
+}
+
+;; Override shard address (owner only, for shard upgrades/fixes)
+;; Requires explicit override operation to prevent accidents
+() override_shard_address(slice sender_address, int shard_id, slice new_shard_address) impure {
+    check_owner(sender_address);
+    throw_unless(400, (shard_id >= 0) & (shard_id < 256));
+
+    shard_addresses~udict_set(8, shard_id, new_shard_address);
+    save_data();
+
+    emit_log(0x56, begin_cell()
+        .store_uint(shard_id, 8)
+        .store_slice(new_shard_address)
+        .end_cell().begin_parse());
+}
+
+;; Batch register shards (gas-efficient for deployment)
+() batch_register_shards(slice sender_address, cell batch_data_cell) impure {
+    check_owner(sender_address);
+
+    slice batch_data = batch_data_cell.begin_parse();
+    int count = batch_data~load_uint(8);  ;; Number of shards in batch
+
+    int i = 0;
+    while (i < count) {
+        int shard_id = batch_data~load_uint(8);
+        slice shard_address = batch_data~load_msg_addr();
+
+        ;; Check shard not already registered
+        var (existing, found) = shard_addresses.udict_get?(8, shard_id);
+        throw_if(409, found);  ;; Conflict
+
+        shard_addresses~udict_set(8, shard_id, shard_address);
+        i += 1;
+    }
+
+    save_data();
+
+    emit_log(0x57, begin_cell()
+        .store_uint(count, 8)
+        .end_cell().begin_parse());
+}
+
+;; ===== QUERY METHODS =====
+
+;; Get policy shard address (for frontend queries)
+;; Returns the shard address that stores this policy
+slice get_policy_shard_address(int policy_id) method_id {
+    load_data();
+    int shard_id = get_shard_id(policy_id);
+    var (shard_address, found) = get_shard_address(shard_id);
+    throw_unless(404, found);
+    return shard_address;
+}
+
+;; Get next policy ID
+int get_next_policy_id() method_id {
+    load_data();
+    return next_policy_id;
+}
+
+;; Get total policies across all shards
+int get_total_policies() method_id {
+    load_data();
+    return total_policies;
+}
+
+;; Get shard address by shard ID
+slice get_shard_by_id(int shard_id) method_id {
+    load_data();
+    throw_unless(400, (shard_id >= 0) & (shard_id < 256));
+    var (shard_address, found) = get_shard_address(shard_id);
+    throw_unless(404, found);
+    return shard_address;
+}
+
+;; Check if all shards registered (returns count of registered shards)
+int get_registered_shard_count() method_id {
+    load_data();
+
+    int count = 0;
+    int shard_id = 0;
+    while (shard_id < 256) {
+        var (addr, found) = shard_addresses.udict_get?(8, shard_id);
+        if (found) {
+            count += 1;
+        }
+        shard_id += 1;
+    }
+
+    return count;
+}
+
+;; Calculate premium (external method for frontend quotes)
+int calculate_premium_external(
+    int coverage_type,
+    int chain_id,
+    int stablecoin_id,
+    int coverage_amount,
+    int duration_days
+) method_id {
+    return calculate_multi_dimensional_premium(
+        coverage_type,
+        chain_id,
+        stablecoin_id,
+        coverage_amount,
+        duration_days
+    );
+}
+
+;; ===== ADMIN FUNCTIONS =====
+
+() pause_router(slice sender_address) impure {
+    check_owner(sender_address);
+    paused = 1;
+    save_data();
+
+    emit_log(0x58, begin_cell()
+        .store_uint(1, 1)  ;; paused = true
+        .end_cell().begin_parse());
+}
+
+() unpause_router(slice sender_address) impure {
+    check_owner(sender_address);
+    paused = 0;
+    save_data();
+
+    emit_log(0x58, begin_cell()
+        .store_uint(0, 1)  ;; paused = false
+        .end_cell().begin_parse());
+}
+
+() set_treasury_address(slice sender_address, slice new_treasury) impure {
+    check_owner(sender_address);
+    treasury_address = new_treasury;
+    save_data();
+}
+
+;; ===== BOUNCE HANDLING =====
+
+() handle_bounce(slice in_msg_body) impure {
+    load_data();
+
+    var (op, original_value, sender_address, success) = parse_bounced_message(in_msg_body);
+
+    if (~ success) {
+        return ();
+    }
+
+    if (op == 0x60) {  ;; create_policy_sharded bounced
+        int tx_id = 0;
+        if (in_msg_body.slice_bits() >= 96) {
+            in_msg_body~skip_bits(32);
+            in_msg_body~skip_bits(32);
+            tx_id = in_msg_body~load_uint(64);
+        }
+
+        pending_txs = update_tx_state(pending_txs, tx_id, TX_STATE_ABORTED);
+
+        emit_log(0x59, begin_cell()
+            .store_uint(tx_id, 64)
+            .store_uint(op, 32)
+            .store_coins(original_value)
+            .end_cell().begin_parse());
+
+        if (tx_id == next_policy_id - 1) {
+            next_policy_id -= 1;
+            total_policies -= 1;
+        }
+
+        save_data();
+        return ();
+    }
+
+    emit_log(0x5A, begin_cell()
+        .store_uint(op, 32)
+        .store_coins(original_value)
+        .end_cell().begin_parse());
+}
+
+;; ===== MESSAGE HANDLING =====
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) {
+        return ();
+    }
+
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+
+    ;; Handle bounces
+    if (flags & 1) {
+        handle_bounce(in_msg_body);
+        return ();
+    }
+
+    slice sender_address = cs~load_msg_addr();
+
+    load_data();
+
+    int op = in_msg_body~load_uint(32);
+
+    if (op == 0x01) {  ;; create_policy (multi-dimensional)
+        int coverage_type = in_msg_body~load_uint(8);
+        int chain_id = in_msg_body~load_uint(8);
+        int stablecoin_id = in_msg_body~load_uint(8);
+        int coverage_amount = in_msg_body~load_coins();
+        int duration_days = in_msg_body~load_uint(16);
+
+        create_policy(msg_value, sender_address, coverage_type, chain_id,
+                     stablecoin_id, coverage_amount, duration_days);
+        return ();
+    }
+
+    if (op == 0x10) {  ;; register_shard
+        int shard_id = in_msg_body~load_uint(8);
+        slice shard_address = in_msg_body~load_msg_addr();
+        register_shard(sender_address, shard_id, shard_address);
+        return ();
+    }
+
+    if (op == 0x11) {  ;; override_shard_address
+        int shard_id = in_msg_body~load_uint(8);
+        slice new_shard_address = in_msg_body~load_msg_addr();
+        override_shard_address(sender_address, shard_id, new_shard_address);
+        return ();
+    }
+
+    if (op == 0x12) {  ;; batch_register_shards
+        cell batch_data = in_msg_body~load_ref();
+        batch_register_shards(sender_address, batch_data);
+        return ();
+    }
+
+    if (op == 0x20) {  ;; pause_router
+        pause_router(sender_address);
+        return ();
+    }
+
+    if (op == 0x21) {  ;; unpause_router
+        unpause_router(sender_address);
+        return ();
+    }
+
+    if (op == 0x22) {  ;; set_treasury_address
+        slice new_treasury = in_msg_body~load_msg_addr();
+        set_treasury_address(sender_address, new_treasury);
+        return ();
+    }
+
+    throw(0xffff);  ;; Unknown operation
+}
+
+;; ===== EVENT IDs (for emit_log) =====
+;; 0x54: PolicyRoutedToShard
+;; 0x55: ShardRegistered
+;; 0x56: ShardAddressOverridden
+;; 0x57: ShardsRegisteredBatch
+;; 0x58: RouterPausedUnpaused
+;; 0x59: PolicyCreationBounced
+;; 0x5A: UnknownBounce

@@ -1,0 +1,381 @@
+name: Deploy to Testnet
+
+on:
+  push:
+    branches:
+      - develop
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '18'
+  OCAML_VERSION: '4.14.1'
+
+jobs:
+  # ============================================================================
+  # JOB 1: Run Tests
+  # ============================================================================
+  test:
+    name: Run Test Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run contract tests
+        run: npm run test:contracts
+        timeout-minutes: 10
+
+      - name: Run service tests
+        run: npm run test:services
+        timeout-minutes: 10
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results
+          path: |
+            test-results/
+            coverage/
+
+      - name: Check coverage thresholds
+        run: |
+          COVERAGE=$(grep -Po '"lines":\{"total":\d+,"covered":\d+,"skipped":\d+,"pct":\K[\d.]+' coverage/coverage-summary.json)
+          echo "Coverage: ${COVERAGE}%"
+          if (( $(echo "$COVERAGE < 90" | bc -l) )); then
+            echo "❌ Coverage below 90% threshold"
+            exit 1
+          fi
+          echo "✅ Coverage meets 90% threshold"
+
+  # ============================================================================
+  # JOB 2: Build Contracts and Services
+  # ============================================================================
+  build:
+    name: Build Contracts and Services
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Setup OCaml
+        uses: ocaml/setup-ocaml@v2
+        with:
+          ocaml-compiler: ${{ env.OCAML_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          cd backend && opam install . --deps-only --yes
+
+      - name: Build smart contracts
+        run: npm run build:contracts
+        timeout-minutes: 5
+
+      - name: Build OCaml backend
+        run: npm run build:backend
+        timeout-minutes: 5
+
+      - name: Build TypeScript services
+        run: npm run build:services
+        timeout-minutes: 3
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-artifacts
+          path: |
+            build/
+            backend/_build/
+            services/dist/
+
+  # ============================================================================
+  # JOB 3: Deploy Smart Contracts to Testnet
+  # ============================================================================
+  deploy-contracts:
+    name: Deploy Smart Contracts
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 30
+    environment: testnet
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: build-artifacts
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Deploy PricingOracle
+        run: npx blueprint run deployPricingOracle --testnet --no-compile
+        env:
+          DEPLOYER_MNEMONIC: ${{ secrets.TESTNET_DEPLOYER_MNEMONIC }}
+          ADMIN_ADDRESS: ${{ secrets.TESTNET_ADMIN_ADDRESS }}
+          KEEPER_ADDRESS: ${{ secrets.TESTNET_KEEPER_ADDRESS }}
+        timeout-minutes: 5
+
+      - name: Deploy MultiTrancheVault
+        run: npx blueprint run deployMultiTrancheVault --testnet --no-compile
+        env:
+          DEPLOYER_MNEMONIC: ${{ secrets.TESTNET_DEPLOYER_MNEMONIC }}
+          ADMIN_ADDRESS: ${{ secrets.TESTNET_ADMIN_ADDRESS }}
+          CLAIMS_PROCESSOR_ADDRESS: ${{ secrets.TESTNET_CLAIMS_PROCESSOR_ADDRESS }}
+        timeout-minutes: 10
+
+      - name: Deploy PolicySharding (limited shards for testnet)
+        run: |
+          # Only deploy 16 shards on testnet (not full 256)
+          export SHARD_COUNT=16
+          npx blueprint run deployPolicySharding --testnet --no-compile
+        env:
+          DEPLOYER_MNEMONIC: ${{ secrets.TESTNET_DEPLOYER_MNEMONIC }}
+          ADMIN_ADDRESS: ${{ secrets.TESTNET_ADMIN_ADDRESS }}
+        timeout-minutes: 10
+
+      - name: Save deployment addresses
+        run: |
+          echo "PRICING_ORACLE_ADDRESS=$(cat deployments/pricing-oracle-testnet-latest.json | jq -r .address)" >> $GITHUB_ENV
+          echo "VAULT_ADDRESS=$(cat deployments/multi-tranche-vault-testnet-latest.json | jq -r .vault.address)" >> $GITHUB_ENV
+          echo "ROUTER_ADDRESS=$(cat deployments/policy-sharding-testnet-latest.json | jq -r .router.address)" >> $GITHUB_ENV
+
+      - name: Upload deployment manifests
+        uses: actions/upload-artifact@v3
+        with:
+          name: deployment-manifests
+          path: deployments/*.json
+
+  # ============================================================================
+  # JOB 4: Run Database Migrations
+  # ============================================================================
+  migrate-database:
+    name: Run Database Migrations
+    runs-on: ubuntu-latest
+    needs: deploy-contracts
+    timeout-minutes: 10
+    environment: testnet
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Run migrations
+        run: |
+          for migration in backend/migrations/*.sql; do
+            echo "Running migration: $migration"
+            psql "$DATABASE_URL" -f "$migration"
+          done
+        env:
+          DATABASE_URL: ${{ secrets.TESTNET_DATABASE_URL }}
+
+      - name: Verify migration
+        run: |
+          psql "$DATABASE_URL" -c "SELECT * FROM pricing_oracle_updates LIMIT 1;"
+          psql "$DATABASE_URL" -c "SELECT * FROM product_exposure LIMIT 1;"
+        env:
+          DATABASE_URL: ${{ secrets.TESTNET_DATABASE_URL }}
+
+  # ============================================================================
+  # JOB 5: Deploy Backend Services
+  # ============================================================================
+  deploy-services:
+    name: Deploy Backend Services
+    runs-on: ubuntu-latest
+    needs: [deploy-contracts, migrate-database]
+    timeout-minutes: 15
+    environment: testnet
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: build-artifacts
+
+      - name: Download deployment manifests
+        uses: actions/download-artifact@v3
+        with:
+          name: deployment-manifests
+          path: deployments/
+
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.TESTNET_KUBECONFIG }}
+
+      - name: Build and push Docker images
+        run: |
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+          # Build OCaml backend
+          docker build -f infra/docker/Dockerfile.ocaml -t tonsurance/ocaml-backend:testnet-${{ github.sha }} .
+          docker push tonsurance/ocaml-backend:testnet-${{ github.sha }}
+
+          # Build keeper services
+          docker build -f infra/docker/Dockerfile.keeper -t tonsurance/keepers:testnet-${{ github.sha }} .
+          docker push tonsurance/keepers:testnet-${{ github.sha }}
+
+      - name: Update Kubernetes manifests
+        run: |
+          # Update image tags in manifests
+          sed -i "s|image: tonsurance/ocaml-backend:.*|image: tonsurance/ocaml-backend:testnet-${{ github.sha }}|g" infra/kubernetes/ocaml-backend.yaml
+          sed -i "s|image: tonsurance/keepers:.*|image: tonsurance/keepers:testnet-${{ github.sha }}|g" infra/kubernetes/pricing-keeper.yaml
+
+          # Update contract addresses from deployment manifests
+          kubectl create configmap contract-addresses \
+            --from-literal=PRICING_ORACLE_ADDRESS=${{ env.PRICING_ORACLE_ADDRESS }} \
+            --from-literal=VAULT_ADDRESS=${{ env.VAULT_ADDRESS }} \
+            --from-literal=ROUTER_ADDRESS=${{ env.ROUTER_ADDRESS }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl apply -f infra/kubernetes/
+          kubectl rollout status deployment/ocaml-backend --timeout=5m
+          kubectl rollout status deployment/pricing-keeper --timeout=5m
+          kubectl rollout status deployment/bridge-keeper --timeout=5m
+
+      - name: Verify deployments
+        run: |
+          kubectl get pods
+          kubectl logs -l app=pricing-keeper --tail=50
+          kubectl logs -l app=ocaml-backend --tail=50
+
+  # ============================================================================
+  # JOB 6: Run Smoke Tests
+  # ============================================================================
+  smoke-tests:
+    name: Run Smoke Tests
+    runs-on: ubuntu-latest
+    needs: deploy-services
+    timeout-minutes: 10
+    environment: testnet
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Waiting for services to start..."
+          sleep 60
+
+      - name: Test PricingOracle updates
+        run: |
+          node scripts/test-oracle-updates.js
+        env:
+          TON_RPC_URL: https://testnet.toncenter.com/api/v2/jsonRPC
+          PRICING_ORACLE_ADDRESS: ${{ env.PRICING_ORACLE_ADDRESS }}
+
+      - name: Test premium quote API
+        run: |
+          RESPONSE=$(curl -s https://testnet-api.tonsurance.com/premium/swing-quote?coverage_type=1&chain_id=0&stablecoin_id=0&coverage_amount=10000000000&duration_days=30)
+          echo "Premium quote response: $RESPONSE"
+          PREMIUM=$(echo $RESPONSE | jq -r '.total_premium')
+          if [ "$PREMIUM" == "null" ] || [ -z "$PREMIUM" ]; then
+            echo "❌ Premium quote API failed"
+            exit 1
+          fi
+          echo "✅ Premium quote API working: $PREMIUM nanoTON"
+
+      - name: Test policy creation
+        run: |
+          node scripts/test-policy-creation.js
+        env:
+          TON_RPC_URL: https://testnet.toncenter.com/api/v2/jsonRPC
+          ROUTER_ADDRESS: ${{ env.ROUTER_ADDRESS }}
+          TEST_WALLET_MNEMONIC: ${{ secrets.TESTNET_TEST_WALLET_MNEMONIC }}
+
+      - name: Verify hedge execution
+        run: |
+          node scripts/test-hedge-execution.js
+        env:
+          DATABASE_URL: ${{ secrets.TESTNET_DATABASE_URL }}
+
+  # ============================================================================
+  # JOB 7: Notify Deployment Status
+  # ============================================================================
+  notify:
+    name: Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: smoke-tests
+    if: always()
+
+    steps:
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          payload: |
+            {
+              "text": "Testnet Deployment ${{ needs.smoke-tests.result == 'success' && '✅ Success' || '❌ Failed' }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Testnet Deployment ${{ needs.smoke-tests.result == 'success' && '✅ Success' || '❌ Failed' }}*\n\nBranch: `${{ github.ref_name }}`\nCommit: `${{ github.sha }}`\nActor: ${{ github.actor }}\n\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Workflow Run>"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*PricingOracle:*\n${{ env.PRICING_ORACLE_ADDRESS }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*MultiTrancheVault:*\n${{ env.VAULT_ADDRESS }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*PolicyRouter:*\n${{ env.ROUTER_ADDRESS }}"
+                    }
+                  ]
+                }
+              ]
+            }

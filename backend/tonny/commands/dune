@@ -1,0 +1,12 @@
+(library
+ (name tonny_commands)
+ (modules start help quote buy policies claim bridges tonny)
+ (libraries
+  core
+  lwt
+  lwt.unix
+  types
+  tonny_lib
+  pricing_engine
+  pool
+  monitoring))

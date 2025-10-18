@@ -4,12 +4,13 @@ import {
   tonClient,
   policyFactory,
   hedgedPolicyFactory,
-  primaryVault,
-  secondaryVault,
-  tradfiBuffer,
   claimsProcessor,
   pricingOracle,
   hedgeCoordinator,
+  multiTrancheVault,
+  dynamicPricingOracle,
+  policyRouter,
+  treasury,
   areContractsConfigured
 } from '../lib/contracts';
 import type { Sender, SenderArguments } from '@ton/core';
@@ -48,12 +49,13 @@ export const useContracts = () => {
     contracts: {
       policyFactory,
       hedgedPolicyFactory,
-      primaryVault,
-      secondaryVault,
-      tradfiBuffer,
       claimsProcessor,
       pricingOracle,
       hedgeCoordinator,
+      multiTrancheVault,
+      dynamicPricingOracle,
+      policyRouter,
+      treasury,
     },
     isConfigured: areContractsConfigured(),
     isConnected: tonConnectUI.connected,

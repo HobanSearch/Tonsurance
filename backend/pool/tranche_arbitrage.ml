@@ -28,7 +28,7 @@ module TrancheArbitrage = struct
 
   (** Fair value analysis for single tranche **)
   type fair_value_analysis = {
-    tranche_id: int;
+    tranche_id: string;
     tranche_name: string;
 
     (* Current market values *)
@@ -53,8 +53,8 @@ module TrancheArbitrage = struct
 
   (** Arbitrage opportunity **)
   type arbitrage_opportunity = {
-    from_tranche: int;
-    to_tranche: int;
+    from_tranche: string;
+    to_tranche: string;
     amount: usd_cents;
     expected_profit: float;
     sharpe_improvement: float;
@@ -81,8 +81,8 @@ module TrancheArbitrage = struct
   (** Calculate risk contribution for each tranche **)
   let calculate_risk_contributions
       (collateral_mgr: Collateral_manager.CollateralManager.t)
-      ~(total_var: float)
-    : (int * float) list =
+      ~(_total_var: float)
+    : (string * float) list =
 
     let pool = collateral_mgr.pool in
 
@@ -110,26 +110,26 @@ module TrancheArbitrage = struct
     let losses = cents_to_usd tranche.accumulated_losses in
     let capital = cents_to_usd tranche.allocated_capital in
 
-    if capital <= 0.0 then 0.0
+    if Float.(capital <= 0.0) then 0.0
     else
-      let time_elapsed = Unix.time () -. pool.created_at in
+      let time_elapsed = Time_float.now () |> Time_float.to_span_since_epoch |> (fun span -> Time_float.Span.to_sec span -. pool.created_at) in
       let years = time_elapsed /. (365.25 *. 86400.0) in
 
-      if years < 0.01 then 0.0 (* Too early *)
+      if Float.(years < 0.01) then 0.0 (* Too early *)
       else losses /. capital /. years (* Annualized loss rate *)
 
   (** Calculate fair value for tranche based on risk-return **)
   let calculate_fair_value
       (collateral_mgr: Collateral_manager.CollateralManager.t)
-      ~(tranche_id: int)
-      ~(total_var: float)
+      ~(tranche_id: string)
+      ~(_total_var: float)
       ~(config: arbitrage_config)
     : fair_value_analysis option =
 
     let pool = collateral_mgr.pool in
 
     let tranche_opt =
-      List.find pool.virtual_tranches ~f:(fun t -> t.tranche_id = tranche_id)
+      List.find pool.virtual_tranches ~f:(fun t -> Poly.equal t.tranche_id tranche_id)
     in
 
     match tranche_opt with
@@ -141,14 +141,14 @@ module TrancheArbitrage = struct
         in
 
         let current_nav =
-          if tranche.lp_token_supply = 0L then 1.0
+          if Int64.(tranche.lp_token_supply = 0L) then 1.0
           else cents_to_usd net_value /. Int64.to_float tranche.lp_token_supply
         in
 
         (* Risk contribution *)
-        let risk_contributions = calculate_risk_contributions collateral_mgr ~total_var in
+        let risk_contributions = calculate_risk_contributions collateral_mgr ~_total_var in
         let risk_contribution =
-          List.Assoc.find risk_contributions tranche_id ~equal:Int.equal
+          List.Assoc.find risk_contributions tranche_id ~equal:String.equal
           |> Option.value ~default:0.0
         in
 
@@ -181,20 +181,20 @@ module TrancheArbitrage = struct
 
         (* Mispricing *)
         let mispricing_pct =
-          if current_nav > 0.0 then
+          if Float.(current_nav > 0.0) then
             (fair_nav -. current_nav) /. current_nav
           else 0.0
         in
 
         (* Recommendation *)
         let recommendation =
-          if mispricing_pct > config.min_mispricing_threshold then `Buy
-          else if mispricing_pct < -.config.min_mispricing_threshold then `Sell
+          if Float.(mispricing_pct > config.min_mispricing_threshold) then `Buy
+          else if Float.(mispricing_pct < -.config.min_mispricing_threshold) then `Sell
           else `Hold
         in
 
         (* Confidence based on data quality *)
-        let time_elapsed = Unix.time () -. pool.created_at in
+        let time_elapsed = Time_float.now () |> Time_float.to_span_since_epoch |> (fun span -> Time_float.Span.to_sec span -. pool.created_at) in
         let days_elapsed = time_elapsed /. 86400.0 in
         let confidence = Float.min 1.0 (days_elapsed /. 90.0) in (* Max confidence after 90 days *)
 
@@ -203,7 +203,7 @@ module TrancheArbitrage = struct
 
         Some {
           tranche_id;
-          tranche_name = tranche.name;
+          tranche_name = tranche.tranche_id;
           current_nav;
           current_yield_bps = tranche.target_yield_bps;
           risk_contribution_pct = risk_contribution *. 100.0;
@@ -220,7 +220,7 @@ module TrancheArbitrage = struct
   (** Scan all tranches for arbitrage opportunities **)
   let scan_arbitrage_opportunities
       (collateral_mgr: Collateral_manager.CollateralManager.t)
-      ~(total_var: float)
+      ~(_total_var: float)
       ~(config: arbitrage_config)
     : fair_value_analysis list =
 
@@ -229,7 +229,7 @@ module TrancheArbitrage = struct
     List.filter_map pool.virtual_tranches ~f:(fun tranche ->
       calculate_fair_value collateral_mgr
         ~tranche_id:tranche.tranche_id
-        ~total_var
+        ~_total_var
         ~config
     )
 
@@ -243,14 +243,14 @@ module TrancheArbitrage = struct
     let overvalued =
       List.filter analyses ~f:(fun a ->
         Poly.equal a.recommendation `Sell &&
-        Float.abs a.mispricing_pct > config.min_mispricing_threshold *. 100.0
+        Float.(abs a.mispricing_pct > config.min_mispricing_threshold *. 100.0)
       )
     in
 
     let undervalued =
       List.filter analyses ~f:(fun a ->
         Poly.equal a.recommendation `Buy &&
-        a.mispricing_pct > config.min_mispricing_threshold *. 100.0
+        Float.(a.mispricing_pct > config.min_mispricing_threshold *. 100.0)
       )
     in
 
@@ -281,15 +281,15 @@ module TrancheArbitrage = struct
   (** Calculate optimal amount to reallocate **)
   let calculate_optimal_amount
       (collateral_mgr: Collateral_manager.CollateralManager.t)
-      ~(from_tranche: int)
-      ~(to_tranche: int)
+      ~(from_tranche: string)
+      ~(_to_tranche: string)
       ~(config: arbitrage_config)
     : usd_cents =
 
     let pool = collateral_mgr.pool in
 
     let from_tranche_opt =
-      List.find pool.virtual_tranches ~f:(fun t -> t.tranche_id = from_tranche)
+      List.find pool.virtual_tranches ~f:(fun t -> Poly.equal t.tranche_id from_tranche)
     in
 
     match from_tranche_opt with
@@ -312,11 +312,11 @@ module TrancheArbitrage = struct
 
     (* Find tranches *)
     let from_tranche_opt =
-      List.find pool.virtual_tranches ~f:(fun t -> t.tranche_id = opportunity.from_tranche)
+      List.find pool.virtual_tranches ~f:(fun t -> Poly.equal t.tranche_id opportunity.from_tranche)
     in
 
     let to_tranche_opt =
-      List.find pool.virtual_tranches ~f:(fun t -> t.tranche_id = opportunity.to_tranche)
+      List.find pool.virtual_tranches ~f:(fun t -> Poly.equal t.tranche_id opportunity.to_tranche)
     in
 
     match (from_tranche_opt, to_tranche_opt) with
@@ -336,8 +336,8 @@ module TrancheArbitrage = struct
         (* Update tranches list *)
         let updated_tranches =
           List.map pool.virtual_tranches ~f:(fun t ->
-            if t.tranche_id = opportunity.from_tranche then updated_from
-            else if t.tranche_id = opportunity.to_tranche then updated_to
+            if Poly.equal t.tranche_id opportunity.from_tranche then updated_from
+            else if Poly.equal t.tranche_id opportunity.to_tranche then updated_to
             else t
           )
         in
@@ -359,7 +359,7 @@ module TrancheArbitrage = struct
     (* Calculate weighted portfolio return and risk *)
     let total_capital = cents_to_usd pool.total_capital_usd in
 
-    if total_capital <= 0.0 then 0.0
+    if Float.(total_capital <= 0.0) then 0.0
     else
       let (weighted_return, weighted_variance) =
         List.fold pool.virtual_tranches ~init:(0.0, 0.0) ~f:(fun (ret_acc, var_acc) tranche ->
@@ -377,7 +377,7 @@ module TrancheArbitrage = struct
 
       let portfolio_std = Float.sqrt weighted_variance in
 
-      if portfolio_std > 0.0 then
+      if Float.(portfolio_std > 0.0) then
         (weighted_return -. config.risk_free_rate) /. portfolio_std
       else
         0.0
@@ -386,7 +386,7 @@ module TrancheArbitrage = struct
   let optimize_tranche_allocation
       (collateral_mgr: Collateral_manager.CollateralManager.t)
       ~(config: arbitrage_config)
-    : (int * float) list =
+    : (string * float) list =
 
     let pool = collateral_mgr.pool in
 
@@ -406,7 +406,7 @@ module TrancheArbitrage = struct
       acc +. Float.max 0.0 s
     ) in
 
-    if total_sharpe <= 0.0 then
+    if Float.(total_sharpe <= 0.0) then
       (* Equal allocation if no positive Sharpe *)
       List.map pool.virtual_tranches ~f:(fun t ->
         (t.tranche_id, 1.0 /. Float.of_int (List.length pool.virtual_tranches))
@@ -426,34 +426,34 @@ module TrancheArbitrage = struct
     let rec loop () =
       let%lwt () =
         try%lwt
-          Lwt_io.printlf "\n[%s] Scanning for tranche arbitrage..."
-            (Time.to_string (Time.now ())) >>= fun () ->
+          let%lwt () = Lwt_io.printlf "\n[%s] Scanning for tranche arbitrage..."
+            (Time_float.to_string_utc (Time_float.now ())) in
 
           (* Get current VaR *)
           let%lwt total_var = var_provider () in
 
           (* Scan for opportunities *)
           let analyses = scan_arbitrage_opportunities !collateral_manager
-            ~total_var
+            ~_total_var:total_var
             ~config
           in
 
           (* Log fair value analysis *)
           let%lwt () = Lwt_io.printlf "\n=== Tranche Fair Values ===" in
           let%lwt () = Lwt_list.iter_s (fun analysis ->
-            Lwt_io.printlf "%s (ID: %d):"
-              analysis.tranche_name analysis.tranche_id >>= fun () ->
-            Lwt_io.printlf "  Current NAV: $%.4f | Fair NAV: $%.4f"
-              analysis.current_nav analysis.fair_value_nav >>= fun () ->
-            Lwt_io.printlf "  Mispricing: %.2f%% | Recommendation: %s"
+            let%lwt () = Lwt_io.printlf "%s (ID: %s):"
+              analysis.tranche_name analysis.tranche_id in
+            let%lwt () = Lwt_io.printlf "  Current NAV: $%.4f | Fair NAV: $%.4f"
+              analysis.current_nav analysis.fair_value_nav in
+            let%lwt () = Lwt_io.printlf "  Mispricing: %.2f%% | Recommendation: %s"
               analysis.mispricing_pct
               (match analysis.recommendation with
                 | `Buy -> "BUY ⬆️"
                 | `Sell -> "SELL ⬇️"
-                | `Hold -> "HOLD ➡️") >>= fun () ->
-            Lwt_io.printlf "  Risk: %.2f%% | Loss Absorption: %.2f%%"
+                | `Hold -> "HOLD ➡️") in
+            let%lwt () = Lwt_io.printlf "  Risk: %.2f%% | Loss Absorption: %.2f%%"
               analysis.risk_contribution_pct
-              analysis.loss_absorption_capacity >>= fun () ->
+              analysis.loss_absorption_capacity in
             Lwt_io.printlf ""
           ) analyses in
 
@@ -466,20 +466,20 @@ module TrancheArbitrage = struct
 
           | opp :: _ ->
               (* Take best opportunity *)
-              Lwt_io.printlf "\n💰 ARBITRAGE OPPORTUNITY FOUND:" >>= fun () ->
-              Lwt_io.printlf "  %s" opp.reason >>= fun () ->
-              Lwt_io.printlf "  Expected profit: %.2f%%" opp.expected_profit >>= fun () ->
+              let%lwt () = Lwt_io.printlf "\n💰 ARBITRAGE OPPORTUNITY FOUND:" in
+              let%lwt () = Lwt_io.printlf "  %s" opp.reason in
+              let%lwt () = Lwt_io.printlf "  Expected profit: %.2f%%" opp.expected_profit in
 
               (* Calculate optimal amount *)
               let amount = calculate_optimal_amount !collateral_manager
                 ~from_tranche:opp.from_tranche
-                ~to_tranche:opp.to_tranche
+                ~_to_tranche:opp.to_tranche
                 ~config
               in
 
               let opp_with_amount = { opp with amount } in
 
-              Lwt_io.printlf "  Amount: $%s" (Int64.to_string_hum ~delimiter:',' amount) >>= fun () ->
+              let%lwt () = Lwt_io.printlf "  Amount: $%s" (Int64.to_string_hum ~delimiter:',' amount) in
 
               (* Execute arbitrage *)
               collateral_manager := execute_arbitrage !collateral_manager ~opportunity:opp_with_amount;
@@ -500,10 +500,10 @@ module TrancheArbitrage = struct
       loop ()
     in
 
-    Lwt_io.printlf "\n╔════════════════════════════════════════╗" >>= fun () ->
-    Lwt_io.printlf "║  Tranche Arbitrage Engine Started     ║" >>= fun () ->
-    Lwt_io.printlf "╚════════════════════════════════════════╝\n" >>= fun () ->
-    Lwt_io.printlf "Check interval: %.0f seconds\n" config.check_interval_seconds >>= fun () ->
+    let%lwt () = Lwt_io.printlf "\n╔════════════════════════════════════════╗" in
+    let%lwt () = Lwt_io.printlf "║  Tranche Arbitrage Engine Started     ║" in
+    let%lwt () = Lwt_io.printlf "╚════════════════════════════════════════╝\n" in
+    let%lwt () = Lwt_io.printlf "Check interval: %.0f seconds\n" config.check_interval_seconds in
 
     loop ()
 

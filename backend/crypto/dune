@@ -1,0 +1,6 @@
+(library
+ (name crypto)
+ (public_name tonsurance.crypto)
+ (modules signature_verifier)
+ (libraries core types logs logs.lwt)
+ (preprocess (pps ppx_sexp_conv ppx_deriving_yojson)))

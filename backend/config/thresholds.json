@@ -1,0 +1,163 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Thresholds for circuit breakers, alerts, and risk management",
+  "version": "1.0.0",
+
+  "circuit_breaker": {
+    "price_change_max_percent": 50.0,
+    "oracle_deviation_max_percent": 5.0,
+    "failure_count_threshold": 5,
+    "recovery_success_count": 2,
+    "timeout_seconds": 60.0,
+    "description": "Circuit breaker triggers: 50% price change, 5% oracle deviation"
+  },
+
+  "risk_management": {
+    "utilization_critical_percent": 90.0,
+    "utilization_high_percent": 75.0,
+    "utilization_medium_percent": 50.0,
+    "capital_buffer_min_percent": 10.0,
+    "description": "Risk thresholds for triggering alerts"
+  },
+
+  "oracle_monitoring": {
+    "staleness_warning_seconds": 180,
+    "staleness_critical_seconds": 300,
+    "price_deviation_warning_percent": 3.0,
+    "price_deviation_critical_percent": 5.0,
+    "heartbeat_timeout_seconds": 120,
+    "description": "Oracle health monitoring thresholds (5 min staleness critical)"
+  },
+
+  "collateral_manager": {
+    "rebalance_trigger_deviation_percent": 5.0,
+    "min_tranche_allocation_percent": 1.0,
+    "max_single_tranche_percent": 50.0,
+    "emergency_reserve_min_percent": 15.0,
+    "description": "Collateral rebalancing triggers"
+  },
+
+  "claims_processor": {
+    "max_single_claim_percent_of_pool": 20.0,
+    "daily_claims_limit_percent": 30.0,
+    "claim_velocity_alerts_per_hour": 10,
+    "description": "Claims processing safety limits"
+  },
+
+  "policy_limits": {
+    "min_coverage_usd": 10,
+    "max_coverage_usd": 1000,
+    "min_duration_days": 30,
+    "max_duration_days": 180,
+    "max_policies_per_user": 100,
+    "description": "Policy purchase limits ($10-$1000, 30-180 days)"
+  },
+
+  "vault_operations": {
+    "min_deposit_ton": 0.1,
+    "lock_timeout_seconds": 60,
+    "circuit_breaker_trigger_percent": 10.0,
+    "max_withdrawal_percent_daily": 25.0,
+    "description": "Vault operational thresholds (60s lock timeout)"
+  },
+
+  "premium_pricing": {
+    "min_premium_rate_bps": 10,
+    "max_premium_rate_bps": 2000,
+    "utilization_tier1_threshold_percent": 90.0,
+    "utilization_tier2_threshold_percent": 75.0,
+    "utilization_tier3_threshold_percent": 50.0,
+    "description": "Premium pricing bounds (0.1% - 20% APR)"
+  },
+
+  "gas_monitoring": {
+    "high_gas_threshold_gwei": 100,
+    "medium_gas_threshold_gwei": 50,
+    "gas_price_spike_percent": 200.0,
+    "description": "Gas price thresholds for dynamic pricing"
+  },
+
+  "bridge_health": {
+    "critical_threshold_percent": 50.0,
+    "warning_threshold_percent": 70.0,
+    "response_time_warning_ms": 2000,
+    "response_time_critical_ms": 5000,
+    "description": "Bridge health scoring thresholds"
+  },
+
+  "cex_liquidation": {
+    "liquidation_cascade_threshold": 5,
+    "volume_spike_threshold_percent": 300.0,
+    "price_impact_warning_percent": 2.0,
+    "description": "CEX liquidation monitoring"
+  },
+
+  "market_data": {
+    "stablecoin_depeg_warning_percent": 1.0,
+    "stablecoin_depeg_critical_percent": 2.0,
+    "volume_anomaly_threshold_percent": 500.0,
+    "correlation_break_threshold": 0.5,
+    "description": "Market data anomaly detection (1% depeg warning, 2% critical)"
+  },
+
+  "treasury_management": {
+    "min_reserve_balance_ton": 1000,
+    "reserve_utilization_max_percent": 80.0,
+    "payout_velocity_alert_per_hour": 20,
+    "description": "Treasury safety thresholds"
+  },
+
+  "hedged_insurance": {
+    "premium_quote_validity_seconds": 30,
+    "hedge_slippage_max_percent": 2.0,
+    "hedge_execution_timeout_seconds": 10,
+    "venue_allocation_deviation_max_percent": 10.0,
+    "description": "Hedged insurance operational limits (30s quote validity)"
+  },
+
+  "arbitrage": {
+    "min_profit_bps": 50,
+    "max_position_size_percent": 10.0,
+    "execution_timeout_seconds": 30,
+    "description": "Arbitrage bot parameters (0.5% min profit)"
+  },
+
+  "monitoring_alerts": {
+    "latency_warning_ms": 1000,
+    "latency_critical_ms": 5000,
+    "error_rate_warning_percent": 1.0,
+    "error_rate_critical_percent": 5.0,
+    "disk_usage_warning_percent": 80.0,
+    "disk_usage_critical_percent": 90.0,
+    "memory_usage_warning_percent": 85.0,
+    "memory_usage_critical_percent": 95.0,
+    "description": "System monitoring alert thresholds"
+  },
+
+  "environment_overrides": {
+    "development": {
+      "circuit_breaker_failure_threshold": 10,
+      "oracle_staleness_critical_seconds": 600,
+      "min_reserve_balance_ton": 10
+    },
+    "staging": {
+      "circuit_breaker_failure_threshold": 7,
+      "oracle_staleness_critical_seconds": 450,
+      "min_reserve_balance_ton": 100
+    },
+    "production": {
+      "circuit_breaker_failure_threshold": 5,
+      "oracle_staleness_critical_seconds": 300,
+      "min_reserve_balance_ton": 1000
+    }
+  },
+
+  "notes": [
+    "All percentage thresholds are absolute values (e.g., 5.0 = 5%)",
+    "Basis points (bps): 100 bps = 1%",
+    "Production has stricter thresholds for safety",
+    "Circuit breakers prevent catastrophic failures",
+    "Alert thresholds should trigger before critical failures",
+    "Review thresholds monthly based on observed metrics"
+  ]
+}

@@ -1,0 +1,18 @@
+(library
+ (name reporting)
+ (public_name tonsurance.reporting)
+ (libraries
+   core
+   lwt
+   lwt.unix
+   logs
+   logs.lwt
+   yojson
+   caqti
+   caqti-lwt
+   caqti-driver-postgresql
+   types
+   math
+   risk_model)
+ (modules risk_report_generator)
+ (preprocess (pps lwt_ppx ppx_sexp_conv ppx_deriving_yojson)))

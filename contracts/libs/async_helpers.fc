@@ -1,0 +1,644 @@
+;; Async Helpers Library - TON Blockchain Asynchronous Coordination
+;; Provides utilities for handling bounced messages, message retry logic,
+;; two-phase commit patterns, and state rollback mechanisms.
+;;
+;; Key Features:
+;; - Bounce message parsing and handling
+;; - Two-phase commit pattern for multi-contract operations
+;; - Message retry queue with exponential backoff
+;; - Transaction atomicity helpers
+;; - State rollback utilities
+
+#include "../imports/stdlib.fc";
+
+;; ===== CONSTANTS =====
+
+;; Operation codes for async operations
+const int OP_TRANSFER = 0x0f8a7ea5;       ;; Standard transfer op
+const int OP_MINT = 21;                    ;; Mint tokens
+const int OP_BURN = 0x595f07bc;            ;; Burn notification
+const int OP_INTERNAL_TRANSFER = 0x178d4519;  ;; Internal transfer
+const int OP_RECEIVE_PREMIUM = 0x01;       ;; Receive premium
+const int OP_ABSORB_LOSS = 0x04;           ;; Absorb claim loss
+
+;; Bounce reasons (for logging and handling)
+const int BOUNCE_REASON_INSUFFICIENT_GAS = 1;
+const int BOUNCE_REASON_INVALID_DESTINATION = 2;
+const int BOUNCE_REASON_CONTRACT_REJECTED = 3;
+const int BOUNCE_REASON_UNKNOWN = 99;
+
+;; Retry configuration
+const int MAX_RETRY_COUNT = 5;
+const int INITIAL_BACKOFF = 1;  ;; 1 second
+const int MAX_BACKOFF = 16;     ;; 16 seconds max
+
+;; Two-phase commit states
+const int TX_STATE_INITIATED = 1;
+const int TX_STATE_PREPARED = 2;
+const int TX_STATE_COMMITTED = 3;
+const int TX_STATE_ABORTED = 4;
+
+;; ===== BOUNCE MESSAGE PARSING =====
+
+;; Parse bounced message body
+;; Returns: (op, original_value, sender_address, success_flag)
+(int, int, slice, int) parse_bounced_message(slice bounced_body) inline {
+    ;; Bounced messages start with 0xffffffff prefix (32 bits of 1s)
+    int prefix = bounced_body~load_uint(32);
+    if (prefix != 0xffffffff) {
+        return (0, 0, begin_cell().end_cell().begin_parse(), 0);  ;; Not a bounced message
+    }
+
+    ;; Extract original operation code
+    int op = bounced_body~load_uint(32);
+
+    ;; Extract value (if present) - default to 0 if not enough data
+    int original_value = 0;
+    if (bounced_body.slice_bits() >= 128) {
+        original_value = bounced_body~load_coins();
+    }
+
+    ;; Extract sender address (if present)
+    slice sender_address = begin_cell().end_cell().begin_parse();  ;; null address default
+    if (bounced_body.slice_bits() >= 267) {  ;; Minimum bits for address
+        sender_address = bounced_body~load_msg_addr();
+    }
+
+    return (op, original_value, sender_address, -1);  ;; -1 = success
+}
+
+;; Identify bounce reason based on message flags and op
+int identify_bounce_reason(int op, int msg_value) inline {
+    if (msg_value < 10000000) {  ;; Less than 0.01 TON
+        return BOUNCE_REASON_INSUFFICIENT_GAS;
+    }
+    ;; In production, add more sophisticated analysis
+    return BOUNCE_REASON_UNKNOWN;
+}
+
+;; ===== TWO-PHASE COMMIT PATTERN =====
+
+;; Initialize a two-phase transaction
+;; Returns: transaction ID (based on seq_no + timestamp)
+;; CRITICAL-4 FIX: Now uses 64-bit seq_no for overflow protection
+;; tx_id format: (seq_no << 32) | (timestamp & 0xFFFFFFFF)
+;; This provides 2^32 unique seq_nos and 47-year timestamp space
+int init_2pc_transaction(int seq_no) inline {
+    return (seq_no << 32) | (now() & 0xFFFFFFFF);
+}
+
+;; Store transaction state in dict
+;; tx_dict structure: tx_id -> (state, retry_count, created_at, op, value, dest_address)
+cell store_tx_state(
+    cell tx_dict,
+    int tx_id,
+    int state,
+    int retry_count,
+    int created_at,
+    int op,
+    int value,
+    slice dest_address
+) inline {
+    cell tx_data = begin_cell()
+        .store_uint(state, 8)
+        .store_uint(retry_count, 8)
+        .store_uint(created_at, 32)
+        .store_uint(op, 32)
+        .store_coins(value)
+        .store_slice(dest_address)
+        .end_cell();
+
+    tx_dict~udict_set_ref(64, tx_id, tx_data);
+    return tx_dict;
+}
+
+;; ===== EXTENDED TRANSACTION STATE (for CRITICAL-1 fix) =====
+;; Store extended transaction state with full context for rollback
+;; Extended structure: tx_id -> (state, retry_count, created_at, op, value, dest_address, depositor, tranche_id, deposit_amount)
+cell store_tx_state_extended(
+    cell tx_dict,
+    int tx_id,
+    int state,
+    int retry_count,
+    int created_at,
+    int op,
+    int value,
+    slice dest_address,
+    slice depositor,
+    int tranche_id,
+    int deposit_amount
+) inline {
+    ;; Store basic tx data in main cell
+    builder tx_builder = begin_cell()
+        .store_uint(state, 8)
+        .store_uint(retry_count, 8)
+        .store_uint(created_at, 32)
+        .store_uint(op, 32)
+        .store_coins(value)
+        .store_slice(dest_address);
+
+    ;; Store extended context in reference cell
+    cell extended_context = begin_cell()
+        .store_slice(depositor)
+        .store_uint(tranche_id, 8)
+        .store_coins(deposit_amount)
+        .end_cell();
+
+    cell tx_data = tx_builder
+        .store_ref(extended_context)
+        .end_cell();
+
+    tx_dict~udict_set_ref(64, tx_id, tx_data);
+    return tx_dict;
+}
+
+;; Load extended transaction state
+(int, int, int, int, int, slice, slice, int, int, int) load_tx_state_extended(cell tx_dict, int tx_id) inline {
+    (slice tx_data, int found) = tx_dict.udict_get?(64, tx_id);
+    if (~ found) {
+        ;; Return default values if not found
+        return (0, 0, 0, 0, 0, begin_cell().end_cell().begin_parse(), begin_cell().end_cell().begin_parse(), 0, 0, 0);
+    }
+
+    int state = tx_data~load_uint(8);
+    int retry_count = tx_data~load_uint(8);
+    int created_at = tx_data~load_uint(32);
+    int op = tx_data~load_uint(32);
+    int value = tx_data~load_coins();
+    slice dest_address = tx_data~load_msg_addr();
+
+    ;; Load extended context from reference
+    slice extended_context = tx_data~load_ref().begin_parse();
+    slice depositor = extended_context~load_msg_addr();
+    int tranche_id = extended_context~load_uint(8);
+    int deposit_amount = extended_context~load_coins();
+
+    return (state, retry_count, created_at, op, value, dest_address, depositor, tranche_id, deposit_amount, -1);  ;; -1 = found
+}
+
+;; Load transaction state from dict
+(int, int, int, int, int, slice, int) load_tx_state(cell tx_dict, int tx_id) inline {
+    (slice tx_data, int found) = tx_dict.udict_get?(64, tx_id);
+    if (~ found) {
+        ;; Return default values if not found
+        return (0, 0, 0, 0, 0, begin_cell().end_cell().begin_parse(), 0);
+    }
+
+    int state = tx_data~load_uint(8);
+    int retry_count = tx_data~load_uint(8);
+    int created_at = tx_data~load_uint(32);
+    int op = tx_data~load_uint(32);
+    int value = tx_data~load_coins();
+    slice dest_address = tx_data~load_msg_addr();
+
+    return (state, retry_count, created_at, op, value, dest_address, -1);  ;; -1 = found
+}
+
+;; Update transaction state (e.g., INITIATED -> PREPARED -> COMMITTED)
+cell update_tx_state(cell tx_dict, int tx_id, int new_state) inline {
+    var (state, retry_count, created_at, op, value, dest_address, found) = load_tx_state(tx_dict, tx_id);
+    if (found) {
+        tx_dict = store_tx_state(tx_dict, tx_id, new_state, retry_count, created_at, op, value, dest_address);
+    }
+    return tx_dict;
+}
+
+;; Increment retry count for a transaction
+cell increment_retry_count(cell tx_dict, int tx_id) inline {
+    var (state, retry_count, created_at, op, value, dest_address, found) = load_tx_state(tx_dict, tx_id);
+    if (found) {
+        retry_count += 1;
+        tx_dict = store_tx_state(tx_dict, tx_id, state, retry_count, created_at, op, value, dest_address);
+    }
+    return tx_dict;
+}
+
+;; Check if transaction should be retried
+;; Returns: (should_retry, backoff_seconds)
+(int, int) should_retry_tx(int retry_count, int created_at) inline {
+    if (retry_count >= MAX_RETRY_COUNT) {
+        return (0, 0);  ;; Max retries exceeded
+    }
+
+    ;; Check if transaction is too old (>1 hour = stale)
+    if (now() - created_at > 3600) {
+        return (0, 0);  ;; Transaction too old
+    }
+
+    ;; Calculate exponential backoff: 1, 2, 4, 8, 16 seconds
+    int backoff = INITIAL_BACKOFF;
+    int i = 0;
+    while (i < retry_count) {
+        backoff *= 2;
+        if (backoff > MAX_BACKOFF) {
+            backoff = MAX_BACKOFF;
+        }
+        i += 1;
+    }
+
+    return (-1, backoff);  ;; -1 = should retry
+}
+
+;; Remove transaction from dict (after commit or max retries)
+cell remove_tx(cell tx_dict, int tx_id) inline {
+    tx_dict~udict_delete?(64, tx_id);
+    return tx_dict;
+}
+
+;; ===== MESSAGE RETRY HELPERS =====
+
+;; Build a retry message with same parameters
+cell build_retry_message(
+    slice dest_address,
+    int op,
+    int value,
+    int gas_amount,
+    int query_id
+) inline {
+    ;; Build message body based on op
+    cell body = begin_cell()
+        .store_uint(op, 32)
+        .store_uint(query_id, 64)
+        .store_coins(value)
+        .end_cell();
+
+    ;; Build message
+    cell msg = begin_cell()
+        .store_uint(0x18, 6)                          ;; flags: bounceable
+        .store_slice(dest_address)                     ;; destination
+        .store_coins(gas_amount)                       ;; gas for message
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)   ;; default message headers
+        .store_ref(body)                               ;; message body
+        .end_cell();
+
+    return msg;
+}
+
+;; Send retry message with exponential backoff tracking
+() send_retry_message(
+    cell tx_dict,
+    int tx_id,
+    slice dest_address,
+    int op,
+    int value,
+    int gas_amount
+) impure inline {
+    var (state, retry_count, created_at, stored_op, stored_value, stored_dest, found) = load_tx_state(tx_dict, tx_id);
+
+    ;; Check if should retry
+    var (should_retry, backoff) = should_retry_tx(retry_count, created_at);
+    if (~ should_retry) {
+        return ();  ;; Don't retry
+    }
+
+    ;; Increment retry count
+    tx_dict = increment_retry_count(tx_dict, tx_id);
+
+    ;; Build and send retry message
+    cell msg = build_retry_message(dest_address, op, value, gas_amount, tx_id);
+    send_raw_message(msg, 1);  ;; mode 1: pay fees separately
+
+    ;; Emit retry event for monitoring
+    emit_log(0x90, begin_cell()
+        .store_uint(tx_id, 64)
+        .store_uint(retry_count + 1, 8)
+        .store_uint(backoff, 16)
+        .store_uint(op, 32)
+        .end_cell().begin_parse());
+}
+
+;; ===== STATE ROLLBACK HELPERS =====
+
+;; Snapshot structure for state rollback
+;; Used to save state before risky operations
+cell create_state_snapshot(
+    int total_capital,
+    int total_coverage,
+    int accumulated_premiums,
+    int accumulated_losses
+) inline {
+    return begin_cell()
+        .store_coins(total_capital)
+        .store_coins(total_coverage)
+        .store_coins(accumulated_premiums)
+        .store_coins(accumulated_losses)
+        .store_uint(now(), 32)
+        .end_cell();
+}
+
+;; Restore state from snapshot
+(int, int, int, int) restore_state_snapshot(cell snapshot) inline {
+    slice ss = snapshot.begin_parse();
+    int total_capital = ss~load_coins();
+    int total_coverage = ss~load_coins();
+    int accumulated_premiums = ss~load_coins();
+    int accumulated_losses = ss~load_coins();
+    ;; Skip timestamp (32 bits)
+
+    return (total_capital, total_coverage, accumulated_premiums, accumulated_losses);
+}
+
+;; ===== TRANCHE LOCK HELPERS (CRITICAL-3 FIX) =====
+
+;; Acquire lock for a tranche operation to prevent race conditions
+;; Returns: 1 if lock acquired, 0 if already locked
+;; Lock format: tranche_id -> (lock_holder_seq_no, expiry_timestamp)
+(int, cell) acquire_tranche_lock(cell lock_dict, int tranche_id, int seq_no, int lock_duration) inline {
+    ;; Check if lock already exists
+    (slice existing_lock, int found) = lock_dict.udict_get?(8, tranche_id);
+
+    if (found) {
+        int lock_holder = existing_lock~load_uint(64);
+        int expiry = existing_lock~load_uint(32);
+
+        ;; Check if lock has expired
+        if (now() >= expiry) {
+            ;; Lock expired, can acquire
+        } else {
+            ;; Lock still active
+            return (0, lock_dict);
+        }
+    }
+
+    ;; Create new lock
+    cell lock_data = begin_cell()
+        .store_uint(seq_no, 64)
+        .store_uint(now() + lock_duration, 32)
+        .end_cell();
+
+    lock_dict~udict_set_ref(8, tranche_id, lock_data);
+    return (1, lock_dict);  ;; Lock acquired
+}
+
+;; Release lock for a tranche
+cell release_tranche_lock(cell lock_dict, int tranche_id, int seq_no) inline {
+    ;; Check if lock exists and belongs to this transaction
+    (slice existing_lock, int found) = lock_dict.udict_get?(8, tranche_id);
+
+    if (found) {
+        int lock_holder = existing_lock~load_uint(64);
+
+        ;; Only release if we own the lock
+        if (lock_holder == seq_no) {
+            lock_dict~udict_delete?(8, tranche_id);
+        }
+    }
+
+    return lock_dict;
+}
+
+;; Check if tranche is currently locked
+int is_tranche_locked(cell lock_dict, int tranche_id) inline {
+    (slice existing_lock, int found) = lock_dict.udict_get?(8, tranche_id);
+
+    if (~ found) {
+        return 0;  ;; No lock
+    }
+
+    int lock_holder = existing_lock~load_uint(64);
+    int expiry = existing_lock~load_uint(32);
+
+    ;; Check if lock has expired
+    if (now() >= expiry) {
+        return 0;  ;; Lock expired
+    }
+
+    return 1;  ;; Locked
+}
+
+;; ===== TRANSACTION ATOMICITY HELPERS =====
+
+;; Check if transaction should timeout (for async operations)
+int tx_should_timeout(int created_at, int timeout_seconds) inline {
+    return now() - created_at > timeout_seconds;
+}
+
+;; Validate message send mode for bounce handling
+;; Mode 1: Pay fees separately (recommended for most operations)
+;; Mode 64: Carry remaining balance (use with caution)
+int validate_send_mode(int mode, int msg_value) inline {
+    ;; Mode 1 is safest for bounced message handling
+    if (mode == 1) {
+        return -1;  ;; Valid
+    }
+
+    ;; Mode 64 is risky if balance is insufficient
+    if (mode == 64) {
+        if (msg_value > 0) {
+            return -1;  ;; Valid if value specified
+        }
+    }
+
+    return 0;  ;; Invalid mode
+}
+
+;; Calculate gas required for message based on op
+int calculate_required_gas(int op) inline {
+    ;; Transfer operations need more gas
+    if ((op == OP_TRANSFER) | (op == OP_INTERNAL_TRANSFER)) {
+        return 100000000;  ;; 0.1 TON
+    }
+
+    ;; Mint/burn operations
+    if ((op == OP_MINT) | (op == OP_BURN)) {
+        return 100000000;  ;; 0.1 TON
+    }
+
+    ;; Premium/loss operations
+    if ((op == OP_RECEIVE_PREMIUM) | (op == OP_ABSORB_LOSS)) {
+        return 50000000;  ;; 0.05 TON
+    }
+
+    ;; Default minimum gas
+    return 30000000;  ;; 0.03 TON
+}
+
+;; ===== ADVANCED GAS CALCULATION (for HIGH-1 fix) =====
+;; Calculate required gas with dynamic sizing based on payload and complexity
+int calculate_required_gas_advanced(int op, int payload_size, int dest_complexity) inline {
+    ;; Base gas costs (from TON documentation)
+    int base_gas = 10000000;  ;; 0.01 TON minimum
+
+    ;; Operation-specific costs
+    if (op == OP_MINT) {
+        base_gas = 50000000;  ;; 0.05 TON for mint
+
+        ;; Add gas for payload size (complex mint data)
+        int payload_gas = muldiv(payload_size, 1000000, 1024);  ;; 0.001 TON per KB
+        base_gas += payload_gas;
+
+        ;; Add gas for destination complexity
+        ;; 0 = simple token, 1 = vesting token, 2 = governance token
+        if (dest_complexity == 1) {
+            base_gas += 50000000;  ;; +0.05 TON for vesting logic
+        }
+        if (dest_complexity == 2) {
+            base_gas += 100000000;  ;; +0.1 TON for governance
+        }
+    }
+
+    if (op == OP_BURN) {
+        base_gas = 50000000;  ;; 0.05 TON for burn
+        int payload_gas = muldiv(payload_size, 1000000, 1024);
+        base_gas += payload_gas;
+    }
+
+    if ((op == OP_TRANSFER) | (op == OP_INTERNAL_TRANSFER)) {
+        base_gas = 100000000;  ;; 0.1 TON for transfer
+        int payload_gas = muldiv(payload_size, 1000000, 1024);
+        base_gas += payload_gas;
+    }
+
+    if (op == OP_RECEIVE_PREMIUM) {
+        base_gas = 50000000;  ;; 0.05 TON
+    }
+
+    if (op == OP_ABSORB_LOSS) {
+        base_gas = 75000000;  ;; 0.075 TON (waterfall logic)
+    }
+
+    ;; Safety margin: 20% extra gas to prevent out-of-gas bounces
+    base_gas = muldiv(base_gas, 120, 100);
+
+    return base_gas;
+}
+
+;; ===== BOUNCE HANDLING WRAPPERS =====
+
+;; Generic bounce handler for transfers
+() handle_transfer_bounce(
+    int original_value,
+    slice original_sender,
+    cell tx_dict,
+    int seq_no
+) impure inline {
+    ;; Create transaction record
+    int tx_id = init_2pc_transaction(seq_no);
+    tx_dict = store_tx_state(
+        tx_dict,
+        tx_id,
+        TX_STATE_ABORTED,
+        1,
+        now(),
+        OP_TRANSFER,
+        original_value,
+        original_sender
+    );
+
+    ;; Refund user if transfer bounced
+    if (original_value > 0) {
+        cell refund_msg = begin_cell()
+            .store_uint(0x18, 6)
+            .store_slice(original_sender)
+            .store_coins(original_value)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .store_uint(0, 32)  ;; empty body
+            .end_cell();
+        send_raw_message(refund_msg, 1);
+    }
+
+    ;; Emit bounce event
+    emit_log(0x91, begin_cell()
+        .store_uint(tx_id, 64)
+        .store_uint(OP_TRANSFER, 32)
+        .store_coins(original_value)
+        .store_slice(original_sender)
+        .end_cell().begin_parse());
+}
+
+;; Generic bounce handler for mint operations
+() handle_mint_bounce(
+    int token_amount,
+    slice dest_address,
+    cell tx_dict,
+    int seq_no
+) impure inline {
+    ;; Create transaction record for retry
+    int tx_id = init_2pc_transaction(seq_no);
+    tx_dict = store_tx_state(
+        tx_dict,
+        tx_id,
+        TX_STATE_ABORTED,
+        1,
+        now(),
+        OP_MINT,
+        token_amount,
+        dest_address
+    );
+
+    ;; Emit bounce event
+    emit_log(0x92, begin_cell()
+        .store_uint(tx_id, 64)
+        .store_uint(OP_MINT, 32)
+        .store_coins(token_amount)
+        .store_slice(dest_address)
+        .end_cell().begin_parse());
+
+    ;; Mint will be retried by async_retry_keeper
+}
+
+;; Generic bounce handler for burn operations
+() handle_burn_bounce(
+    int token_amount,
+    slice from_address,
+    cell tx_dict,
+    int seq_no
+) impure inline {
+    ;; Create transaction record for retry
+    int tx_id = init_2pc_transaction(seq_no);
+    tx_dict = store_tx_state(
+        tx_dict,
+        tx_id,
+        TX_STATE_ABORTED,
+        1,
+        now(),
+        OP_BURN,
+        token_amount,
+        from_address
+    );
+
+    ;; Emit bounce event
+    emit_log(0x93, begin_cell()
+        .store_uint(tx_id, 64)
+        .store_uint(OP_BURN, 32)
+        .store_coins(token_amount)
+        .store_slice(from_address)
+        .end_cell().begin_parse());
+
+    ;; Burn will be retried by async_retry_keeper
+}
+
+;; ===== EVENT EMISSION =====
+;; Note: emit_log is provided by stdlib.fc
+
+;; ===== UTILITY FUNCTIONS =====
+
+;; Calculate capital-time for time-weighted yield distribution
+;; capital_time = capital × days_staked
+int calculate_capital_time(int capital, int stake_start_time, int current_time) inline {
+    ;; Calculate time staked in days
+    int seconds_staked = current_time - stake_start_time;
+    int days_staked = seconds_staked / 86400;
+
+    ;; Minimum 1 day to prevent division by zero
+    if (days_staked < 1) {
+        days_staked = 1;
+    }
+
+    ;; capital_time = capital × days
+    return muldiv(capital, days_staked, 1);
+}
+
+;; Safe division with zero check
+int safe_div(int a, int b) inline {
+    if (b == 0) {
+        return 0;
+    }
+    return a / b;
+}
+
+;; Check if address is null (addr_none)
+int is_null_address(slice addr) inline {
+    int addr_type = addr.preload_uint(2);
+    return addr_type == 0;  ;; 0 = addr_none
+}

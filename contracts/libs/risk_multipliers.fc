@@ -1,0 +1,279 @@
+;; risk_multipliers.fc - Chain and Stablecoin Risk Adjustment Library
+;; Multi-dimensional risk pricing for 5 coverage types × 8 chains × 14 stablecoins
+
+;; ===========================================
+;; CHAIN RISK MULTIPLIERS (in basis points, 10000 = 1.0x)
+;; ===========================================
+
+;; Chain IDs:
+;; 0 = Ethereum, 1 = Arbitrum, 2 = Base, 3 = Polygon
+;; 4 = Bitcoin, 5 = Lightning, 6 = TON, 7 = Solana
+
+int get_chain_risk_multiplier(int chain_id) inline {
+    if (chain_id == 0) {
+        return 10000;  ;; Ethereum: 1.0x (most secure, longest track record)
+    }
+    if (chain_id == 1) {
+        return 11000;  ;; Arbitrum: 1.1x (L2, slightly higher risk)
+    }
+    if (chain_id == 2) {
+        return 11000;  ;; Base: 1.1x (Coinbase L2, similar to Arbitrum)
+    }
+    if (chain_id == 3) {
+        return 12000;  ;; Polygon: 1.2x (PoS sidechain, more centralized)
+    }
+    if (chain_id == 4) {
+        return 9000;   ;; Bitcoin: 0.9x (most secure blockchain, discount)
+    }
+    if (chain_id == 5) {
+        return 13000;  ;; Lightning: 1.3x (payment channels, liquidity risk)
+    }
+    if (chain_id == 6) {
+        return 11500;  ;; TON: 1.15x (newer chain, growing ecosystem)
+    }
+    if (chain_id == 7) {
+        return 14000;  ;; Solana: 1.4x (history of outages, higher risk)
+    }
+
+    throw(400);  ;; Invalid chain_id
+    return 10000;  ;; Unreachable but satisfies compiler
+}
+
+;; Get chain name for logging (returns hash for event emission)
+int get_chain_name_hash(int chain_id) inline {
+    ;; Returns a simple identifier for chain
+    ;; In production, frontend maps this back to chain names
+    return chain_id;
+}
+
+;; ===========================================
+;; STABLECOIN RISK ADJUSTMENTS (in basis points)
+;; ===========================================
+
+;; Stablecoin IDs:
+;; 0 = USDC, 1 = USDT, 2 = USDP, 3 = DAI
+;; 4 = FRAX, 5 = BUSD, 6 = USDe, 7 = sUSDe
+;; 8 = USDY, 9 = PYUSD, 10 = GHO, 11 = LUSD
+;; 12 = crvUSD, 13 = mkUSD
+
+;; Returns adjustment in basis points (-50 to +150)
+;; Negative = discount, Positive = premium
+int get_stablecoin_risk_adjustment(int stablecoin_id) inline {
+    ;; Tier 1: Fiat-backed majors (0 bps adjustment)
+    if (stablecoin_id == 0) {
+        return 0;      ;; USDC: Circle, highly regulated
+    }
+    if (stablecoin_id == 1) {
+        return 0;      ;; USDT: Tether, largest by market cap
+    }
+    if (stablecoin_id == 2) {
+        return 0;      ;; USDP: Paxos, regulated by NYDFS
+    }
+
+    ;; Tier 2: Established crypto-collateralized (0-25 bps)
+    if (stablecoin_id == 3) {
+        return 0;      ;; DAI: MakerDAO, longest track record
+    }
+    if (stablecoin_id == 11) {
+        return 10;     ;; LUSD: Liquity, immutable protocol
+    }
+
+    ;; Tier 3: Newer fiat-backed (+25-50 bps)
+    if (stablecoin_id == 5) {
+        return 50;     ;; BUSD: Binance/Paxos (being phased out)
+    }
+    if (stablecoin_id == 9) {
+        return 25;     ;; PYUSD: PayPal, new but strong backing
+    }
+
+    ;; Tier 4: Algorithmic/hybrid (+50-100 bps)
+    if (stablecoin_id == 4) {
+        return 75;     ;; FRAX: Fractional-algorithmic
+    }
+    if (stablecoin_id == 10) {
+        return 50;     ;; GHO: Aave, crypto-collateralized
+    }
+    if (stablecoin_id == 12) {
+        return 60;     ;; crvUSD: Curve, newer design
+    }
+    if (stablecoin_id == 13) {
+        return 70;     ;; mkUSD: Prisma, newer protocol
+    }
+
+    ;; Tier 5: Delta-neutral / Yield-bearing (+100-150 bps)
+    if (stablecoin_id == 6) {
+        return 100;    ;; USDe: Ethena delta-neutral, complex strategy
+    }
+    if (stablecoin_id == 7) {
+        return 125;    ;; sUSDe: Staked USDe, additional complexity
+    }
+    if (stablecoin_id == 8) {
+        return 110;    ;; USDY: Ondo yield-bearing, RWA exposure
+    }
+
+    throw(401);  ;; Invalid stablecoin_id
+    return 0;  ;; Unreachable but satisfies compiler
+}
+
+;; Get stablecoin risk tier (0 = safest, 4 = riskiest)
+int get_stablecoin_risk_tier(int stablecoin_id) inline {
+    if ((stablecoin_id >= 0) & (stablecoin_id <= 2)) {
+        return 0;  ;; Tier 1: USDC, USDT, USDP
+    }
+    if ((stablecoin_id == 3) | (stablecoin_id == 11)) {
+        return 1;  ;; Tier 2: DAI, LUSD
+    }
+    if ((stablecoin_id == 5) | (stablecoin_id == 9)) {
+        return 2;  ;; Tier 3: BUSD, PYUSD
+    }
+    if ((stablecoin_id >= 4) & (stablecoin_id <= 13)) {
+        return 3;  ;; Tier 4: Algorithmic/hybrid
+    }
+    if ((stablecoin_id >= 6) & (stablecoin_id <= 8)) {
+        return 4;  ;; Tier 5: Complex strategies
+    }
+    return 3;  ;; Default to medium-high risk
+}
+
+;; ===========================================
+;; COVERAGE TYPE BASE RATES (in basis points)
+;; ===========================================
+
+;; Coverage type IDs:
+;; 0 = Depeg, 1 = Smart_contract, 2 = Oracle, 3 = Bridge, 4 = CEX_liquidation
+
+int get_coverage_type_base_rate(int coverage_type) inline {
+    if (coverage_type == 0) {
+        return 80;     ;; Depeg: 0.8% APR (most common, lower risk)
+    }
+    if (coverage_type == 1) {
+        return 200;    ;; Smart contract: 2% APR (medium risk)
+    }
+    if (coverage_type == 2) {
+        return 180;    ;; Oracle failure: 1.8% APR (medium risk)
+    }
+    if (coverage_type == 3) {
+        return 200;    ;; Bridge hack: 2% APR (high impact events)
+    }
+    if (coverage_type == 4) {
+        return 300;    ;; CEX liquidation: 3% APR (NEW - highest risk)
+    }
+
+    throw(402);  ;; Invalid coverage_type
+    return 80;  ;; Unreachable but satisfies compiler
+}
+
+;; ===========================================
+;; COMBINED RISK CALCULATION
+;; ===========================================
+
+;; Calculate final premium with all adjustments
+;; Returns premium in nanoTON
+int calculate_multi_dimensional_premium(
+    int coverage_type,
+    int chain_id,
+    int stablecoin_id,
+    int coverage_amount,
+    int duration_days
+) inline {
+    ;; 1. Get base rate for coverage type
+    int base_rate = get_coverage_type_base_rate(coverage_type);
+
+    ;; 2. Get chain risk multiplier (in basis points, 10000 = 1.0x)
+    int chain_multiplier = get_chain_risk_multiplier(chain_id);
+
+    ;; 3. Get stablecoin risk adjustment (in basis points)
+    int stablecoin_adjustment = get_stablecoin_risk_adjustment(stablecoin_id);
+
+    ;; 4. Apply chain multiplier to base rate
+    ;; base_rate_adjusted = base_rate * (chain_multiplier / 10000)
+    int adjusted_rate = muldiv(base_rate, chain_multiplier, 10000);
+
+    ;; 5. Apply stablecoin adjustment (additive in bps)
+    ;; If stablecoin_adjustment = +100, add 1% to APR
+    ;; If base is 80 bps (0.8%), +100 bps = 180 bps (1.8%)
+    adjusted_rate += stablecoin_adjustment;
+
+    ;; 6. Time multiplier (same as original)
+    int time_multiplier = 1000;  ;; Default 1.0x for 90 days
+    if (duration_days == 30) {
+        time_multiplier = 1200;  ;; 1.2x premium (shorter term)
+    } elseif (duration_days == 180) {
+        time_multiplier = 900;   ;; 0.9x discount (longer term)
+    }
+
+    ;; 7. Calculate final premium
+    ;; Formula: (amount * adjusted_rate * days / 365 / 10000) * time_multiplier / 1000
+    int premium = muldiv(coverage_amount, adjusted_rate * duration_days, 365 * 10000);
+    premium = muldiv(premium, time_multiplier, 1000);
+
+    return premium;
+}
+
+;; ===========================================
+;; VALIDATION HELPERS
+;; ===========================================
+
+;; Validate chain ID is in valid range (0-7)
+() validate_chain_id(int chain_id) impure inline {
+    throw_unless(403, (chain_id >= 0) & (chain_id <= 7));
+}
+
+;; Validate stablecoin ID is in valid range (0-13)
+() validate_stablecoin_id(int stablecoin_id) impure inline {
+    throw_unless(404, (stablecoin_id >= 0) & (stablecoin_id <= 13));
+}
+
+;; Validate coverage type is in valid range (0-4, now includes CEX_liquidation)
+() validate_coverage_type(int coverage_type) impure inline {
+    throw_unless(405, (coverage_type >= 0) & (coverage_type <= 4));
+}
+
+;; Validate chain supports stablecoin (basic check)
+;; Returns 1 if valid combination, 0 if not
+;; In production, this would check a more comprehensive compatibility matrix
+int validate_chain_stablecoin_pair(int chain_id, int stablecoin_id) inline {
+    ;; Bitcoin (4) only supports USDT (1)
+    if (chain_id == 4) {
+        return stablecoin_id == 1;
+    }
+
+    ;; Lightning (5) supports USDT (1) and USDC (0)
+    if (chain_id == 5) {
+        return (stablecoin_id == 0) | (stablecoin_id == 1);
+    }
+
+    ;; All other chains support most stablecoins
+    ;; This is a simplified check - frontend has full compatibility matrix
+    return 1;
+}
+
+;; ===========================================
+;; PRODUCT HASH CALCULATION
+;; ===========================================
+
+;; Generate unique product identifier for caching/indexing
+;; Hash = (coverage_type << 16) | (chain_id << 8) | stablecoin_id
+;; Example: Depeg + Ethereum + USDC = (0 << 16) | (0 << 8) | 0 = 0
+;; Example: Bridge + Solana + USDT = (3 << 16) | (7 << 8) | 1 = 197633
+int calculate_product_hash(int coverage_type, int chain_id, int stablecoin_id) inline {
+    return (coverage_type << 16) | (chain_id << 8) | stablecoin_id;
+}
+
+;; Decompose product hash back to components
+(int, int, int) decompose_product_hash(int product_hash) inline {
+    int coverage_type = product_hash >> 16;
+    int chain_id = (product_hash >> 8) & 0xFF;
+    int stablecoin_id = product_hash & 0xFF;
+    return (coverage_type, chain_id, stablecoin_id);
+}
+
+;; ===========================================
+;; COVERAGE TYPE NAMES (for events/logging)
+;; ===========================================
+
+int get_coverage_type_name_hash(int coverage_type) inline {
+    ;; Returns simple identifier for frontend mapping
+    ;; 0 = DEPEG, 1 = CONTRACT, 2 = ORACLE, 3 = BRIDGE, 4 = CEX_LIQ
+    return coverage_type;
+}

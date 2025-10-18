@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  redis-1:
+    image: redis:7.2-alpine
+    container_name: tonsurance-redis-1
+    command: redis-server --port 6379 --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-1-data:/data
+    networks:
+      - tonsurance-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis-2:
+    image: redis:7.2-alpine
+    container_name: tonsurance-redis-2
+    command: redis-server --port 6380 --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
+    ports:
+      - "6380:6380"
+    volumes:
+      - redis-2-data:/data
+    networks:
+      - tonsurance-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6380", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis-3:
+    image: redis:7.2-alpine
+    container_name: tonsurance-redis-3
+    command: redis-server --port 6381 --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 5000 --appendonly yes
+    ports:
+      - "6381:6381"
+    volumes:
+      - redis-3-data:/data
+    networks:
+      - tonsurance-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6381", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redis-1-data:
+    driver: local
+  redis-2-data:
+    driver: local
+  redis-3-data:
+    driver: local
+
+networks:
+  tonsurance-net:
+    driver: bridge

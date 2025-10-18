@@ -184,21 +184,10 @@ export const MultiChainInsurance = () => {
   return (
     <div className="space-y-8 pb-20">
       {/* Header */}
-      <TerminalWindow title="MULTI-CHAIN INSURANCE PROTOCOL v4.0">
-        <div className="space-y-2 font-mono text-sm">
-          <div className="text-green-400">
-            ╔════════════════════════════════════════════════════════════════╗
-          </div>
-          <div className="text-green-400">
-            ║  CROSS-CHAIN STABLECOIN INSURANCE                              ║
-          </div>
-          <div className="text-green-400">
-            ║  14 Stablecoins • 8 Blockchains • Real-Time Bridge Monitoring  ║
-          </div>
-          <div className="text-green-400">
-            ╚════════════════════════════════════════════════════════════════╝
-          </div>
-          <div className="text-gray-400 mt-4">
+      <TerminalWindow title="MULTI-CHAIN_INSURANCE">
+        <div className="font-mono text-sm text-text-secondary">
+          &gt; 14 Stablecoins • 8 Blockchains • Real-Time Bridge Monitoring
+          <div className="mt-2 text-xs">
             Insure your stablecoins across any supported blockchain with dynamic pricing
             based on real-time bridge health and external hedge costs.
           </div>
@@ -227,8 +216,8 @@ export const MultiChainInsurance = () => {
         <div className="space-y-6">
           {/* Coverage Types */}
           <div>
-            <h3 className="text-green-400 font-mono text-sm mb-3">
-              SELECT COVERAGE TYPES
+            <h3 className="text-text-secondary font-mono text-xs font-semibold mb-3 uppercase">
+              Select Coverage Types
             </h3>
             <div className="grid grid-cols-2 gap-3">
               {Object.entries(coverageTypes).map(([type, info]) => {
@@ -240,26 +229,28 @@ export const MultiChainInsurance = () => {
                     key={type}
                     onClick={() => toggleCoverageType(type as CoverageType)}
                     className={`
-                      relative p-4 border-2 transition-all text-left
+                      relative p-4 border-3 transition-all text-left
                       ${isSelected
-                        ? 'border-green-400 bg-green-400/10'
-                        : 'border-gray-600 hover:border-gray-500'}
+                        ? 'border-copper-500 bg-copper-50 shadow-[0_0_0_2px_#D87665]'
+                        : 'border-cream-400 hover:bg-cream-300 hover:border-copper-300'}
                     `}
                   >
                     <div className="flex items-start justify-between mb-2">
                       <span className="text-2xl">{info.icon}</span>
                       {isRecommended && (
-                        <span className="text-[10px] text-yellow-400 border border-yellow-400 px-2 py-1 font-mono">
+                        <span className="text-[10px] text-copper-500 border-2 border-copper-500 px-2 py-0.5 font-mono font-bold">
                           RECOMMENDED
                         </span>
                       )}
                     </div>
                     <div className="font-mono">
-                      <div className="text-xs text-gray-300 mb-1">{info.name}</div>
-                      <div className="text-[10px] text-gray-500">{info.description}</div>
+                      <div className="text-sm font-semibold text-copper-500 mb-1">{info.name}</div>
+                      <div className="text-xs text-text-secondary">{info.description}</div>
                     </div>
                     {isSelected && (
-                      <div className="absolute top-2 right-2 text-green-400 text-xs">✓</div>
+                      <div className="absolute top-2 right-2 w-5 h-5 bg-copper-500 text-white rounded-full flex items-center justify-center text-xs font-bold">
+                        ✓
+                      </div>
                     )}
                   </button>
                 );
@@ -269,15 +260,15 @@ export const MultiChainInsurance = () => {
 
           {/* Coverage Amount */}
           <div>
-            <h3 className="text-green-400 font-mono text-sm mb-3">
-              COVERAGE AMOUNT ({selectedStablecoin})
+            <h3 className="text-text-secondary font-mono text-xs font-semibold mb-3 uppercase">
+              Coverage Amount ({selectedStablecoin})
             </h3>
             <div className="flex gap-3">
               <input
                 type="number"
                 value={coverageAmount}
                 onChange={e => setCoverageAmount(e.target.value)}
-                className="flex-1 bg-black border-2 border-gray-600 px-4 py-3 text-green-400 font-mono focus:border-green-400 outline-none"
+                className="flex-1 bg-cream-300/50 border border-cream-400 px-4 py-3 text-text-primary font-mono focus:border-copper-500 focus:outline-none outline-none"
                 placeholder="10000"
               />
               <div className="grid grid-cols-4 gap-2">
@@ -296,15 +287,15 @@ export const MultiChainInsurance = () => {
 
           {/* Duration */}
           <div>
-            <h3 className="text-green-400 font-mono text-sm mb-3">
-              DURATION (DAYS)
+            <h3 className="text-text-secondary font-mono text-xs font-semibold mb-3 uppercase">
+              Duration (Days)
             </h3>
             <div className="flex gap-3">
               <input
                 type="number"
                 value={durationDays}
                 onChange={e => setDurationDays(e.target.value)}
-                className="flex-1 bg-black border-2 border-gray-600 px-4 py-3 text-green-400 font-mono focus:border-green-400 outline-none"
+                className="flex-1 bg-cream-300/50 border border-cream-400 px-4 py-3 text-text-primary font-mono focus:border-copper-500 focus:outline-none outline-none"
                 placeholder="30"
               />
               <div className="grid grid-cols-4 gap-2">
@@ -329,21 +320,21 @@ export const MultiChainInsurance = () => {
           <div className="space-y-4 font-mono text-sm">
             {/* Breakdown */}
             <div className="space-y-2">
-              <div className="flex justify-between">
-                <span className="text-gray-400">Base Premium:</span>
-                <span className="text-gray-300">${quote.baseAmount.toFixed(2)}</span>
+              <div className="flex justify-between text-xs">
+                <span className="text-text-secondary">Base Premium:</span>
+                <span className="text-text-primary font-semibold">${quote.baseAmount.toFixed(2)}</span>
               </div>
               {quote.bridgeRiskAdjustment > 0 && (
-                <div className="flex justify-between">
-                  <span className="text-gray-400">
+                <div className="flex justify-between text-xs">
+                  <span className="text-text-secondary">
                     Bridge Risk ({quote.bridgeRiskMultiplier.toFixed(1)}x):
                   </span>
-                  <span className="text-yellow-400">+${quote.bridgeRiskAdjustment.toFixed(2)}</span>
+                  <span className="text-copper-500 font-semibold">+${quote.bridgeRiskAdjustment.toFixed(2)}</span>
                 </div>
               )}
-              <div className="text-xs text-gray-500 pl-4 space-y-1">
+              <div className="text-xs text-text-tertiary pl-4 space-y-1">
                 <div className="flex justify-between">
-                  <span>Polymarket (40%):</span>
+                  <span>Prediction Markets (40%):</span>
                   <span>${quote.hedgeCosts.polymarket.toFixed(2)}</span>
                 </div>
                 <div className="flex justify-between">
@@ -351,23 +342,23 @@ export const MultiChainInsurance = () => {
                   <span>${quote.hedgeCosts.perpetuals.toFixed(2)}</span>
                 </div>
                 <div className="flex justify-between">
-                  <span>Allianz (20%):</span>
+                  <span>Off-Chain Reinsurance (20%):</span>
                   <span>${quote.hedgeCosts.allianz.toFixed(2)}</span>
                 </div>
               </div>
-              <div className="border-t border-gray-700 pt-2"></div>
-              <div className="flex justify-between text-lg">
-                <span className="text-green-400">Total Premium:</span>
-                <span className="text-green-400 font-bold">${quote.totalPremium.toFixed(2)}</span>
+              <div className="border-t-2 border-cream-400 pt-2"></div>
+              <div className="flex justify-between">
+                <span className="text-text-secondary font-semibold">Total Premium:</span>
+                <span className="text-terminal-green font-bold text-lg">${quote.totalPremium.toFixed(2)}</span>
               </div>
               <div className="flex justify-between text-xs">
-                <span className="text-gray-500">Effective APR:</span>
-                <span className="text-gray-400">{(quote.apr * 100).toFixed(2)}%</span>
+                <span className="text-text-tertiary">Effective APR:</span>
+                <span className="text-text-secondary">{(quote.apr * 100).toFixed(2)}%</span>
               </div>
               {quote.estimatedSavings > 0 && (
                 <div className="flex justify-between text-xs">
-                  <span className="text-gray-500">Savings vs Core Insurance:</span>
-                  <span className="text-green-400">-${quote.estimatedSavings.toFixed(2)} ({((quote.estimatedSavings / (quote.totalPremium + quote.estimatedSavings)) * 100).toFixed(0)}%)</span>
+                  <span className="text-text-tertiary">Savings vs Core Insurance:</span>
+                  <span className="text-terminal-green font-semibold">-${quote.estimatedSavings.toFixed(2)} ({((quote.estimatedSavings / (quote.totalPremium + quote.estimatedSavings)) * 100).toFixed(0)}%)</span>
                 </div>
               )}
             </div>
@@ -402,7 +393,7 @@ export const MultiChainInsurance = () => {
 
       {!userAddress && (
         <InfoPanel variant="warning">
-          Please connect your TON wallet to purchase insurance
+          Please connect your TON wallet to purchase parametric coverage
         </InfoPanel>
       )}
     </div>

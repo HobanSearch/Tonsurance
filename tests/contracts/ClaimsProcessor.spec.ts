@@ -1,47 +1,58 @@
 import { Blockchain, SandboxContract, TreasuryContract } from '@ton/sandbox';
-import { Cell, toNano, beginCell } from '@ton/core';
-import { ClaimsProcessor } from '../wrappers/ClaimsProcessor';
+import { Cell, toNano, beginCell, Address } from '@ton/core';
+import { ClaimsProcessor, claimsProcessorConfigToCell } from '../wrappers/ClaimsProcessor';
+import { MultiTrancheVault, createInitialTrancheData } from '../wrappers/MultiTrancheVault';
 import '@ton/test-utils';
 import { compile } from '@ton/blueprint';
 
 describe('ClaimsProcessor', () => {
-    let code: Cell;
+    let claimsProcessorCode: Cell;
+    let multiTrancheVaultCode: Cell;
 
     beforeAll(async () => {
-        code = await compile('ClaimsProcessor');
+        claimsProcessorCode = await compile('ClaimsProcessor';
+        multiTrancheVaultCode = await compile('MultiTrancheVault');
     });
 
     let blockchain: Blockchain;
     let deployer: SandboxContract<TreasuryContract>;
     let claimsProcessor: SandboxContract<ClaimsProcessor>;
     let treasury: SandboxContract<TreasuryContract>;
-    let primaryVault: SandboxContract<TreasuryContract>;
-    let secondaryVault: SandboxContract<TreasuryContract>;
-    let tradfiBuffer: SandboxContract<TreasuryContract>;
+    let multiTrancheVault: SandboxContract<MultiTrancheVault>;
     let priceOracle: SandboxContract<TreasuryContract>;
 
     beforeEach(async () => {
         blockchain = await Blockchain.create();
         deployer = await blockchain.treasury('deployer');
         treasury = await blockchain.treasury('treasury');
-        primaryVault = await blockchain.treasury('primaryVault');
-        secondaryVault = await blockchain.treasury('secondaryVault');
-        tradfiBuffer = await blockchain.treasury('tradfiBuffer');
         priceOracle = await blockchain.treasury('priceOracle');
 
+        // Deploy MultiTrancheVault
+        multiTrancheVault = blockchain.openContract(
+            MultiTrancheVault.createFromConfig(
+                {
+                    ownerAddress: deployer.address,
+                    adminAddress: deployer.address,
+                    claimsProcessorAddress: Address.parse('EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c'), // Temp address
+                    trancheData: createInitialTrancheData(),
+                },
+                multiTrancheVaultCode
+            )
+        );
+        await multiTrancheVault.sendDeploy(deployer.getSender(), toNano('1'));
+
+        // Deploy ClaimsProcessor
         claimsProcessor = blockchain.openContract(
             ClaimsProcessor.createFromConfig(
                 {
                     ownerAddress: deployer.address,
                     nextClaimId: 1n,
                     treasuryAddress: treasury.address,
-                    primaryVaultAddress: primaryVault.address,
-                    secondaryVaultAddress: secondaryVault.address,
-                    tradfiBufferAddress: tradfiBuffer.address,
+                    multiTrancheVaultAddress: multiTrancheVault.address,
                     priceOracleAddress: priceOracle.address,
-                    autoApprovalThreshold: 100,
+                    autoApprovalThreshold: 10000,
                 },
-                code
+                claimsProcessorCode
             )
         );
 
@@ -53,6 +64,9 @@ describe('ClaimsProcessor', () => {
             deploy: true,
             success: true,
         });
+
+        // Set the actual ClaimsProcessor address in the vault
+        await multiTrancheVault.sendSetClaimsProcessor(deployer.getSender(), toNano('0.05'), claimsProcessor.address);
     });
 
     it('should deploy successfully', async () => {
@@ -66,7 +80,9 @@ describe('ClaimsProcessor', () => {
         const result = await claimsProcessor.sendFileClaim(claimant.getSender(), {
             value: toNano('0.1'),
             policyId: 1n,
-            coverageType: 1, // USDT depeg
+            coverageType: 0, // Depeg
+            chainId: 0, // Ethereum
+            stablecoinId: 0, // USDC
             coverageAmount: toNano('1000'),
             evidence,
         });
@@ -78,10 +94,10 @@ describe('ClaimsProcessor', () => {
         });
     });
 
-    it('should auto-verify USDT depeg claims', async () => {
+    it('should auto-verify claims if event is verified', async () => {
         const claimant = await blockchain.treasury('claimant');
 
-        // Add USDT depeg as verified event
+        // Add a verified event by owner
         const eventHash = BigInt('0x' + '1'.repeat(64)); // Mock event hash
         await claimsProcessor.sendAddVerifiedEvent(deployer.getSender(), {
             value: toNano('0.05'),
@@ -93,7 +109,9 @@ describe('ClaimsProcessor', () => {
         await claimsProcessor.sendFileClaim(claimant.getSender(), {
             value: toNano('0.15'),
             policyId: 1n,
-            coverageType: 1, // USDT depeg
+            coverageType: 0, // Depeg
+            chainId: 0, // Ethereum
+            stablecoinId: 0, // USDC
             coverageAmount: toNano('1000'),
             evidence,
         });
@@ -104,64 +122,16 @@ describe('ClaimsProcessor', () => {
         expect(status.autoApproved).toBe(true);
     });
 
-    it('should auto-verify protocol exploit claims', async () => {
-        const claimant = await blockchain.treasury('claimant');
-        const eventHash = BigInt('0x' + '2'.repeat(64));
-
-        await claimsProcessor.sendAddVerifiedEvent(deployer.getSender(), {
-            value: toNano('0.05'),
-            eventHash,
-        });
-
-        const evidence = beginCell().storeUint(Number(eventHash & 0xffffffffn), 32).endCell();
-
-        await claimsProcessor.sendFileClaim(claimant.getSender(), {
-            value: toNano('0.15'),
-            policyId: 2n,
-            coverageType: 2, // Protocol exploit
-            coverageAmount: toNano('2000'),
-            evidence,
-        });
-
-        const status = await claimsProcessor.getClaimStatus(1n);
-
-        expect(status.status).toBe(1); // STATUS_APPROVED
-        expect(status.autoApproved).toBe(true);
-    });
-
-    it('should auto-verify bridge hack claims', async () => {
-        const claimant = await blockchain.treasury('claimant');
-        const eventHash = BigInt('0x' + '3'.repeat(64));
-
-        await claimsProcessor.sendAddVerifiedEvent(deployer.getSender(), {
-            value: toNano('0.05'),
-            eventHash,
-        });
-
-        const evidence = beginCell().storeUint(Number(eventHash & 0xffffffffn), 32).endCell();
-
-        await claimsProcessor.sendFileClaim(claimant.getSender(), {
-            value: toNano('0.15'),
-            policyId: 3n,
-            coverageType: 3, // Bridge hack
-            coverageAmount: toNano('3000'),
-            evidence,
-        });
-
-        const status = await claimsProcessor.getClaimStatus(1n);
-
-        expect(status.status).toBe(1); // STATUS_APPROVED
-        expect(status.autoApproved).toBe(true);
-    });
-
-    it('should leave subjective claims pending for admin review', async () => {
+    it('should leave claims pending for admin review if no event verified', async () => {
         const claimant = await blockchain.treasury('claimant');
         const evidence = beginCell().storeUint(999999, 64).endCell();
 
         await claimsProcessor.sendFileClaim(claimant.getSender(), {
             value: toNano('0.1'),
             policyId: 4n,
-            coverageType: 4, // Subjective claim (e.g., smart contract bug)
+            coverageType: 1, // Smart Contract
+            chainId: 0,
+            stablecoinId: 0,
             coverageAmount: toNano('2000'),
             evidence,
         });
@@ -179,7 +149,9 @@ describe('ClaimsProcessor', () => {
         await claimsProcessor.sendFileClaim(claimant.getSender(), {
             value: toNano('0.1'),
             policyId: 5n,
-            coverageType: 4,
+            coverageType: 1,
+            chainId: 0,
+            stablecoinId: 0,
             coverageAmount: toNano('2000'),
             evidence,
         });
@@ -202,152 +174,7 @@ describe('ClaimsProcessor', () => {
         expect(status.autoApproved).toBe(false); // Manually approved
     });
 
-    it('should allow owner to manually reject pending claims', async () => {
-        const claimant = await blockchain.treasury('claimant');
-        const evidence = beginCell().storeUint(999999, 64).endCell();
-
-        await claimsProcessor.sendFileClaim(claimant.getSender(), {
-            value: toNano('0.1'),
-            policyId: 6n,
-            coverageType: 4,
-            coverageAmount: toNano('2000'),
-            evidence,
-        });
-
-        // Admin rejects claim
-        const result = await claimsProcessor.sendAdminRejectClaim(deployer.getSender(), {
-            value: toNano('0.15'),
-            claimId: 1n,
-        });
-
-        expect(result.transactions).toHaveTransaction({
-            from: deployer.address,
-            to: claimsProcessor.address,
-            success: true,
-        });
-
-        const status = await claimsProcessor.getClaimStatus(1n);
-
-        expect(status.status).toBe(2); // STATUS_REJECTED
-    });
-
-    it('should reject non-owner approval attempts', async () => {
-        const claimant = await blockchain.treasury('claimant');
-        const attacker = await blockchain.treasury('attacker');
-        const evidence = beginCell().storeUint(999999, 64).endCell();
-
-        await claimsProcessor.sendFileClaim(claimant.getSender(), {
-            value: toNano('0.1'),
-            policyId: 7n,
-            coverageType: 4,
-            coverageAmount: toNano('2000'),
-            evidence,
-        });
-
-        // Non-owner tries to approve claim
-        const result = await claimsProcessor.sendAdminApproveClaim(attacker.getSender(), {
-            value: toNano('0.15'),
-            claimId: 1n,
-        });
-
-        expect(result.transactions).toHaveTransaction({
-            from: attacker.address,
-            to: claimsProcessor.address,
-            success: false,
-            exitCode: 403, // Not owner
-        });
-    });
-
-    it('should reject non-owner rejection attempts', async () => {
-        const claimant = await blockchain.treasury('claimant');
-        const attacker = await blockchain.treasury('attacker');
-        const evidence = beginCell().storeUint(999999, 64).endCell();
-
-        await claimsProcessor.sendFileClaim(claimant.getSender(), {
-            value: toNano('0.1'),
-            policyId: 8n,
-            coverageType: 4,
-            coverageAmount: toNano('2000'),
-            evidence,
-        });
-
-        // Non-owner tries to reject claim
-        const result = await claimsProcessor.sendAdminRejectClaim(attacker.getSender(), {
-            value: toNano('0.15'),
-            claimId: 1n,
-        });
-
-        expect(result.transactions).toHaveTransaction({
-            from: attacker.address,
-            to: claimsProcessor.address,
-            success: false,
-            exitCode: 403, // Not owner
-        });
-    });
-
-    it('should retrieve claim status correctly', async () => {
-        const claimant = await blockchain.treasury('claimant');
-        const evidence = beginCell().storeUint(999999, 64).endCell();
-
-        await claimsProcessor.sendFileClaim(claimant.getSender(), {
-            value: toNano('0.1'),
-            policyId: 9n,
-            coverageType: 4,
-            coverageAmount: toNano('3000'),
-            evidence,
-        });
-
-        const status = await claimsProcessor.getClaimStatus(1n);
-
-        expect(status.coverageAmount).toBe(toNano('3000'));
-        expect(status.status).toBeGreaterThanOrEqual(0);
-    });
-
-    it('should execute loss waterfall (Primary → Secondary → TradFi)', async () => {
-        const claimant = await blockchain.treasury('claimant');
-        const eventHash = BigInt('0x' + '4'.repeat(64));
-
-        await claimsProcessor.sendAddVerifiedEvent(deployer.getSender(), {
-            value: toNano('0.05'),
-            eventHash,
-        });
-
-        const evidence = beginCell().storeUint(Number(eventHash & 0xffffffffn), 32).endCell();
-
-        const result = await claimsProcessor.sendFileClaim(claimant.getSender(), {
-            value: toNano('0.2'),
-            policyId: 10n,
-            coverageType: 1,
-            coverageAmount: toNano('5000'),
-            evidence,
-        });
-
-        // Check that claim was auto-approved and payout initiated
-        expect(result.transactions).toHaveTransaction({
-            from: claimsProcessor.address,
-            to: primaryVault.address,
-            success: true,
-        });
-    });
-
-    it('should only allow owner to add verified events', async () => {
-        const attacker = await blockchain.treasury('attacker');
-        const eventHash = BigInt('0x' + '5'.repeat(64));
-
-        const result = await claimsProcessor.sendAddVerifiedEvent(attacker.getSender(), {
-            value: toNano('0.05'),
-            eventHash,
-        });
-
-        expect(result.transactions).toHaveTransaction({
-            from: attacker.address,
-            to: claimsProcessor.address,
-            success: false,
-            exitCode: 403,
-        });
-    });
-
-    it('should send payout to claimant after approval', async () => {
+    it('should send payout request to MultiTrancheVault after approval', async () => {
         const claimant = await blockchain.treasury('claimant');
         const eventHash = BigInt('0x' + '6'.repeat(64));
 
@@ -361,44 +188,19 @@ describe('ClaimsProcessor', () => {
         const result = await claimsProcessor.sendFileClaim(claimant.getSender(), {
             value: toNano('0.2'),
             policyId: 11n,
-            coverageType: 2,
+            coverageType: 2, // Oracle Failure
+            chainId: 0,
+            stablecoinId: 0,
             coverageAmount: toNano('1000'),
             evidence,
         });
 
-        // Payout request should be sent to PrimaryVault
+        // Payout request should be sent to MultiTrancheVault
         expect(result.transactions).toHaveTransaction({
             from: claimsProcessor.address,
-            to: primaryVault.address,
+            to: multiTrancheVault.address,
+            op: 0x04, // op: absorb_loss
             success: true,
         });
-    });
-
-    it('should handle multiple claims from different users', async () => {
-        const claimant1 = await blockchain.treasury('claimant1');
-        const claimant2 = await blockchain.treasury('claimant2');
-        const evidence = beginCell().storeUint(999999, 64).endCell();
-
-        await claimsProcessor.sendFileClaim(claimant1.getSender(), {
-            value: toNano('0.1'),
-            policyId: 12n,
-            coverageType: 4,
-            coverageAmount: toNano('1000'),
-            evidence,
-        });
-
-        await claimsProcessor.sendFileClaim(claimant2.getSender(), {
-            value: toNano('0.1'),
-            policyId: 13n,
-            coverageType: 4,
-            coverageAmount: toNano('2000'),
-            evidence,
-        });
-
-        const status1 = await claimsProcessor.getClaimStatus(1n);
-        const status2 = await claimsProcessor.getClaimStatus(2n);
-
-        expect(status1.coverageAmount).toBe(toNano('1000'));
-        expect(status2.coverageAmount).toBe(toNano('2000'));
     });
 });

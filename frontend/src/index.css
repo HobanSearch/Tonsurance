@@ -213,6 +213,50 @@ select:focus {
   outline-offset: 2px;
 }
 
+/* TON Connect Button Styling */
+.ton-connect-button,
+[class*="tc-button"],
+[class*="tonconnect"] {
+  font-family: 'IBM Plex Mono', 'Space Mono', 'Courier New', monospace !important;
+}
+
+/* Style TON Connect button to match retro theme */
+button[class*="tc-button"] {
+  background: linear-gradient(180deg, #E89B88 0%, var(--copper) 50%, var(--copper-dark) 100%) !important;
+  color: #FFFBF8 !important;
+  border: 2px solid var(--copper-dark) !important;
+  border-right: 3px solid rgba(0, 0, 0, 0.2) !important;
+  border-bottom: 3px solid rgba(0, 0, 0, 0.2) !important;
+  border-radius: 0 !important;
+  font-family: 'IBM Plex Mono', monospace !important;
+  font-weight: 600 !important;
+  font-size: 13px !important;
+  padding: 8px 16px !important;
+  box-shadow:
+    0 2px 4px rgba(0, 0, 0, 0.15),
+    inset 0 1px 0 rgba(255, 255, 255, 0.25),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.1) !important;
+  transition: all 0.1s !important;
+}
+
+button[class*="tc-button"]:hover {
+  background: linear-gradient(180deg, #EDA593 0%, #E08675 50%, #CE5E50  100%) !important;
+}
+
+button[class*="tc-button"]:active {
+  border-right: 2px solid var(--copper-darker) !important;
+  border-bottom: 2px solid var(--copper-darker) !important;
+  border-left: 3px solid rgba(0, 0, 0, 0.2) !important;
+  border-top: 3px solid rgba(0, 0, 0, 0.2) !important;
+  transform: translate(1px, 1px) !important;
+}
+
+/* Style TON Connect modal */
+div[class*="tc-modal"],
+div[class*="tonconnect-modal"] {
+  font-family: 'IBM Plex Mono', monospace !important;
+}
+
 /* Reduced Motion */
 @media (prefers-reduced-motion: reduce) {
   .terminal-window::before {

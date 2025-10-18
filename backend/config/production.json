@@ -1,0 +1,78 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Production environment configuration - Tight limits for security and performance",
+  "version": "1.0.0",
+  "environment": "production",
+
+  "timeouts": {
+    "ton_client_seconds": 30,
+    "http_default_seconds": 10.0,
+    "oracle_update_interval_seconds": 60.0,
+    "daemon_health_check_seconds": 30.0
+  },
+
+  "gas": {
+    "environment_multiplier": 1.2,
+    "deploy_buffer_percent": 20,
+    "description": "20% gas buffer for safety in production"
+  },
+
+  "retry": {
+    "max_attempts": 3,
+    "backoff_max_seconds": 16.0
+  },
+
+  "pools": {
+    "database_pool_size": 50,
+    "worker_threads": 16,
+    "max_concurrent_requests": 200,
+    "rate_limit_per_minute": 100
+  },
+
+  "thresholds": {
+    "circuit_breaker_failures": 5,
+    "oracle_staleness_critical_seconds": 300,
+    "min_reserve_balance_ton": 1000,
+    "utilization_critical_percent": 90.0,
+    "description": "Strict thresholds for production safety"
+  },
+
+  "logging": {
+    "level": "INFO",
+    "verbose_queries": false,
+    "trace_http_requests": false,
+    "enable_audit_log": true
+  },
+
+  "features": {
+    "enable_hot_reload": false,
+    "enable_test_endpoints": false,
+    "skip_signature_verification": false,
+    "mock_external_apis": false,
+    "require_multi_sig": true
+  },
+
+  "security": {
+    "enable_rate_limiting": true,
+    "enable_ip_whitelist": false,
+    "enable_request_signing": true,
+    "max_request_size_mb": 10
+  },
+
+  "monitoring": {
+    "enable_prometheus": true,
+    "enable_grafana_alerts": true,
+    "alert_webhook_url": "${ALERT_WEBHOOK_URL}",
+    "pagerduty_api_key": "${PAGERDUTY_API_KEY}"
+  },
+
+  "notes": [
+    "Production configuration prioritizes security and stability",
+    "Tight resource limits prevent abuse",
+    "20% gas buffer for network congestion",
+    "All security features enabled",
+    "Monitoring and alerting mandatory",
+    "Test endpoints disabled",
+    "Environment variables used for secrets"
+  ]
+}

@@ -4,26 +4,35 @@
    1. Manages single unified pool backing all products
    2. Enforces risk limits consistently across all policies
    3. Allocates capital for new policies
-   4. Tracks virtual tranche accounting
-   5. Executes loss waterfall on payouts
+   4. Tracks 6-tier tranche accounting (BTC, SNR, MEZZ, JNR, JNR+, EQT)
+   5. Executes loss waterfall on payouts (reverse order: EQT → BTC)
    6. Rebalances between USD and BTC
 
    CRITICAL: Every policy must pass through can_underwrite()
    No exceptions. No product-specific overrides.
+
+   ARCHITECTURAL UPDATE (Phase 1):
+   - Replaced legacy 2-vault model with 6-tier MultiTrancheVault integration
+   - Effective capital calculation respects waterfall risk (EQT 100% → BTC 50%)
+   - Per-tranche utilization tracking
+   - Integration with MultiTrancheVault.fc via get_tranche_info()
 *)
 
 open Core
 open Types
 open Math
+(* open Pricing_engine.Tranche_pricing *)
 
 module CollateralManager = struct
 
-  (** Virtual tranche for LP accounting **)
+  (** 6-tier tranche for LP accounting
+      Maps to MultiTrancheVault.fc tranches 1-6
+  **)
   type virtual_tranche = {
-    tranche_id: int;
-    name: string;
-    seniority: int; (* 1 = most senior, higher = more junior *)
+    tranche_id: string; (* tranche ID *) (* "SURE_BTC", "SURE_SNR", "SURE_MEZZ", SURE_JNR, SURE_JNR_PLUS, SURE_EQT *)
+    seniority: int; (* 1 = most senior (BTC), 6 = most junior (EQT) *)
     target_yield_bps: int;
+    risk_capacity_pct: float; (* Risk capacity: BTC=50%, SNR=60%, MEZZ=70%, JNR=80%, JNR+=90%, EQT=100% *)
 
     (* Accounting (not physical segregation) *)
     allocated_capital: usd_cents;
@@ -34,6 +43,9 @@ module CollateralManager = struct
     accumulated_losses: usd_cents;
     accumulated_yields: usd_cents;
     last_yield_update: float;
+
+    (* Utilization tracking *)
+    allocated_coverage: usd_cents; (* Coverage allocated to this tranche *)
   } [@@deriving sexp, yojson]
 
   (** Unified liquidity pool **)
@@ -95,50 +107,92 @@ module CollateralManager = struct
     price_cache: (asset * float * float) list; (* asset, price, timestamp *)
   }
 
-  (** Initialize unified pool **)
+  (** Initialize unified pool with 6-tier tranche model **)
   let create_pool
       ?(initial_capital = 0L)
-      ?(tranches = 3)
+      ?(_tranches = 6) (* Always 6 tranches now *)
       ()
     : unified_pool =
 
-    (* Create default virtual tranches *)
+    (* Create 6-tier virtual tranches matching MultiTrancheVault.fc *)
     let default_tranches = [
       {
-        tranche_id = 1;
-        name = "Senior";
-        seniority = 1;
-        target_yield_bps = 800;  (* 8% *)
+        tranche_id = "SURE_BTC";
+        seniority = 1; (* Most senior - last to absorb losses *)
+        target_yield_bps = 400;  (* 4% flat *)
+        risk_capacity_pct = 0.50; (* 50% capacity *)
         allocated_capital = 0L;
         lp_token_supply = 0L;
         lp_holders = [];
         accumulated_losses = 0L;
         accumulated_yields = 0L;
-        last_yield_update = Unix.time ();
+        last_yield_update = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
+        allocated_coverage = 0L;
       };
       {
-        tranche_id = 2;
-        name = "Mezzanine";
+        tranche_id = "SURE_SNR";
         seniority = 2;
-        target_yield_bps = 1200; (* 12% *)
+        target_yield_bps = 650;  (* 6.5% min *)
+        risk_capacity_pct = 0.60; (* 60% capacity *)
         allocated_capital = 0L;
         lp_token_supply = 0L;
         lp_holders = [];
         accumulated_losses = 0L;
         accumulated_yields = 0L;
-        last_yield_update = Unix.time ();
+        last_yield_update = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
+        allocated_coverage = 0L;
       };
       {
-        tranche_id = 3;
-        name = "Junior";
+        tranche_id = "SURE_MEZZ";
         seniority = 3;
-        target_yield_bps = 2000; (* 20% *)
+        target_yield_bps = 900; (* 9% min *)
+        risk_capacity_pct = 0.70; (* 70% capacity *)
         allocated_capital = 0L;
         lp_token_supply = 0L;
         lp_holders = [];
         accumulated_losses = 0L;
         accumulated_yields = 0L;
-        last_yield_update = Unix.time ();
+        last_yield_update = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
+        allocated_coverage = 0L;
+      };
+      {
+        tranche_id = "SURE_JNR";
+        seniority = 4;
+        target_yield_bps = 1250; (* 12.5% min *)
+        risk_capacity_pct = 0.80; (* 80% capacity *)
+        allocated_capital = 0L;
+        lp_token_supply = 0L;
+        lp_holders = [];
+        accumulated_losses = 0L;
+        accumulated_yields = 0L;
+        last_yield_update = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
+        allocated_coverage = 0L;
+      };
+      {
+        tranche_id = "SURE_JNR_PLUS";
+        seniority = 5;
+        target_yield_bps = 1600; (* 16% min *)
+        risk_capacity_pct = 0.90; (* 90% capacity *)
+        allocated_capital = 0L;
+        lp_token_supply = 0L;
+        lp_holders = [];
+        accumulated_losses = 0L;
+        accumulated_yields = 0L;
+        last_yield_update = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
+        allocated_coverage = 0L;
+      };
+      {
+        tranche_id = "SURE_EQT";
+        seniority = 6; (* Most junior - first to absorb losses *)
+        target_yield_bps = 1500; (* 15% min *)
+        risk_capacity_pct = 1.00; (* 100% capacity - first loss *)
+        allocated_capital = 0L;
+        lp_token_supply = 0L;
+        lp_holders = [];
+        accumulated_losses = 0L;
+        accumulated_yields = 0L;
+        last_yield_update = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
+        allocated_coverage = 0L;
       };
     ] in
 
@@ -148,10 +202,10 @@ module CollateralManager = struct
       btc_float_sats = 0L;
       btc_cost_basis_usd = 0L;
       usd_reserves = initial_capital;
-      virtual_tranches = List.take default_tranches tranches;
+      virtual_tranches = default_tranches; (* Always use all 6 tranches *)
       active_policies = [];
-      last_rebalance_time = Unix.time ();
-      created_at = Unix.time ();
+      last_rebalance_time = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
+      created_at = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
     }
 
   (** Create manager **)
@@ -172,16 +226,34 @@ module CollateralManager = struct
       price_cache = [];
     }
 
-  (** Calculate pool utilization (LTV) **)
+  (** Calculate effective capital using waterfall risk capacity
+      Effective capital = Σ(tranche_capital × risk_capacity_pct)
+
+      BTC   (50%) + SNR  (60%) + MEZZ (70%) +
+      JNR   (80%) + JNR+ (90%) + EQT  (100%)
+  **)
+  let calculate_effective_capital (pool: unified_pool) : usd_cents =
+    List.fold pool.virtual_tranches ~init:0L ~f:(fun acc tranche ->
+      let weighted_capital =
+        Float.to_int64 (
+          cents_to_usd tranche.allocated_capital *.
+          tranche.risk_capacity_pct
+        )
+      in
+      Int64.(acc + weighted_capital)
+    )
+
+  (** Calculate pool utilization (LTV) using effective capital **)
   let calculate_ltv (pool: unified_pool) : float =
-    if pool.total_capital_usd = 0L then 0.0
+    let effective_capital = calculate_effective_capital pool in
+    if Int64.(effective_capital = 0L) then 0.0
     else
       cents_to_usd pool.total_coverage_sold /.
-      cents_to_usd pool.total_capital_usd
+      cents_to_usd effective_capital
 
   (** Calculate liquid reserves ratio **)
   let calculate_reserve_ratio (pool: unified_pool) : float =
-    if pool.total_capital_usd = 0L then 0.0
+    if Int64.(pool.total_capital_usd = 0L) then 0.0
     else
       cents_to_usd pool.usd_reserves /.
       cents_to_usd pool.total_capital_usd
@@ -201,7 +273,7 @@ module CollateralManager = struct
       (asset: asset)
     : float =
 
-    if pool.total_capital_usd = 0L then 0.0
+    if Int64.(pool.total_capital_usd = 0L) then 0.0
     else
       let exposure = get_asset_exposure pool asset in
       cents_to_usd exposure /. cents_to_usd pool.total_capital_usd
@@ -230,7 +302,7 @@ module CollateralManager = struct
       )
     in
 
-    if pool.total_capital_usd = 0L then 0.0
+    if Int64.(pool.total_capital_usd = 0L) then 0.0
     else
       cents_to_usd total_correlated_exposure /.
       cents_to_usd pool.total_capital_usd
@@ -243,7 +315,77 @@ module CollateralManager = struct
     let total_coverage = cents_to_usd pool.total_coverage_sold in
     total_coverage *. 0.50
 
-  (** Check if pool can underwrite new policy **)
+  (** Get tranche-specific utilization
+      Returns utilization for a specific tranche
+  **)
+  type tranche_utilization = {
+    tranche_id: string; (* tranche ID *)
+    balance: usd_cents;
+    allocated_coverage: usd_cents;
+    utilization_pct: float; (* 0.0 - 1.0 *)
+    capacity_remaining: usd_cents;
+    risk_capacity_pct: float;
+  } [@@deriving sexp, yojson]
+
+  let get_tranche_utilization
+      (pool: unified_pool)
+      ~(tranche_id: string)
+    : tranche_utilization =
+
+    let tranche_opt = List.find pool.virtual_tranches ~f:(fun t ->
+      Poly.equal t.tranche_id tranche_id
+    ) in
+
+    match tranche_opt with
+    | None ->
+        (* Tranche not found - return zero state *)
+        {
+          tranche_id;
+          balance = 0L;
+          allocated_coverage = 0L;
+          utilization_pct = 0.0;
+          capacity_remaining = 0L;
+          risk_capacity_pct = 0.0;
+        }
+    | Some tranche ->
+        let effective_capacity =
+          Float.to_int64 (
+            cents_to_usd tranche.allocated_capital *.
+            tranche.risk_capacity_pct
+          )
+        in
+
+        let utilization_pct =
+          if Int64.(effective_capacity = 0L) then 0.0
+          else
+            cents_to_usd tranche.allocated_coverage /.
+            cents_to_usd effective_capacity
+        in
+
+        let capacity_remaining =
+          Int64.max 0L Int64.(effective_capacity - tranche.allocated_coverage)
+        in
+
+        {
+          tranche_id;
+          balance = tranche.allocated_capital;
+          allocated_coverage = tranche.allocated_coverage;
+          utilization_pct;
+          capacity_remaining;
+          risk_capacity_pct = tranche.risk_capacity_pct;
+        }
+
+  (** Get all tranche utilizations **)
+  let get_all_tranche_utilizations (pool: unified_pool)
+    : tranche_utilization list =
+
+    List.map pool.virtual_tranches ~f:(fun tranche ->
+      get_tranche_utilization pool ~tranche_id:tranche.tranche_id
+    )
+
+  (** Check if pool can underwrite new policy
+      Updated for 6-tier model with per-tranche utilization checks
+  **)
   let can_underwrite
       (t: t)
       (policy_request: policy)
@@ -252,46 +394,89 @@ module CollateralManager = struct
     let pool = t.pool in
     let params = t.risk_params in
 
-    (* Check 1: Total utilization (LTV) *)
+    (* Check 1: Total utilization (LTV) using EFFECTIVE capital *)
     let new_total_coverage = Int64.(pool.total_coverage_sold + policy_request.coverage_amount) in
-    let new_ltv = cents_to_usd new_total_coverage /. cents_to_usd pool.total_capital_usd in
+    let effective_capital = calculate_effective_capital pool in
+    let new_ltv =
+      if Int64.(effective_capital = 0L) then 1.0
+      else cents_to_usd new_total_coverage /. cents_to_usd effective_capital
+    in
 
-    if new_ltv > params.max_ltv then
-      (false, Printf.sprintf "LTV too high: %.2f%% > %.2f%%" (new_ltv *. 100.0) (params.max_ltv *. 100.0))
+    if Float.(new_ltv > 0.85) then (* 85% max utilization for 6-tier model *)
+      (false, Printf.sprintf "Effective capital LTV too high: %.2f%% > 85%%" (new_ltv *. 100.0))
     else
-      (* Check 2: Liquid reserves *)
-      let reserve_ratio = calculate_reserve_ratio pool in
+      (* Check 2: Per-tranche utilization - no single tranche > 95% *)
+      let tranche_utils = get_all_tranche_utilizations pool in
+      let over_utilized_tranches = List.filter tranche_utils ~f:(fun t ->
+        Float.(t.utilization_pct > 0.95)
+      ) in
 
-      if reserve_ratio < params.min_reserve_ratio then
-        (false, Printf.sprintf "Insufficient reserves: %.2f%% < %.2f%%" (reserve_ratio *. 100.0) (params.min_reserve_ratio *. 100.0))
+      if not (List.is_empty over_utilized_tranches) then
+        let over_util_names = List.map over_utilized_tranches ~f:(fun t ->
+          Printf.sprintf "%s (%.1f%%)"
+            (t.tranche_id)
+            (t.utilization_pct *. 100.0)
+        ) in
+        (false, Printf.sprintf "Tranches over-utilized: %s"
+          (String.concat ~sep:", " over_util_names))
       else
-        (* Check 3: Asset concentration *)
-        let current_exposure = get_asset_exposure pool policy_request.asset in
-        let new_exposure = Int64.(current_exposure + policy_request.coverage_amount) in
-        let new_concentration = cents_to_usd new_exposure /. cents_to_usd pool.total_capital_usd in
+        (* Check 3: Equity tranche capacity (first loss) - must have capacity *)
+        let eqt_util = List.find tranche_utils ~f:(fun t ->
+          Poly.equal t.tranche_id "SURE_EQT"
+        ) in
 
-        if new_concentration > params.max_single_asset_exposure then
-          (false, Printf.sprintf "Asset concentration too high: %.2f%% > %.2f%%"
-            (new_concentration *. 100.0) (params.max_single_asset_exposure *. 100.0))
-        else
-          (* Check 4: Correlated exposure *)
-          let correlated_exposure = calculate_correlated_exposure pool policy_request.asset in
-          let new_correlated = correlated_exposure +. (cents_to_usd policy_request.coverage_amount /. cents_to_usd pool.total_capital_usd) in
-
-          if new_correlated > params.max_correlated_exposure then
-            (false, Printf.sprintf "Correlated exposure too high: %.2f%% > %.2f%%"
-              (new_correlated *. 100.0) (params.max_correlated_exposure *. 100.0))
-          else
-            (* Check 5: Stress test *)
-            let worst_case = calculate_worst_case_loss pool in
-            let available_buffer = cents_to_usd pool.total_capital_usd -. cents_to_usd pool.total_coverage_sold in
-            let required_buffer = worst_case *. params.required_stress_buffer in
-
-            if available_buffer < required_buffer then
-              (false, Printf.sprintf "Insufficient stress buffer: $%.2f < $%.2f"
-                available_buffer required_buffer)
+        (match eqt_util with
+        | None ->
+            (false, "Equity tranche not found")
+        | Some eqt ->
+            if Float.(eqt.utilization_pct > 0.90) then
+              (false, Printf.sprintf "Equity tranche near capacity: %.2f%% > 90%%"
+                (eqt.utilization_pct *. 100.0))
             else
-              (true, "All risk checks passed")
+              (* Check 4: Liquid reserves *)
+              let reserve_ratio = calculate_reserve_ratio pool in
+
+              if Float.(reserve_ratio < params.min_reserve_ratio) then
+                (false, Printf.sprintf "Insufficient reserves: %.2f%% < %.2f%%"
+                  (reserve_ratio *. 100.0) (params.min_reserve_ratio *. 100.0))
+              else
+                (* Check 5: Asset concentration *)
+                let current_exposure = get_asset_exposure pool policy_request.asset in
+                let new_exposure = Int64.(current_exposure + policy_request.coverage_amount) in
+                let new_concentration =
+                  if Int64.(pool.total_capital_usd = 0L) then 0.0
+                  else cents_to_usd new_exposure /. cents_to_usd pool.total_capital_usd
+                in
+
+                if Float.(new_concentration > params.max_single_asset_exposure) then
+                  (false, Printf.sprintf "Asset concentration too high: %.2f%% > %.2f%%"
+                    (new_concentration *. 100.0) (params.max_single_asset_exposure *. 100.0))
+                else
+                  (* Check 6: Correlated exposure *)
+                  let correlated_exposure = calculate_correlated_exposure pool policy_request.asset in
+                  let new_correlated =
+                    if Int64.(pool.total_capital_usd = 0L) then 0.0
+                    else correlated_exposure +. (cents_to_usd policy_request.coverage_amount /. cents_to_usd pool.total_capital_usd)
+                  in
+
+                  if Float.(new_correlated > params.max_correlated_exposure) then
+                    (false, Printf.sprintf "Correlated exposure too high: %.2f%% > %.2f%%"
+                      (new_correlated *. 100.0) (params.max_correlated_exposure *. 100.0))
+                  else
+                    (* Check 7: Stress test *)
+                    let worst_case = calculate_worst_case_loss pool in
+                    let available_buffer =
+                      if Int64.(pool.total_capital_usd = 0L) then 0.0
+                      else cents_to_usd pool.total_capital_usd -. cents_to_usd pool.total_coverage_sold
+                    in
+                    let required_buffer = worst_case *. params.required_stress_buffer in
+
+                    if Float.(available_buffer < required_buffer) then
+                      (false, Printf.sprintf "Insufficient stress buffer: $%.2f < $%.2f"
+                        available_buffer required_buffer)
+                    else
+                      (true, "All risk checks passed")
+        )
 
   (** Allocate coverage for new policy **)
   let allocate_coverage
@@ -320,7 +505,7 @@ module CollateralManager = struct
 
     let (released_policy, remaining_policies) =
       List.partition_tf t.pool.active_policies ~f:(fun p ->
-        p.policy_id = policy_id
+        Int64.(p.policy_id = policy_id)
       )
     in
 
@@ -356,10 +541,10 @@ module CollateralManager = struct
             Int64.(tranche.allocated_capital - tranche.accumulated_losses)
           in
 
-          if remaining_loss <= 0L then
+          if Int64.(remaining_loss <= 0L) then
             (* No more loss to allocate *)
             List.rev_append acc (tranche :: rest)
-          else if available_capital <= 0L then
+          else if Int64.(available_capital <= 0L) then
             (* Tranche already depleted *)
             apply_loss remaining_loss (tranche :: acc) rest
           else
@@ -387,8 +572,8 @@ module CollateralManager = struct
       ~(payout_amount: usd_cents)
     : t =
 
-    if payout_amount <= 0L then t
-    else if payout_amount > t.pool.usd_reserves then
+    if Int64.(payout_amount <= 0L) then t
+    else if Int64.(payout_amount > t.pool.usd_reserves) then
       failwith "Insufficient reserves for payout"
     else
       (* Deduct from pool *)
@@ -413,12 +598,12 @@ module CollateralManager = struct
   let add_liquidity
       (t: t)
       ~(lp_address: string)
-      ~(tranche_id: int)
+      ~(tranche_id: string)
       ~(amount: usd_cents)
     : (t * int64) = (* Returns (updated_manager, lp_tokens_minted) *)
 
     let tranche_opt =
-      List.find t.pool.virtual_tranches ~f:(fun tr -> tr.tranche_id = tranche_id)
+      List.find t.pool.virtual_tranches ~f:(fun tr -> Poly.equal tr.tranche_id tranche_id)
     in
 
     match tranche_opt with
@@ -430,7 +615,7 @@ module CollateralManager = struct
         in
 
         let nav_per_token =
-          if tranche.lp_token_supply = 0L then
+          if Int64.(tranche.lp_token_supply = 0L) then
             1.0 (* Initial NAV = 1.0 *)
           else
             cents_to_usd net_value /. Int64.to_float tranche.lp_token_supply
@@ -452,7 +637,7 @@ module CollateralManager = struct
         (* Update pool *)
         let updated_tranches =
           List.map t.pool.virtual_tranches ~f:(fun tr ->
-            if tr.tranche_id = tranche_id then updated_tranche else tr
+            if Poly.equal tr.tranche_id tranche_id then updated_tranche else tr
           )
         in
 
@@ -469,12 +654,12 @@ module CollateralManager = struct
   let remove_liquidity
       (t: t)
       ~(lp_address: string)
-      ~(tranche_id: int)
+      ~(tranche_id: string)
       ~(lp_tokens: int64)
     : (t * usd_cents) = (* Returns (updated_manager, withdrawal_amount) *)
 
     let tranche_opt =
-      List.find t.pool.virtual_tranches ~f:(fun tr -> tr.tranche_id = tranche_id)
+      List.find t.pool.virtual_tranches ~f:(fun tr -> Poly.equal tr.tranche_id tranche_id)
     in
 
     match tranche_opt with
@@ -486,7 +671,7 @@ module CollateralManager = struct
         in
 
         let nav_per_token =
-          if tranche.lp_token_supply = 0L then 1.0
+          if Int64.(tranche.lp_token_supply = 0L) then 1.0
           else cents_to_usd net_value /. Int64.to_float tranche.lp_token_supply
         in
 
@@ -495,7 +680,7 @@ module CollateralManager = struct
           usd_to_cents (Int64.to_float lp_tokens *. nav_per_token)
         in
 
-        if withdrawal_amount > t.pool.usd_reserves then
+        if Int64.(withdrawal_amount > t.pool.usd_reserves) then
           failwith "Insufficient liquidity for withdrawal"
         else
           (* Update tranche *)
@@ -515,7 +700,7 @@ module CollateralManager = struct
           (* Update pool *)
           let updated_tranches =
             List.map t.pool.virtual_tranches ~f:(fun tr ->
-              if tr.tranche_id = tranche_id then updated_tranche else tr
+              if Poly.equal tr.tranche_id tranche_id then updated_tranche else tr
             )
           in
 
@@ -528,16 +713,79 @@ module CollateralManager = struct
 
           ({ t with pool = new_pool }, withdrawal_amount)
 
-  (** Get pool statistics **)
+  (** Get pool statistics with 6-tier tranche breakdown **)
   let get_pool_stats (t: t) : (string * string) list =
-    [
-      ("Total Capital", Printf.sprintf "$%s" (Int64.to_string_hum ~delimiter:',' t.pool.total_capital_usd));
+    let effective_capital = calculate_effective_capital t.pool in
+    let tranche_utils = get_all_tranche_utilizations t.pool in
+
+    (* Base statistics *)
+    let base_stats = [
+      ("Total Capital (Raw)", Printf.sprintf "$%s" (Int64.to_string_hum ~delimiter:',' t.pool.total_capital_usd));
+      ("Effective Capital (Risk-Weighted)", Printf.sprintf "$%s" (Int64.to_string_hum ~delimiter:',' effective_capital));
       ("Total Coverage Sold", Printf.sprintf "$%s" (Int64.to_string_hum ~delimiter:',' t.pool.total_coverage_sold));
-      ("LTV", Printf.sprintf "%.2f%%" (calculate_ltv t.pool *. 100.0));
+      ("LTV (Effective)", Printf.sprintf "%.2f%%" (calculate_ltv t.pool *. 100.0));
       ("Reserve Ratio", Printf.sprintf "%.2f%%" (calculate_reserve_ratio t.pool *. 100.0));
       ("Active Policies", Int.to_string (List.length t.pool.active_policies));
       ("BTC Float", Printf.sprintf "%.8f BTC" (Int64.to_float t.pool.btc_float_sats /. 100_000_000.0));
       ("USD Reserves", Printf.sprintf "$%s" (Int64.to_string_hum ~delimiter:',' t.pool.usd_reserves));
-    ]
+    ] in
+
+    (* Per-tranche statistics *)
+    let tranche_stats = List.concat_map tranche_utils ~f:(fun tu ->
+      let tranche_name = tu.tranche_id in
+      [
+        (Printf.sprintf "%s Capital" tranche_name,
+         Printf.sprintf "$%s" (Int64.to_string_hum ~delimiter:',' tu.balance));
+        (Printf.sprintf "%s Utilization" tranche_name,
+         Printf.sprintf "%.2f%%" (tu.utilization_pct *. 100.0));
+        (Printf.sprintf "%s Capacity" tranche_name,
+         Printf.sprintf "$%s" (Int64.to_string_hum ~delimiter:',' tu.capacity_remaining));
+      ]
+    ) in
+
+    base_stats @ tranche_stats
+
+  (** Capital adequacy monitoring - emits alerts if thresholds breached **)
+  let check_capital_adequacy (t: t) : unit =
+    let utilization = calculate_ltv t.pool in
+
+    (* Critical alert: > 85% utilization *)
+    if Float.(utilization > 0.85) then
+      Logs.err (fun m ->
+        m "CRITICAL: Total effective capital utilization %.2f%% > 85%%"
+          (utilization *. 100.0)
+      )
+    (* Warning alert: > 75% utilization *)
+    else if Float.(utilization > 0.75) then
+      Logs.warn (fun m ->
+        m "WARNING: Total effective capital utilization %.2f%% > 75%%"
+          (utilization *. 100.0)
+      )
+    else
+      Logs.info (fun m ->
+        m "Capital adequacy check passed: utilization %.2f%%"
+          (utilization *. 100.0)
+      );
+
+    (* Check per-tranche utilization *)
+    let tranche_utils = get_all_tranche_utilizations t.pool in
+    List.iter tranche_utils ~f:(fun tu ->
+      if Float.(tu.utilization_pct > 0.95) then
+        Logs.err (fun m ->
+          m "CRITICAL: %s utilization %.2f%% > 95%%"
+            (tu.tranche_id)
+            (tu.utilization_pct *. 100.0)
+        )
+      else if Float.(tu.utilization_pct > 0.85) then
+        Logs.warn (fun m ->
+          m "WARNING: %s utilization %.2f%% > 85%%"
+            (tu.tranche_id)
+            (tu.utilization_pct *. 100.0)
+        )
+    )
+
+  (** Get total utilization (convenience function) **)
+  let get_total_utilization (t: t) : float =
+    calculate_ltv t.pool
 
 end

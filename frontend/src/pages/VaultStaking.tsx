@@ -13,6 +13,8 @@ interface VaultStats {
   userBalance: number;
   userStaked: number;
   allocation: number;
+  utilization: number; // Percentage of capacity used
+  availableCapacity: number; // In USD
   riskLevel: string;
   name: string;
   description: string;
@@ -63,6 +65,8 @@ export const VaultStaking = () => {
       userBalance: 0,
       userStaked: 0,
       allocation: 25,
+      utilization: 0,
+      availableCapacity: 0,
       riskLevel: 'Safest',
       name: 'SURE-BTC',
       description: 'Bitcoin-focused, safest tranche with lowest risk'
@@ -73,6 +77,8 @@ export const VaultStaking = () => {
       userBalance: 0,
       userStaked: 0,
       allocation: 20,
+      utilization: 0,
+      availableCapacity: 0,
       riskLevel: 'Very Low',
       name: 'SURE-SNR',
       description: 'Senior tranche, institutional-grade capital'
@@ -83,6 +89,8 @@ export const VaultStaking = () => {
       userBalance: 0,
       userStaked: 0,
       allocation: 18,
+      utilization: 0,
+      availableCapacity: 0,
       riskLevel: 'Low',
       name: 'SURE-MEZZ',
       description: 'Mezzanine tranche, balanced risk-reward'
@@ -93,6 +101,8 @@ export const VaultStaking = () => {
       userBalance: 0,
       userStaked: 0,
       allocation: 15,
+      utilization: 0,
+      availableCapacity: 0,
       riskLevel: 'Medium',
       name: 'SURE-JNR',
       description: 'Junior tranche, higher yield for DeFi natives'
@@ -103,6 +113,8 @@ export const VaultStaking = () => {
       userBalance: 0,
       userStaked: 0,
       allocation: 12,
+      utilization: 0,
+      availableCapacity: 0,
       riskLevel: 'High',
       name: 'SURE-JNR+',
       description: 'Junior Plus tranche, aggressive yield seekers'
@@ -113,6 +125,8 @@ export const VaultStaking = () => {
       userBalance: 0,
       userStaked: 0,
       allocation: 10,
+      utilization: 0,
+      availableCapacity: 0,
       riskLevel: 'Highest',
       name: 'SURE-EQT',
       description: 'Equity tranche, maximum risk and reward'
@@ -126,29 +140,39 @@ export const VaultStaking = () => {
     }
   }, [selectedVault, selectedCollateral]);
 
-  // Fetch vault data from contracts
+  // Fetch vault data from contracts and API
   useEffect(() => {
     const fetchVaultData = async () => {
-      if (!isConfigured || !userAddress) return;
-
       setIsFetching(true);
       try {
-        const userAddr = Address.parse(userAddress);
+        // In production: Fetch from Agent 5's API
+        // GET /api/v2/tranches/apy
+        // Response: { btc: { apy: 4.2, tvl: 1000000, utilization: 45, available_capacity: 550000 }, ... }
 
-        // TODO: Implement contract calls for 6-tier vaults when available
-        // For now, vaults will show mock data (0 TVL)
+        // Mock real-time APY data (would come from WebSocket in production)
+        const mockApyData = {
+          btc: { apy: 4.2, tvl: 1_250_000, utilization: 45, availableCapacity: 550_000 },
+          snr: { apy: 6.8, tvl: 950_000, utilization: 52, availableCapacity: 480_000 },
+          mezz: { apy: 9.3, tvl: 720_000, utilization: 60, availableCapacity: 320_000 },
+          jnr: { apy: 12.7, tvl: 580_000, utilization: 68, availableCapacity: 220_000 },
+          jnr_plus: { apy: 16.4, tvl: 430_000, utilization: 78, availableCapacity: 120_000 },
+          eqt: { apy: 20.2, tvl: 320_000, utilization: 92, availableCapacity: 28_000 }
+        };
 
-        // Example structure for when contracts are deployed:
-        // if (contracts.btcVault) {
-        //   const [tvl, userStaked] = await Promise.all([
-        //     contracts.btcVault.getTotalCapital(),
-        //     contracts.btcVault.getUserBalance(userAddr),
-        //   ]);
-        //   setVaults((prev) => ({
-        //     ...prev,
-        //     btc: { ...prev.btc, tvl: parseFloat(fromNano(tvl)), userStaked: parseFloat(fromNano(userStaked)) }
-        //   }));
-        // }
+        setVaults(prev => ({
+          btc: { ...prev.btc, ...mockApyData.btc },
+          snr: { ...prev.snr, ...mockApyData.snr },
+          mezz: { ...prev.mezz, ...mockApyData.mezz },
+          jnr: { ...prev.jnr, ...mockApyData.jnr },
+          jnr_plus: { ...prev.jnr_plus, ...mockApyData.jnr_plus },
+          eqt: { ...prev.eqt, ...mockApyData.eqt }
+        }));
+
+        // If user connected, fetch user-specific data from contracts
+        if (isConfigured && userAddress) {
+          const userAddr = Address.parse(userAddress);
+          // TODO: Implement contract calls for user balances when deployed
+        }
 
       } catch (error) {
         console.error('Error fetching vault data:', error);
@@ -158,9 +182,25 @@ export const VaultStaking = () => {
     };
 
     fetchVaultData();
-    const interval = setInterval(fetchVaultData, 30000); // Refresh every 30s
+
+    // Setup WebSocket for real-time APY updates
+    // const ws = new WebSocket('ws://localhost:8080/ws');
+    // ws.onopen = () => {
+    //   ws.send(JSON.stringify({ type: 'subscribe', channel: 'tranche_apy' }));
+    // };
+    // ws.onmessage = (event) => {
+    //   const data = JSON.parse(event.data);
+    //   if (data.type === 'tranche_apy_update') {
+    //     setVaults(prev => ({
+    //       ...prev,
+    //       [data.tranche]: { ...prev[data.tranche], apy: data.apy, utilization: data.utilization }
+    //     }));
+    //   }
+    // };
+
+    const interval = setInterval(fetchVaultData, 60000); // Refresh every 60s
     return () => clearInterval(interval);
-  }, [isConfigured, userAddress, contracts]);
+  }, [isConfigured, userAddress]);
 
   const handleStake = async () => {
     if (!userAddress) {
@@ -168,8 +208,8 @@ export const VaultStaking = () => {
       return;
     }
 
-    if (!isConfigured) {
-      alert('Contracts not configured. Please deploy contracts and update .env file.');
+    if (!contracts.multiTrancheVault) {
+      alert('MultiTrancheVault not configured. Please deploy and update .env');
       return;
     }
 
@@ -181,29 +221,44 @@ export const VaultStaking = () => {
     setIsLoading(true);
     try {
       const amountNano = toNano(amount);
-      const gasAmount = toNano('0.1');
+      const gasAmount = toNano('0.15'); // Increased for new security fixes
 
-      // TODO: Implement contract calls for 6-tier vaults when available
-      const collateral = collateralOptions[selectedCollateral];
-      alert(`${action === 'stake' ? 'Staking' : 'Unstaking'} ${amount} ${collateral.symbol} to ${vaults[selectedVault].name}.\n\nContracts for 6-tier vault system will be deployed soon.`);
+      // Map vault type to tranche ID
+      const trancheIdMap: Record<VaultType, number> = {
+        btc: 1,        // TRANCHE_BTC
+        snr: 2,        // TRANCHE_SNR
+        mezz: 3,       // TRANCHE_MEZZ
+        jnr: 4,        // TRANCHE_JNR
+        jnr_plus: 5,   // TRANCHE_JNR_PLUS
+        eqt: 6,        // TRANCHE_EQT
+      };
 
-      // Example structure for when contracts are deployed:
-      // if (action === 'stake') {
-      //   if (selectedVault === 'btc' && contracts.btcVault) {
-      //     await contracts.btcVault.sendDeposit(sender, { value: amountNano + gasAmount, amount: amountNano });
-      //   }
-      //   // ... similar for other vaults
-      // } else {
-      //   if (selectedVault === 'btc' && contracts.btcVault) {
-      //     await contracts.btcVault.sendWithdraw(sender, { value: gasAmount, amount: amountNano });
-      //   }
-      //   // ... similar for other vaults
-      // }
+      const trancheId = trancheIdMap[selectedVault];
+
+      if (action === 'stake') {
+        // Deposit to MultiTrancheVault
+        await contracts.multiTrancheVault.sendDeposit(
+          sender,
+          trancheId,
+          amountNano + gasAmount
+        );
+        alert(`Successfully deposited ${amount} TON to ${vaults[selectedVault].name}!`);
+      } else {
+        // Withdraw from MultiTrancheVault
+        await contracts.multiTrancheVault.sendWithdraw(
+          sender,
+          gasAmount,
+          trancheId,
+          amountNano
+        );
+        alert(`Successfully withdrew ${amount} tokens from ${vaults[selectedVault].name}!`);
+      }
 
       setAmount('');
+      // Refresh vault data
+      fetchVaultData();
     } catch (error: any) {
       console.error(`Error ${action}ing:`, error);
-
       if (error.message?.includes('User rejected')) {
         alert('Transaction was rejected');
       } else if (error.message?.includes('Insufficient')) {
@@ -317,19 +372,34 @@ export const VaultStaking = () => {
                   <div className="flex justify-between items-center">
                     <span className="text-text-secondary">APY:</span>
                     <span className="text-lg font-bold text-terminal-green">
-                      {vault.apy}%
+                      {vault.apy.toFixed(1)}%
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-text-secondary">TVL:</span>
+                    <span className="font-semibold text-copper-500">
+                      ${(vault.tvl / 1000).toFixed(0)}K
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-text-secondary">UTILIZATION:</span>
+                    <span className={`font-semibold ${
+                      vault.utilization > 85 ? 'text-terminal-red' :
+                      vault.utilization > 70 ? 'text-copper-500' : 'text-terminal-green'
+                    }`}>
+                      {vault.utilization}%
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-text-secondary">CAPACITY:</span>
+                    <span className="font-semibold text-text-primary">
+                      ${(vault.availableCapacity / 1000).toFixed(0)}K
                     </span>
                   </div>
                   <div className="flex justify-between items-center">
                     <span className="text-text-secondary">RISK:</span>
                     <span className="font-semibold">
                       {vault.riskLevel}
-                    </span>
-                  </div>
-                  <div className="flex justify-between items-center">
-                    <span className="text-text-secondary">ALLOC:</span>
-                    <span className="font-semibold">
-                      {vault.allocation}%
                     </span>
                   </div>
                 </div>
@@ -398,7 +468,7 @@ export const VaultStaking = () => {
                 variant="primary"
                 className="w-full"
               >
-                {isLoading ? 'PROCESSING...' : userAddress ? `${action === 'stake' ? 'STAKE' : 'UNSTAKE'} ${collateralOptions[selectedCollateral].symbol} >>` : 'CONNECT WALLET'}
+                {isLoading ? 'PROCESSING...' : userAddress ? `${action === 'stake' ? 'STAKE' : 'UNSTAKE'} ${collateralOptions[selectedCollateral].symbol} >>` : 'CONNECT TON WALLET'}
               </RetroButton>
             </div>
           </TerminalWindow>

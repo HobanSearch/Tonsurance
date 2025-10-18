@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tonsurance WebSocket v2 Test Client</title>
+    <style>
+        body {
+            font-family: 'Monaco', 'Courier New', monospace;
+            background: #0a0e27;
+            color: #00ff88;
+            padding: 20px;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        h1 {
+            color: #00ffff;
+            text-align: center;
+            border-bottom: 2px solid #00ff88;
+            padding-bottom: 10px;
+        }
+        .container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-top: 20px;
+        }
+        .panel {
+            background: #1a1f3a;
+            border: 1px solid #00ff88;
+            border-radius: 8px;
+            padding: 15px;
+        }
+        .panel h2 {
+            color: #00ffff;
+            margin-top: 0;
+            font-size: 18px;
+            border-bottom: 1px solid #00ff88;
+            padding-bottom: 8px;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        .status.connected {
+            background: #004400;
+            color: #00ff00;
+        }
+        .status.disconnected {
+            background: #440000;
+            color: #ff0000;
+        }
+        button {
+            background: #00ff88;
+            color: #0a0e27;
+            border: none;
+            padding: 10px 20px;
+            margin: 5px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 14px;
+        }
+        button:hover {
+            background: #00ffff;
+        }
+        button:disabled {
+            background: #555;
+            color: #888;
+            cursor: not-allowed;
+        }
+        .message-log {
+            background: #0a0e27;
+            border: 1px solid #00ff88;
+            border-radius: 4px;
+            padding: 10px;
+            height: 400px;
+            overflow-y: auto;
+            font-size: 12px;
+            margin-top: 10px;
+        }
+        .message {
+            margin: 5px 0;
+            padding: 8px;
+            border-left: 3px solid #00ff88;
+            background: #1a1f3a;
+        }
+        .message.welcome {
+            border-left-color: #00ffff;
+        }
+        .message.subscribed {
+            border-left-color: #00ff00;
+        }
+        .message.bridge_health {
+            border-left-color: #ffaa00;
+        }
+        .message.risk_alerts {
+            border-left-color: #ff0000;
+        }
+        .message.top_products {
+            border-left-color: #ff00ff;
+        }
+        .message.tranche_apy {
+            border-left-color: #0088ff;
+        }
+        .timestamp {
+            color: #888;
+            font-size: 10px;
+        }
+        .channel-buttons {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+            margin: 10px 0;
+        }
+        pre {
+            background: #0a0e27;
+            padding: 10px;
+            border-radius: 4px;
+            overflow-x: auto;
+            font-size: 11px;
+        }
+    </style>
+</head>
+<body>
+    <h1>🔌 Tonsurance WebSocket v2 Test Client</h1>
+
+    <div class="container">
+        <div class="panel">
+            <h2>Connection Control</h2>
+            <div id="status" class="status disconnected">Disconnected</div>
+            <button id="connectBtn" onclick="connect()">Connect</button>
+            <button id="disconnectBtn" onclick="disconnect()" disabled>Disconnect</button>
+            <button onclick="clearLog()">Clear Log</button>
+
+            <h2 style="margin-top: 20px;">Channel Subscriptions</h2>
+            <div class="channel-buttons">
+                <button id="sub-bridge_health" onclick="subscribe('bridge_health')" disabled>
+                    Subscribe: bridge_health
+                </button>
+                <button id="unsub-bridge_health" onclick="unsubscribe('bridge_health')" disabled>
+                    Unsubscribe
+                </button>
+            </div>
+            <div class="channel-buttons">
+                <button id="sub-risk_alerts" onclick="subscribe('risk_alerts')" disabled>
+                    Subscribe: risk_alerts
+                </button>
+                <button id="unsub-risk_alerts" onclick="unsubscribe('risk_alerts')" disabled>
+                    Unsubscribe
+                </button>
+            </div>
+            <div class="channel-buttons">
+                <button id="sub-top_products" onclick="subscribe('top_products')" disabled>
+                    Subscribe: top_products
+                </button>
+                <button id="unsub-top_products" onclick="unsubscribe('top_products')" disabled>
+                    Unsubscribe
+                </button>
+            </div>
+            <div class="channel-buttons">
+                <button id="sub-tranche_apy" onclick="subscribe('tranche_apy')" disabled>
+                    Subscribe: tranche_apy
+                </button>
+                <button id="unsub-tranche_apy" onclick="unsubscribe('tranche_apy')" disabled>
+                    Unsubscribe
+                </button>
+            </div>
+
+            <h2 style="margin-top: 20px;">Statistics</h2>
+            <div style="font-size: 12px; line-height: 1.8;">
+                <div>Messages Received: <span id="msgCount">0</span></div>
+                <div>Bridge Updates: <span id="bridgeCount">0</span></div>
+                <div>Risk Alerts: <span id="alertCount">0</span></div>
+                <div>APY Updates: <span id="apyCount">0</span></div>
+                <div>Connection Time: <span id="connTime">-</span></div>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>Message Log</h2>
+            <div id="messageLog" class="message-log"></div>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let messageCount = 0;
+        let bridgeCount = 0;
+        let alertCount = 0;
+        let apyCount = 0;
+        let connectionTime = null;
+        let heartbeatInterval = null;
+
+        const WS_URL = 'ws://localhost:8080/ws';
+
+        function connect() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                return;
+            }
+
+            ws = new WebSocket(WS_URL);
+
+            ws.onopen = () => {
+                updateStatus(true);
+                connectionTime = new Date();
+                logMessage('Connected to Tonsurance WebSocket v2', 'system');
+
+                // Start heartbeat
+                heartbeatInterval = setInterval(() => {
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({
+                            action: 'ping',
+                            channel: 'heartbeat'
+                        }));
+                    }
+                }, 30000);
+
+                updateConnectionTime();
+            };
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                messageCount++;
+                document.getElementById('msgCount').textContent = messageCount;
+
+                handleMessage(data);
+            };
+
+            ws.onerror = (error) => {
+                logMessage('WebSocket error: ' + error, 'error');
+                console.error('WebSocket error:', error);
+            };
+
+            ws.onclose = () => {
+                updateStatus(false);
+                logMessage('WebSocket connection closed', 'system');
+                if (heartbeatInterval) {
+                    clearInterval(heartbeatInterval);
+                    heartbeatInterval = null;
+                }
+            };
+        }
+
+        function disconnect() {
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+        }
+
+        function subscribe(channel) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('Not connected!');
+                return;
+            }
+
+            ws.send(JSON.stringify({
+                action: 'subscribe',
+                channel: channel
+            }));
+
+            logMessage(`Subscribing to channel: ${channel}`, 'action');
+        }
+
+        function unsubscribe(channel) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('Not connected!');
+                return;
+            }
+
+            ws.send(JSON.stringify({
+                action: 'unsubscribe',
+                channel: channel
+            }));
+
+            logMessage(`Unsubscribing from channel: ${channel}`, 'action');
+        }
+
+        function handleMessage(data) {
+            console.log('Received:', data);
+
+            switch(data.type) {
+                case 'welcome':
+                    logMessage(`Welcome! Client ID: ${data.client_id}`, 'welcome');
+                    logMessage(`Available channels: ${data.available_channels.join(', ')}`, 'welcome');
+                    break;
+
+                case 'subscribed':
+                    logMessage(`Subscribed to: ${data.channel}`, 'subscribed');
+                    break;
+
+                case 'unsubscribed':
+                    logMessage(`Unsubscribed from: ${data.channel}`, 'system');
+                    break;
+
+                case 'pong':
+                    // Silent heartbeat response
+                    break;
+
+                case 'error':
+                    logMessage(`Error: ${data.message}`, 'error');
+                    break;
+
+                default:
+                    // Channel-specific messages
+                    if (data.channel === 'bridge_health') {
+                        bridgeCount++;
+                        document.getElementById('bridgeCount').textContent = bridgeCount;
+                        logMessage(`Bridge Health: ${JSON.stringify(data, null, 2)}`, 'bridge_health');
+                    } else if (data.channel === 'risk_alerts') {
+                        alertCount++;
+                        document.getElementById('alertCount').textContent = alertCount;
+                        logMessage(`Risk Alert: ${JSON.stringify(data, null, 2)}`, 'risk_alerts');
+                    } else if (data.channel === 'top_products') {
+                        logMessage(`Top Products Update: ${JSON.stringify(data, null, 2)}`, 'top_products');
+                    } else if (data.channel === 'tranche_apy') {
+                        apyCount++;
+                        document.getElementById('apyCount').textContent = apyCount;
+                        logMessage(`APY Update: ${JSON.stringify(data, null, 2)}`, 'tranche_apy');
+                    }
+                    break;
+            }
+        }
+
+        function logMessage(message, type = 'info') {
+            const log = document.getElementById('messageLog');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${type}`;
+
+            const timestamp = new Date().toLocaleTimeString();
+            messageDiv.innerHTML = `
+                <span class="timestamp">[${timestamp}]</span><br>
+                <pre>${message}</pre>
+            `;
+
+            log.appendChild(messageDiv);
+            log.scrollTop = log.scrollHeight;
+        }
+
+        function clearLog() {
+            document.getElementById('messageLog').innerHTML = '';
+            messageCount = 0;
+            bridgeCount = 0;
+            alertCount = 0;
+            apyCount = 0;
+            document.getElementById('msgCount').textContent = '0';
+            document.getElementById('bridgeCount').textContent = '0';
+            document.getElementById('alertCount').textContent = '0';
+            document.getElementById('apyCount').textContent = '0';
+        }
+
+        function updateStatus(connected) {
+            const statusDiv = document.getElementById('status');
+            const connectBtn = document.getElementById('connectBtn');
+            const disconnectBtn = document.getElementById('disconnectBtn');
+
+            if (connected) {
+                statusDiv.textContent = 'Connected';
+                statusDiv.className = 'status connected';
+                connectBtn.disabled = true;
+                disconnectBtn.disabled = false;
+
+                // Enable subscription buttons
+                ['bridge_health', 'risk_alerts', 'top_products', 'tranche_apy'].forEach(channel => {
+                    document.getElementById(`sub-${channel}`).disabled = false;
+                    document.getElementById(`unsub-${channel}`).disabled = false;
+                });
+            } else {
+                statusDiv.textContent = 'Disconnected';
+                statusDiv.className = 'status disconnected';
+                connectBtn.disabled = false;
+                disconnectBtn.disabled = true;
+
+                // Disable subscription buttons
+                ['bridge_health', 'risk_alerts', 'top_products', 'tranche_apy'].forEach(channel => {
+                    document.getElementById(`sub-${channel}`).disabled = true;
+                    document.getElementById(`unsub-${channel}`).disabled = true;
+                });
+
+                document.getElementById('connTime').textContent = '-';
+            }
+        }
+
+        function updateConnectionTime() {
+            if (!connectionTime) return;
+
+            const now = new Date();
+            const diff = Math.floor((now - connectionTime) / 1000);
+            const minutes = Math.floor(diff / 60);
+            const seconds = diff % 60;
+
+            document.getElementById('connTime').textContent = `${minutes}m ${seconds}s`;
+
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                setTimeout(updateConnectionTime, 1000);
+            }
+        }
+
+        // Auto-connect on load
+        window.onload = () => {
+            logMessage('WebSocket test client ready. Click "Connect" to start.', 'system');
+        };
+    </script>
+</body>
+</html>

@@ -12,7 +12,7 @@
 open Core
 
 (** Currency types - use int64 to prevent overflow and ensure precision *)
-type usd_cents = int64 [@@deriving sexp, compare, yojson]
+type usd_cents = int64 [@@deriving sexp, compare, yojson, equal]
 type btc_sats = int64 [@@deriving sexp, compare, yojson]
 
 (** Asset types supported by the protocol *)
@@ -24,16 +24,16 @@ type asset =
   | FRAX
   | BUSD
   | USDe    (* Ethena stablecoin *)
-  | sUSDe   (* Staked Ethena *)
+  | SUSDe   (* Staked Ethena *)
   | USDY    (* Ondo yield-bearing *)
   | PYUSD   (* PayPal stablecoin *)
   | GHO     (* Aave stablecoin *)
   | LUSD    (* Liquity stablecoin *)
-  | crvUSD  (* Curve stablecoin *)
-  | mkUSD   (* Prisma stablecoin *)
+  | CrvUSD  (* Curve stablecoin *)
+  | MkUSD   (* Prisma stablecoin *)
   | BTC
   | ETH
-[@@deriving sexp, compare, yojson, enumerate, equal]
+[@@deriving sexp, compare, yojson, enumerate, equal, hash]
 
 let asset_to_string = function
   | USDC -> "USDC"
@@ -43,13 +43,13 @@ let asset_to_string = function
   | FRAX -> "FRAX"
   | BUSD -> "BUSD"
   | USDe -> "USDe"
-  | sUSDe -> "sUSDe"
+  | SUSDe -> "sUSDe"
   | USDY -> "USDY"
   | PYUSD -> "PYUSD"
   | GHO -> "GHO"
   | LUSD -> "LUSD"
-  | crvUSD -> "crvUSD"
-  | mkUSD -> "mkUSD"
+  | CrvUSD -> "crvUSD"
+  | MkUSD -> "mkUSD"
   | BTC -> "BTC"
   | ETH -> "ETH"
 
@@ -61,13 +61,13 @@ let asset_of_string = function
   | "FRAX" -> Ok FRAX
   | "BUSD" -> Ok BUSD
   | "USDe" -> Ok USDe
-  | "sUSDe" -> Ok sUSDe
+  | "sUSDe" -> Ok SUSDe
   | "USDY" -> Ok USDY
   | "PYUSD" -> Ok PYUSD
   | "GHO" -> Ok GHO
   | "LUSD" -> Ok LUSD
-  | "crvUSD" -> Ok crvUSD
-  | "mkUSD" -> Ok mkUSD
+  | "crvUSD" -> Ok CrvUSD
+  | "mkUSD" -> Ok MkUSD
   | "BTC" -> Ok BTC
   | "ETH" -> Ok ETH
   | s -> Error (Printf.sprintf "Unknown asset: %s" s)
@@ -81,6 +81,74 @@ type price = {
 } [@@deriving sexp, yojson]
 
 type price_series = price list [@@deriving sexp, yojson]
+
+(** Coverage types - now includes CEX liquidation *)
+type coverage_type =
+  | Depeg
+  | Smart_contract
+  | Oracle
+  | Bridge
+  | CEX_liquidation
+[@@deriving sexp, compare, yojson, enumerate, equal, hash]
+
+let coverage_type_to_string = function
+  | Depeg -> "depeg"
+  | Smart_contract -> "smart_contract"
+  | Oracle -> "oracle"
+  | Bridge -> "bridge"
+  | CEX_liquidation -> "cex_liquidation"
+
+let coverage_type_of_string = function
+  | "depeg" -> Ok Depeg
+  | "smart_contract" -> Ok Smart_contract
+  | "oracle" -> Ok Oracle
+  | "bridge" -> Ok Bridge
+  | "cex_liquidation" -> Ok CEX_liquidation
+  | s -> Error (Printf.sprintf "Unknown coverage type: %s" s)
+
+(** Coverage type to contract ID (0-4) *)
+let coverage_type_to_id = function
+  | Depeg -> 0
+  | Smart_contract -> 1
+  | Oracle -> 2
+  | Bridge -> 3
+  | CEX_liquidation -> 4
+
+(** Supported blockchains *)
+type blockchain =
+  | Ethereum
+  | Arbitrum
+  | Base
+  | Polygon
+  | Optimism
+  | Bitcoin
+  | Lightning
+  | Solana
+  | TON
+[@@deriving sexp, compare, yojson, enumerate, equal, hash]
+
+let blockchain_to_string = function
+  | Ethereum -> "Ethereum"
+  | Arbitrum -> "Arbitrum"
+  | Base -> "Base"
+  | Polygon -> "Polygon"
+  | Optimism -> "Optimism"
+  | Bitcoin -> "Bitcoin"
+  | Lightning -> "Lightning"
+  | Solana -> "Solana"
+  | TON -> "TON"
+
+let blockchain_of_string = function
+  | "Ethereum" -> Ok Ethereum
+  | "Arbitrum" -> Ok Arbitrum
+  | "Base" -> Ok Base
+  | "Polygon" -> Ok Polygon
+  | "Optimism" -> Ok Optimism
+  | "Bitcoin" -> Ok Bitcoin
+  | "Lightning" -> Ok Lightning
+  | "Solana" -> Ok Solana
+  | "TON" -> Ok TON
+  | s -> Error (Printf.sprintf "Unknown blockchain: %s" s)
 
 (** Policy status *)
 type policy_status =
@@ -98,12 +166,14 @@ let policy_status_to_string = function
   | Expired -> "expired"
   | Cancelled -> "cancelled"
 
-(** Policy structure *)
+(** Policy structure (multi-dimensional with chain and stablecoin) *)
 type policy = {
   policy_id: int64;
   policyholder: string;
   beneficiary: string option; (* If None, policyholder is beneficiary *)
-  asset: asset;
+  coverage_type: coverage_type; (* NEW: Coverage dimension *)
+  chain: blockchain; (* NEW: Chain dimension *)
+  asset: asset; (* Stablecoin dimension *)
   coverage_amount: usd_cents;
   premium_paid: usd_cents;
   trigger_price: float;
@@ -125,8 +195,10 @@ let is_active policy =
   | Active -> true
   | _ -> false
 
+(* Commented out due to ppx_fields_conv conflict
 let is_expired policy ~current_time =
   current_time >= policy.expiry_time
+*)
 
 (** Virtual tranche for LP accounting *)
 type virtual_tranche = {
@@ -405,7 +477,7 @@ let create_alert ~severity ~component ~message =
     severity;
     component;
     message;
-    timestamp = Unix.gettimeofday ();
+    timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
     metadata = [];
   }
 
@@ -497,39 +569,6 @@ and tranche_info = {
 (** ========================================
     MULTI-CHAIN TYPES
     ======================================== *)
-
-(** Supported blockchains *)
-type blockchain =
-  | Ethereum
-  | Arbitrum
-  | Base
-  | Polygon
-  | Optimism
-  | Bitcoin
-  | Lightning
-  | TON
-[@@deriving sexp, compare, yojson, enumerate, equal]
-
-let blockchain_to_string = function
-  | Ethereum -> "Ethereum"
-  | Arbitrum -> "Arbitrum"
-  | Base -> "Base"
-  | Polygon -> "Polygon"
-  | Optimism -> "Optimism"
-  | Bitcoin -> "Bitcoin"
-  | Lightning -> "Lightning"
-  | TON -> "TON"
-
-let blockchain_of_string = function
-  | "Ethereum" -> Ok Ethereum
-  | "Arbitrum" -> Ok Arbitrum
-  | "Base" -> Ok Base
-  | "Polygon" -> Ok Polygon
-  | "Optimism" -> Ok Optimism
-  | "Bitcoin" -> Ok Bitcoin
-  | "Lightning" -> Ok Lightning
-  | "TON" -> Ok TON
-  | s -> Error (Printf.sprintf "Unknown blockchain: %s" s)
 
 (** Oracle sources for price/event data *)
 type oracle_source =
@@ -676,10 +715,13 @@ type escrow_contract = {
   status: escrow_status;
   conditions_met: int;
   released_at: float option;
+  funded_at: float option;
+  timeout_at: float;
 
   (* Protection *)
   protection_enabled: bool;
   protection_covers: protection_coverage;
+  protection_policy_id: int64 option;
 } [@@deriving sexp, yojson]
 
 and release_condition =
@@ -785,4 +827,137 @@ type escrow_status_response = {
   conditions_status: (int * bool * string) list; (* index, met, description *)
   time_remaining_seconds: int;
   can_release: bool;
+} [@@deriving sexp, yojson]
+
+(** ========================================
+    DISPUTE RESOLUTION TYPES
+    ======================================== *)
+
+(** Evidence for dispute *)
+type evidence = {
+  evidence_id: int64;
+  dispute_id: int64;
+  submitted_by: string; (* payer or payee *)
+  evidence_type: string; (* "transaction_proof", "oracle_data", etc. *)
+  content_hash: string; (* SHA-256 hash of evidence *)
+  ipfs_cid: string option; (* IPFS CID if stored on IPFS *)
+  description: string;
+  metadata: string option; (* Additional structured data as JSON string *)
+  submitted_at: float;
+  verified: bool;
+  verified_at: float option;
+  verified_by: string option;
+} [@@deriving sexp, yojson]
+
+type evidence_type_legacy =
+  | Document
+  | Image
+  | Video
+  | ScreenRecording
+  | GitHubCommit
+  | ChatLog
+  | ContractAgreement
+  | Other
+[@@deriving sexp, yojson]
+
+(** Dispute reasons *)
+type dispute_reason =
+  | WorkNotCompleted of { expected_deliverable: string; actual_state: string }
+  | WorkQualityIssue of { agreed_standard: string; actual_quality: string }
+  | PaymentDispute of { agreed_amount: usd_cents; disputed_amount: usd_cents }
+  | TimelineViolation of { deadline: float; completion_time: float option }
+  | FraudSuspicion of { evidence_url: string; description: string }
+  | OtherReason of string
+[@@deriving sexp, yojson]
+
+(** Resolution outcomes *)
+type resolution_outcome =
+  | FullRelease (* 100% to payee *)
+  | FullRefund (* 100% to payer *)
+  | PartialSplit of { payee_pct: float; payer_pct: float } (* e.g., 60/40 *)
+  | ExtendedDeadline of { extension_days: int } (* Give more time *)
+  | RequireArbitration (* Escalate to multi-arbiter panel *)
+[@@deriving sexp, yojson]
+
+(** Dispute status *)
+type dispute_status =
+  | EvidenceCollection
+  | UnderReview
+  | Resolved
+  | Appealed
+  | Closed
+[@@deriving sexp, compare, yojson, equal]
+
+(** Dispute record *)
+type dispute = {
+  dispute_id: int64;
+  escrow_id: int64;
+  initiated_by: string;
+  reason: dispute_reason;
+  evidence: evidence list;
+  assigned_arbiter: string option;
+  status: dispute_status;
+  resolution: resolution_outcome option;
+  resolution_reasoning: string option;
+  created_at: float;
+  resolved_at: float option;
+  appeal_deadline: float option;
+} [@@deriving sexp, yojson]
+
+(** Arbiter specialization *)
+type specialization =
+  | FreelanceDisputes
+  | TradeFinDisputes
+  | RealEstateDisputes
+  | MilestoneDisputes
+  | TechnicalDisputes
+  | LegalDisputes
+[@@deriving sexp, compare, yojson, equal]
+
+let specialization_to_string = function
+  | FreelanceDisputes -> "freelance"
+  | TradeFinDisputes -> "trade_fin"
+  | RealEstateDisputes -> "real_estate"
+  | MilestoneDisputes -> "milestone"
+  | TechnicalDisputes -> "technical"
+  | LegalDisputes -> "legal"
+
+let specialization_of_string = function
+  | "freelance" -> Ok FreelanceDisputes
+  | "trade_fin" -> Ok TradeFinDisputes
+  | "real_estate" -> Ok RealEstateDisputes
+  | "milestone" -> Ok MilestoneDisputes
+  | "technical" -> Ok TechnicalDisputes
+  | "legal" -> Ok LegalDisputes
+  | s -> Error (Printf.sprintf "Unknown specialization: %s" s)
+
+(** Arbiter record *)
+type arbiter = {
+  arbiter_id: int64;
+  arbiter_address: string;
+  reputation_score: int; (* Integer score, default 1000 *)
+  total_disputes_resolved: int;
+  total_votes_cast: int;
+  specialization: string option;
+  is_active: bool;
+} [@@deriving sexp, yojson]
+
+(** Arbiter vote *)
+type arbiter_vote = {
+  vote_id: int64;
+  dispute_id: int64;
+  arbiter_id: int64;
+  arbiter_address: string;
+  vote_option: string; (* "approve", "deny", "partial_approve", "abstain" *)
+  vote_amount: int64 option; (* For partial approvals *)
+  reasoning: string option;
+} [@@deriving sexp, yojson]
+
+(** Timeline event *)
+type timeline_event = {
+  event_id: int64;
+  dispute_id: int64;
+  event_type: string; (* "dispute_created", "evidence_submitted", etc. *)
+  actor_address: string option;
+  event_data: string option; (* JSON string *)
 } [@@deriving sexp, yojson]

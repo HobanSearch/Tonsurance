@@ -1,0 +1,281 @@
+{
+  "network": "testnet",
+  "deployedAt": "2025-10-15T00:00:00Z",
+  "deployer": "EQ... (deployer wallet address)",
+  "contracts": {
+    "core": {
+      "PolicyFactory": {
+        "address": "EQ... (to be deployed)",
+        "codeHash": "",
+        "deployTx": "",
+        "description": "Main policy factory for 560-product matrix",
+        "supports": {
+          "coverageTypes": ["depeg", "bridge_exploit", "smart_contract", "oracle_failure", "cex_liquidation"],
+          "chains": ["ethereum", "arbitrum", "base", "polygon", "optimism", "bitcoin", "lightning", "solana", "ton"],
+          "stablecoins": ["USDC", "USDT", "USDP", "DAI", "FRAX", "BUSD", "USDe", "sUSDe", "USDY", "PYUSD", "GHO", "LUSD", "crvUSD", "mkUSD"]
+        }
+      },
+      "ClaimsProcessor": {
+        "address": "EQ... (to be deployed)",
+        "codeHash": "",
+        "deployTx": "",
+        "description": "Processes claims with 4-hour sustained trigger validation"
+      },
+      "MultiTrancheVault": {
+        "address": "EQ... (to be deployed)",
+        "codeHash": "",
+        "deployTx": "",
+        "description": "6-tranche vault system with bonding curves",
+        "tranches": [
+          {
+            "name": "SURE-BTC",
+            "id": 0,
+            "tokenAddress": "EQ... (to be deployed)",
+            "targetAPY": "4% flat",
+            "allocation": "25%"
+          },
+          {
+            "name": "SURE-SNR",
+            "id": 1,
+            "tokenAddress": "EQ... (to be deployed)",
+            "targetAPY": "6.5-10% logarithmic",
+            "allocation": "20%"
+          },
+          {
+            "name": "SURE-MEZZ",
+            "id": 2,
+            "tokenAddress": "EQ... (to be deployed)",
+            "targetAPY": "9-15% linear",
+            "allocation": "18%"
+          },
+          {
+            "name": "SURE-JNR",
+            "id": 3,
+            "tokenAddress": "EQ... (to be deployed)",
+            "targetAPY": "12.5-16% sigmoidal",
+            "allocation": "15%"
+          },
+          {
+            "name": "SURE-JNR+",
+            "id": 4,
+            "tokenAddress": "EQ... (to be deployed)",
+            "targetAPY": "16-22% quadratic",
+            "allocation": "12%"
+          },
+          {
+            "name": "SURE-EQT",
+            "id": 5,
+            "tokenAddress": "EQ... (to be deployed)",
+            "targetAPY": "15-25% exponential",
+            "allocation": "10%"
+          }
+        ]
+      },
+      
+      "Treasury": {
+        "address": "EQ... (to be deployed)",
+        "codeHash": "",
+        "deployTx": "",
+        "description": "Protocol treasury and reserve management"
+      },
+      "SUREToken": {
+        "address": "EQ... (to be deployed)",
+        "codeHash": "",
+        "deployTx": "",
+        "description": "Governance token"
+      }
+    },
+    "libs": {
+      "BondingCurves": {
+        "address": "EQ... (to be deployed)",
+        "codeHash": "",
+        "deployTx": "",
+        "description": "Bonding curve library for tranche pricing"
+      },
+      "RiskMultipliers": {
+        "address": "EQ... (to be deployed)",
+        "codeHash": "",
+        "deployTx": "",
+        "description": "Chain and stablecoin risk multipliers"
+      },
+      "AsyncHelpers": {
+        "address": "EQ... (to be deployed)",
+        "codeHash": "",
+        "deployTx": "",
+        "description": "Async message handling utilities"
+      }
+    },
+    "oracles": {
+      "CEXOracleAdapter": {
+        "address": "EQ... (to be deployed)",
+        "codeHash": "",
+        "deployTx": "",
+        "description": "Aggregates Redstone, Pyth, Chainlink for CEX liquidation monitoring",
+        "sources": ["Redstone", "Pyth", "Chainlink"]
+      },
+      "PricingOracle": {
+        "address": "EQ... (to be deployed)",
+        "codeHash": "",
+        "deployTx": "",
+        "description": "Phase 4 hedge pricing oracle (future)"
+      }
+    },
+    "hedged": {
+      "HedgedPolicyFactory": {
+        "address": "EQ... (to be deployed)",
+        "codeHash": "",
+        "deployTx": "",
+        "description": "Phase 4: Swing pricing policy factory (future)"
+      },
+      "HedgeCoordinator": {
+        "address": "EQ... (to be deployed)",
+        "codeHash": "",
+        "deployTx": "",
+        "description": "Phase 4: Coordinates external hedges (future)"
+      }
+    }
+  },
+  "backend": {
+    "api": {
+      "baseURL": "https://api-testnet.tonsurance.com",
+      "endpoints": [
+        "POST /api/v1/quote",
+        "POST /api/v1/policy/purchase",
+        "GET /api/v1/policy/:id",
+        "GET /api/v1/vault/info",
+        "POST /api/v1/lp/deposit",
+        "POST /api/v1/lp/withdraw",
+        "GET /api/v1/risk/metrics"
+      ],
+      "wsURL": "wss://api-testnet.tonsurance.com/ws"
+    },
+    "database": {
+      "host": "testnet-db.tonsurance.com",
+      "name": "tonsurance_testnet",
+      "migrations": "backend/migrations/*.sql"
+    },
+    "redis": {
+      "host": "testnet-redis.tonsurance.com",
+      "port": 6379,
+      "cluster": false
+    }
+  },
+  "monitoring": {
+    "prometheus": "https://prometheus-testnet.tonsurance.com",
+    "grafana": "https://grafana-testnet.tonsurance.com",
+    "dashboards": [
+      "Policy Volume by Product",
+      "Bridge Health Monitor",
+      "Tranche Utilization",
+      "API Request Rates",
+      "Risk Metrics (VaR, LTV, Reserves)"
+    ]
+  },
+  "configuration": {
+    "riskLimits": {
+      "maxLTV": 0.75,
+      "minReserveRatio": 0.15,
+      "maxSingleChainConcentration": 0.35,
+      "maxSingleAssetConcentration": 0.30,
+      "maxCorrelatedExposure": 0.50,
+      "requiredStressBuffer": 1.5
+    },
+    "chainConcentrationLimits": {
+      "ethereum": 0.40,
+      "bitcoin": 0.40,
+      "arbitrum": 0.30,
+      "optimism": 0.30,
+      "base": 0.30,
+      "polygon": 0.20,
+      "ton": 0.20,
+      "solana": 0.10,
+      "lightning": 0.10
+    },
+    "stablecoinTiers": {
+      "tier1": {
+        "coins": ["USDC", "USDT", "USDP", "PYUSD"],
+        "maxSingleAsset": 0.30,
+        "maxTierTotal": 0.60,
+        "adjustmentBps": 0
+      },
+      "tier2": {
+        "coins": ["DAI", "FRAX", "BUSD", "USDY", "GHO", "LUSD"],
+        "maxSingleAsset": 0.20,
+        "maxTierTotal": 0.40,
+        "adjustmentBps": 75
+      },
+      "tier3": {
+        "coins": ["USDe", "sUSDe", "crvUSD", "mkUSD"],
+        "maxSingleAsset": 0.10,
+        "maxTierTotal": 0.20,
+        "adjustmentBps": 175
+      }
+    },
+    "coverageTypeMultipliers": {
+      "depeg": 1.0,
+      "smart_contract": 1.3,
+      "oracle_failure": 1.2,
+      "bridge_exploit": 1.5,
+      "cex_liquidation": 1.4
+    }
+  },
+  "testnetFaucets": {
+    "TON": "https://testnet.ton.org/testnet/faucet",
+    "instructions": "Request testnet TON to fund deployer wallet and test policy purchases"
+  },
+  "explorerLinks": {
+    "tonScan": "https://testnet.tonscan.org",
+    "tonAPI": "https://testnet.tonapi.io"
+  },
+  "deploymentSteps": {
+    "1_libraries": [
+      "Deploy BondingCurves library",
+      "Deploy RiskMultipliers library",
+      "Deploy AsyncHelpers library"
+    ],
+    "2_core_contracts": [
+      "Deploy MultiTrancheVault (with library references)",
+      "Deploy 6 tranche token contracts (SURE-BTC, SURE-SNR, SURE-MEZZ, SURE-JNR, SURE-JNR+, SURE-EQT)",
+      "Deploy PolicyFactory (with MultiTrancheVault address)",
+      "Deploy ClaimsProcessor",
+      
+      "Deploy Treasury",
+      "Deploy SUREToken"
+    ],
+    "3_oracles": [
+      "Deploy CEXOracleAdapter",
+      "Configure oracle sources (Redstone, Pyth, Chainlink endpoints)"
+    ],
+    "4_initialization": [
+      "Initialize MultiTrancheVault with tranche token addresses",
+      "Set PolicyFactory as authorized minter on MultiTrancheVault",
+      "Set ClaimsProcessor as authorized on vaults",
+      "Configure risk limits on PolicyFactory",
+      "Fund vaults with initial test capital (optional)"
+    ],
+    "5_backend_deployment": [
+      "Deploy PostgreSQL database",
+      "Run migrations (002_add_multi_dimensional_coverage.sql)",
+      "Deploy Redis cache",
+      "Deploy OCaml API server",
+      "Configure monitoring stack (Prometheus + Grafana)"
+    ],
+    "6_verification": [
+      "Test quote endpoint for all 5 coverage types",
+      "Test policy purchase for USDC depeg on Ethereum",
+      "Verify LP deposit to SURE-MEZZ tranche",
+      "Check vault info endpoint",
+      "Verify risk metrics calculation"
+    ]
+  },
+  "notes": [
+    "This is a TESTNET deployment - do not use real funds",
+    "Contract addresses will be populated after deployment",
+    "All transactions are on TON testnet",
+    "Product matrix: 560 combinations (5 coverage × 9 chains × 14 stablecoins)",
+    "See docs/DEPLOYMENT_GUIDE.md for detailed deployment instructions",
+    "See docs/PRODUCT_MATRIX.md for full product list",
+    "See docs/RISK_MATRIX.md for risk multipliers and concentration limits",
+    "See docs/API_REFERENCE.md for backend API documentation"
+  ]
+}

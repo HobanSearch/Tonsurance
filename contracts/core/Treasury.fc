@@ -1,7 +1,8 @@
-;; Treasury Contract - Protocol Treasury
+;; Treasury Contract - Protocol Treasury (6-Tier Aware)
 ;; Holds premiums and reserves
 ;; Manages payouts to Claims Processor
-;; Routes premium shares to vaults
+;; Distributes yield to MultiTrancheVault (6 tranches)
+;; Tracks LP rewards with utilization-based bonuses
 
 #include "../imports/stdlib.fc";
 
@@ -11,8 +12,16 @@ global int total_premiums_collected;
 global int total_payouts_made;
 global int reserve_balance;
 global slice claims_processor_address;
-global slice premium_distributor_address;
+global slice multi_tranche_vault_address;  ;; NEW: MultiTrancheVault reference
 global slice staking_pool_address;
+
+;; Tranche yield tracking (cumulative rewards distributed)
+global int btc_yield_distributed;
+global int snr_yield_distributed;
+global int mezz_yield_distributed;
+global int jnr_yield_distributed;
+global int jnr_plus_yield_distributed;
+global int eqt_yield_distributed;
 
 () load_data() impure {
     slice ds = get_data().begin_parse();
@@ -22,17 +31,36 @@ global slice staking_pool_address;
     reserve_balance = ds~load_coins();
     claims_processor_address = ds~load_msg_addr();
 
-    ;; Load remaining addresses from reference cell
+    ;; Load remaining addresses and yield tracking from reference cells
     slice addresses_ref = ds~load_ref().begin_parse();
-    premium_distributor_address = addresses_ref~load_msg_addr();
+    multi_tranche_vault_address = addresses_ref~load_msg_addr();
     staking_pool_address = addresses_ref~load_msg_addr();
+
+    ;; Load tranche yield tracking from second reference cell
+    slice yield_ref = ds~load_ref().begin_parse();
+    btc_yield_distributed = yield_ref~load_coins();
+    snr_yield_distributed = yield_ref~load_coins();
+    mezz_yield_distributed = yield_ref~load_coins();
+    jnr_yield_distributed = yield_ref~load_coins();
+    jnr_plus_yield_distributed = yield_ref~load_coins();
+    eqt_yield_distributed = yield_ref~load_coins();
 }
 
 () save_data() impure {
     ;; Store extra addresses in reference cell to avoid overflow
     cell addresses_ref = begin_cell()
-        .store_slice(premium_distributor_address)
+        .store_slice(multi_tranche_vault_address)
         .store_slice(staking_pool_address)
+        .end_cell();
+
+    ;; Store tranche yield tracking in second reference cell
+    cell yield_ref = begin_cell()
+        .store_coins(btc_yield_distributed)
+        .store_coins(snr_yield_distributed)
+        .store_coins(mezz_yield_distributed)
+        .store_coins(jnr_yield_distributed)
+        .store_coins(jnr_plus_yield_distributed)
+        .store_coins(eqt_yield_distributed)
         .end_cell();
 
     set_data(begin_cell()
@@ -42,6 +70,7 @@ global slice staking_pool_address;
         .store_coins(reserve_balance)
         .store_slice(claims_processor_address)
         .store_ref(addresses_ref)
+        .store_ref(yield_ref)
         .end_cell());
 }
 
@@ -49,40 +78,29 @@ global slice staking_pool_address;
     throw_unless(403, equal_slices_bits(sender_address, owner_address));
 }
 
-;; Receive premium from PolicyFactory
+;; Receive premium from PolicyFactory and distribute to 6 tranches
 () receive_premium(int policy_id, int amount, cell policy_data) impure {
     total_premiums_collected += amount;
-    save_data();
 
-    ;; Forward to Premium Distributor for distribution
-    cell msg = begin_cell()
+    ;; Calculate splits:
+    ;; - 70% to MultiTrancheVault (LP rewards across 6 tranches)
+    ;; - 20% to staking pool (SURE staker rewards)
+    ;; - 10% to protocol reserve
+    int vault_amount = muldiv(amount, 70, 100);
+    int staker_amount = muldiv(amount, 20, 100);
+    int reserve_amount = amount - vault_amount - staker_amount;
+
+    ;; Send to MultiTrancheVault for 6-tier distribution
+    cell msg_vault = begin_cell()
         .store_uint(0x18, 6)
-        .store_slice(premium_distributor_address)
-        .store_coins(amount)
+        .store_slice(multi_tranche_vault_address)
+        .store_coins(vault_amount)
         .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
-        .store_uint(0x01, 32)  ;; op: distribute_premium
-        .store_coins(amount)
-        .store_uint(policy_id, 64)
+        .store_uint(0x03, 32)  ;; op: distribute_premiums (from MultiTrancheVault.fc)
+        .store_coins(vault_amount)
         .end_cell();
 
-    send_raw_message(msg, 1);
-
-    ;; Emit event
-    emit_log(0x50, begin_cell()
-        .store_uint(policy_id, 64)
-        .store_coins(amount)
-        .store_coins(total_premiums_collected)
-        .end_cell().begin_parse());
-}
-
-;; Receive protocol share (from Premium Distributor)
-() receive_protocol_share(int amount, int policy_id) impure {
-    ;; Split protocol share:
-    ;; - 60% to staking pool (for staker rewards)
-    ;; - 40% to reserve
-
-    int staker_amount = muldiv(amount, 60, 100);
-    int reserve_amount = amount - staker_amount;
+    send_raw_message(msg_vault, 1);
 
     ;; Send to staking pool
     cell msg_staking = begin_cell()
@@ -100,22 +118,39 @@ global slice staking_pool_address;
     reserve_balance += reserve_amount;
     save_data();
 
-    emit_log(0x51, begin_cell()
+    ;; Emit premium received event
+    emit_log(0x50, begin_cell()
         .store_uint(policy_id, 64)
+        .store_coins(amount)
+        .store_coins(vault_amount)
         .store_coins(staker_amount)
         .store_coins(reserve_amount)
+        .store_coins(total_premiums_collected)
         .end_cell().begin_parse());
 }
 
-;; Receive reserve share (from Premium Distributor)
-() receive_reserve_share(int amount, int policy_id) impure {
-    reserve_balance += amount;
+;; Receive tranche yield confirmation from MultiTrancheVault
+() receive_yield_confirmation(int tranche_id, int yield_amount) impure {
+    ;; Track cumulative yield distributed to each tranche
+    if (tranche_id == 1) {
+        btc_yield_distributed += yield_amount;
+    } elseif (tranche_id == 2) {
+        snr_yield_distributed += yield_amount;
+    } elseif (tranche_id == 3) {
+        mezz_yield_distributed += yield_amount;
+    } elseif (tranche_id == 4) {
+        jnr_yield_distributed += yield_amount;
+    } elseif (tranche_id == 5) {
+        jnr_plus_yield_distributed += yield_amount;
+    } elseif (tranche_id == 6) {
+        eqt_yield_distributed += yield_amount;
+    }
+
     save_data();
 
-    emit_log(0x52, begin_cell()
-        .store_uint(policy_id, 64)
-        .store_coins(amount)
-        .store_coins(reserve_balance)
+    emit_log(0x51, begin_cell()
+        .store_uint(tranche_id, 8)
+        .store_coins(yield_amount)
         .end_cell().begin_parse());
 }
 
@@ -171,9 +206,9 @@ global slice staking_pool_address;
     save_data();
 }
 
-() set_premium_distributor(slice sender_address, slice new_address) impure {
+() set_multi_tranche_vault(slice sender_address, slice new_address) impure {
     check_owner(sender_address);
-    premium_distributor_address = new_address;
+    multi_tranche_vault_address = new_address;
     save_data();
 }
 
@@ -209,6 +244,62 @@ slice get_claims_processor() method_id {
     return (total_premiums_collected, total_payouts_made, reserve_balance);
 }
 
+;; Get tranche yield distributed (individual tranches)
+int get_btc_yield_distributed() method_id {
+    load_data();
+    return btc_yield_distributed;
+}
+
+int get_snr_yield_distributed() method_id {
+    load_data();
+    return snr_yield_distributed;
+}
+
+int get_mezz_yield_distributed() method_id {
+    load_data();
+    return mezz_yield_distributed;
+}
+
+int get_jnr_yield_distributed() method_id {
+    load_data();
+    return jnr_yield_distributed;
+}
+
+int get_jnr_plus_yield_distributed() method_id {
+    load_data();
+    return jnr_plus_yield_distributed;
+}
+
+int get_eqt_yield_distributed() method_id {
+    load_data();
+    return eqt_yield_distributed;
+}
+
+;; Get all tranche yields (for analytics)
+(int, int, int, int, int, int) get_all_tranche_yields() method_id {
+    load_data();
+    return (
+        btc_yield_distributed,
+        snr_yield_distributed,
+        mezz_yield_distributed,
+        jnr_yield_distributed,
+        jnr_plus_yield_distributed,
+        eqt_yield_distributed
+    );
+}
+
+;; Get total yield distributed across all tranches
+int get_total_yield_distributed() method_id {
+    load_data();
+    return btc_yield_distributed + snr_yield_distributed + mezz_yield_distributed +
+           jnr_yield_distributed + jnr_plus_yield_distributed + eqt_yield_distributed;
+}
+
+slice get_multi_tranche_vault() method_id {
+    load_data();
+    return multi_tranche_vault_address;
+}
+
 ;; Recv internal
 () recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
     if (in_msg_body.slice_empty?()) {
@@ -238,17 +329,10 @@ slice get_claims_processor() method_id {
         return ();
     }
 
-    if (op == 0x04) {  ;; receive_protocol_share
-        int amount = in_msg_body~load_coins();
-        int policy_id = in_msg_body~load_uint(64);
-        receive_protocol_share(amount, policy_id);
-        return ();
-    }
-
-    if (op == 0x05) {  ;; receive_reserve_share
-        int amount = in_msg_body~load_coins();
-        int policy_id = in_msg_body~load_uint(64);
-        receive_reserve_share(amount, policy_id);
+    if (op == 0x04) {  ;; receive_yield_confirmation (from MultiTrancheVault)
+        int tranche_id = in_msg_body~load_uint(8);
+        int yield_amount = in_msg_body~load_coins();
+        receive_yield_confirmation(tranche_id, yield_amount);
         return ();
     }
 
@@ -265,9 +349,9 @@ slice get_claims_processor() method_id {
         return ();
     }
 
-    if (op == 0x11) {  ;; set_premium_distributor
+    if (op == 0x11) {  ;; set_multi_tranche_vault
         slice new_address = in_msg_body~load_msg_addr();
-        set_premium_distributor(sender_address, new_address);
+        set_multi_tranche_vault(sender_address, new_address);
         return ();
     }
 
@@ -289,7 +373,7 @@ slice get_claims_processor() method_id {
 
 ;; Note: emit_log() is now implemented in stdlib.fc
 ;; Treasury uses the following event IDs for audit trail:
-;; 0x50: PremiumReceived
-;; 0x51: PayoutMade
-;; 0x52: ReserveWithdrawn
+;; 0x50: PremiumReceived (includes vault_amount, staker_amount, reserve_amount splits)
+;; 0x51: YieldConfirmation (tranche_id, yield_amount)
+;; 0x52: PayoutMade (recipient, amount, total_payouts)
 ;; 0x53: ReserveDeposited

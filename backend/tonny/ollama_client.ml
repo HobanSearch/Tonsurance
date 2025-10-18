@@ -29,7 +29,7 @@ type chat_response = {
   model: string;
   created_at: string;
   message: message;
-  done: bool;
+  done_: bool; [@key "done"]
 }
 [@@deriving yojson]
 

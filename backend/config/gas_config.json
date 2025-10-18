@@ -1,0 +1,128 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Gas amount configuration for TON blockchain operations",
+  "version": "1.0.0",
+
+  "base_amounts_nanoton": {
+    "min_operational_balance": 100000000,
+    "description": "Minimum balance: 0.1 TON (100,000,000 nanoton)"
+  },
+
+  "contract_operations": {
+    "deploy": {
+      "amount_nanoton": 100000000,
+      "description": "0.1 TON for contract deployment"
+    },
+    "simple_message": {
+      "amount_nanoton": 10000000,
+      "description": "0.01 TON for simple notifications"
+    },
+    "standard_operation": {
+      "amount_nanoton": 30000000,
+      "description": "0.03 TON for standard operations"
+    },
+    "complex_operation": {
+      "amount_nanoton": 50000000,
+      "description": "0.05 TON for complex operations (mint, burn)"
+    },
+    "heavy_operation": {
+      "amount_nanoton": 100000000,
+      "description": "0.1 TON for heavy operations (governance, transfers)"
+    },
+    "waterfall_operation": {
+      "amount_nanoton": 150000000,
+      "description": "0.15 TON for waterfall distribution logic"
+    }
+  },
+
+  "policy_factory": {
+    "minimum_premium_gas": 50000000,
+    "routing_gas": 80000000,
+    "description": "0.05 TON minimum for premiums, 0.08 TON for routing"
+  },
+
+  "policy_router": {
+    "minimum_payment_buffer": 100000000,
+    "shard_operation_gas": 80000000,
+    "description": "0.1 TON buffer, 0.08 TON for shard operations"
+  },
+
+  "multi_tranche_vault": {
+    "deposit_gas": 100000000,
+    "withdrawal_gas": 50000000,
+    "waterfall_gas": 150000000,
+    "notification_gas": 100000000,
+    "description": "Gas amounts for vault operations"
+  },
+
+  "claims_processor": {
+    "waterfall_gas": 150000000,
+    "payout_gas": 100000000,
+    "description": "Gas for claims processing and payouts"
+  },
+
+  "treasury": {
+    "reserve_gas": 100000000,
+    "description": "Gas reserve for Treasury operations"
+  },
+
+  "tranche_tokens": {
+    "mint_gas": 100000000,
+    "burn_gas": 100000000,
+    "transfer_gas": 100000000,
+    "description": "Gas for SURE_BTC, SURE_SNR, SURE_MEZZ, SURE_JNR, SURE_JNR_PLUS, SURE_EQT operations"
+  },
+
+  "hedged_contracts": {
+    "hedge_coordination_gas": 100000000,
+    "pricing_oracle_update_gas": 50000000,
+    "description": "Gas for hedged insurance operations"
+  },
+
+  "rewards": {
+    "governance_vote_reward": 50000000,
+    "oracle_update_reward": 100000000,
+    "description": "0.05 TON per vote, 0.1 TON per oracle update"
+  },
+
+  "escrow": {
+    "creation_gas": 100000000,
+    "release_gas": 50000000,
+    "description": "Gas for escrow operations"
+  },
+
+  "dynamic_gas": {
+    "base_gas": 10000000,
+    "payload_gas_per_kb": 1000000,
+    "vesting_logic_bonus": 50000000,
+    "governance_bonus": 100000000,
+    "description": "Dynamic gas calculation parameters (0.001 TON per KB payload)"
+  },
+
+  "min_deposits": {
+    "vault_min_deposit": 100000000,
+    "policy_min_coverage_nanoton": 10000000000,
+    "policy_max_coverage_nanoton": 1000000000000,
+    "description": "0.1 TON min vault deposit, 2 TON - 200 TON policy range at $5/TON"
+  },
+
+  "tonny_bot": {
+    "policy_purchase_gas": 500000000,
+    "description": "0.5 TON gas for bot-initiated policy purchases"
+  },
+
+  "environment_multipliers": {
+    "development": 1.0,
+    "staging": 1.0,
+    "production": 1.2,
+    "description": "Gas multipliers per environment (prod has 20% safety buffer)"
+  },
+
+  "notes": [
+    "All amounts in nanoton (1 TON = 1,000,000,000 nanoton)",
+    "Production environment uses 20% higher gas for safety",
+    "Waterfall operations are most expensive due to multi-tranche logic",
+    "Dynamic gas calculation adjusts based on payload size",
+    "Review gas costs quarterly based on network congestion"
+  ]
+}
