@@ -23,3 +23,14 @@
 **/values.dev.yaml
 LICENSE
 README.md
+# Exclude tonny training artifacts from main backend build (8GB total)
+# Keep OCaml source code for tonny_bot.exe compilation
+# Inference server has separate Dockerfile with access to merged model
+backend/tonny/training_data/
+backend/tonny/models/
+backend/tonny/train_tonny.py
+backend/tonny/train_tonny*.py
+
+# Exclude local build artifacts (causes conflicts in Docker)
+backend/_build/
+**/_build/
