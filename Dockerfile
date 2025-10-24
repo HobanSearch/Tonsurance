@@ -43,7 +43,7 @@ RUN opam install -y yojson logs && \
     opam install -y conf-libev && \
     opam install -y lwt lwt_ppx && \
     opam install -y redis redis-lwt cryptokit && \
-    opam install -y core dream cohttp-lwt-unix caqti caqti-lwt caqti-driver-postgresql ppx_sexp_conv ppx_deriving_yojson ppx_yojson_conv ppx_jane
+    opam install -y core dream opium cohttp-lwt-unix caqti caqti-lwt caqti-driver-postgresql ppx_sexp_conv ppx_deriving_yojson ppx_yojson_conv ppx_jane
 
 # Build the project
 RUN eval $(opam env) && dune build --release
