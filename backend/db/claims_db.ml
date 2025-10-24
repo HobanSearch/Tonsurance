@@ -1,4 +1,3 @@
-open Lwt.Syntax
 open Core
 open Connection_pool.ConnectionPool
 
@@ -17,12 +16,12 @@ module Q = struct
   open Caqti_type
 
   let trigger_state_type =
-    (tup4 int64 (option float) int float)
-    |> map
-      ~decode:(fun (policy_id, first_below_timestamp, samples_below, last_check_timestamp) ->
-        Ok { policy_id; first_below_timestamp; samples_below; last_check_timestamp; })
+    custom
       ~encode:(fun { policy_id; first_below_timestamp; samples_below; last_check_timestamp } ->
         Ok (policy_id, first_below_timestamp, samples_below, last_check_timestamp))
+      ~decode:(fun (policy_id, first_below_timestamp, samples_below, last_check_timestamp) ->
+        Ok { policy_id; first_below_timestamp; samples_below; last_check_timestamp; })
+      (t4 int64 (option float) int float)
 
   let upsert_trigger_state =
     trigger_state_type ->. unit

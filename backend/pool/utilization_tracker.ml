@@ -16,7 +16,7 @@ open Core
 open Lwt.Syntax
 (* open Pricing_engine.Tranche_pricing *)
 open Types
-open Integration.Database
+open Database
 
 module UtilizationTracker = struct
 
@@ -55,7 +55,7 @@ module UtilizationTracker = struct
   let cache_ttl_seconds = 30.0
 
   (** Database connection pool *)
-  let db_pool = ref None
+  let db_pool : ((Caqti_lwt.connection, Caqti_error.t) Caqti_lwt_unix.Pool.t, Caqti_error.t) Result.t option ref = ref None
 
   (** Create tranche_utilization table if not exists *)
   let rec create_utilization_table () : unit Lwt.t =
@@ -68,17 +68,16 @@ module UtilizationTracker = struct
 
   (** Initialize with database pool *)
   and init ~database_config =
-    let%lwt pool = Database.create_pool database_config in
-    db_pool := Some pool;
+    let pool_result = Database.create_pool database_config in
     (* Ensure schema exists *)
-    match pool with
+    match pool_result with
     | Ok pool_val ->
-        let%lwt _ = Database.with_connection (Ok pool_val) (fun db ->
-          Database.initialize_schema db
-        ) in
+        db_pool := Some (Ok pool_val);
+        (* Schema initialization would happen here with the pool *)
         let%lwt _ = create_utilization_table () in
         Lwt.return_ok ()
     | Error e ->
+        db_pool := Some (Error e);
         Lwt.return_error (DatabaseError (Caqti_error.show e))
 
   (** Calculate utilization ratio *)

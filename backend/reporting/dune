@@ -13,6 +13,8 @@
    caqti-driver-postgresql
    types
    math
-   risk_model)
+   risk_model
+   monte_carlo_enhanced
+   db)
  (modules risk_report_generator)
  (preprocess (pps lwt_ppx ppx_sexp_conv ppx_deriving_yojson)))
