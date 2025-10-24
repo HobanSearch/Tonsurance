@@ -12,7 +12,6 @@
  *)
 
 open Core
-open Lwt.Syntax
 open Lwt.Infix
 
 module ConnectionPool = struct
@@ -73,7 +72,11 @@ module ConnectionPool = struct
     mutable total_released: int;
     mutable total_failures: int;
     pool_mutex: Lwt_mutex.t;
-    semaphore: unit; (* TODO: Replace with actual semaphore when available *)
+    (* Custom semaphore implementation (Lwt_semaphore not available) *)
+    available_permits: int ref;
+    max_permits: int;
+    semaphore_mutex: Lwt_mutex.t;
+    semaphore_condition: unit Lwt_condition.t;
     health_check_running: bool ref;
   }
 
@@ -204,6 +207,7 @@ module ConnectionPool = struct
       (db_uri: Uri.t)
     : t Lwt.t =
 
+    let max_permits = config.pool_size + config.max_overflow in
     let pool = {
       config;
       db_uri;
@@ -213,7 +217,10 @@ module ConnectionPool = struct
       total_released = 0;
       total_failures = 0;
       pool_mutex = Lwt_mutex.create ();
-      semaphore = (); (* TODO: Lwt_semaphore.create (config.pool_size + config.max_overflow); *)
+      available_permits = ref max_permits;
+      max_permits;
+      semaphore_mutex = Lwt_mutex.create ();
+      semaphore_condition = Lwt_condition.create ();
       health_check_running = ref false;
     } in
 
@@ -233,6 +240,32 @@ module ConnectionPool = struct
       Lwt.return pool
     )
 
+  (** Custom semaphore operations (since Lwt_semaphore not available) *)
+  let rec semaphore_wait (pool: t) : unit Lwt.t =
+    Lwt_mutex.with_lock pool.semaphore_mutex (fun () ->
+      if !(pool.available_permits) > 0 then begin
+        pool.available_permits := !(pool.available_permits) - 1;
+        Lwt.return (`Acquired)
+      end else
+        Lwt.return (`Must_wait)
+    ) >>= function
+    | `Acquired -> Lwt.return ()
+    | `Must_wait ->
+        let%lwt () = Lwt_condition.wait ~mutex:pool.semaphore_mutex pool.semaphore_condition in
+        semaphore_wait pool
+
+  let semaphore_signal (pool: t) : unit =
+    Lwt.async (fun () ->
+      Lwt_mutex.with_lock pool.semaphore_mutex (fun () ->
+        pool.available_permits := !(pool.available_permits) + 1;
+        Lwt_condition.signal pool.semaphore_condition ();
+        Lwt.return ()
+      )
+    )
+
+  let semaphore_wait_count (pool: t) : int =
+    pool.max_permits - !(pool.available_permits)
+
   (** Acquire connection from pool *)
   let acquire (pool: t) : (Caqti_lwt.connection, string) Result.t Lwt.t =
     let timeout_promise =
@@ -243,7 +276,7 @@ module ConnectionPool = struct
     in
 
     let acquire_promise =
-      (* let%lwt () = Lwt_semaphore.wait pool.semaphore in *)
+      let%lwt () = semaphore_wait pool in
 
       let%lwt conn_opt = Lwt_mutex.with_lock pool.pool_mutex (fun () ->
         let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
@@ -292,11 +325,11 @@ module ConnectionPool = struct
               ) in
               Lwt.return (Ok db_conn)
           | Error error ->
-              (* Lwt_semaphore.signal pool.semaphore; *)
+              semaphore_signal pool;
               Lwt.return (Error (Caqti_error.show error)))
 
       | None ->
-          (* Lwt_semaphore.signal pool.semaphore; *)
+          semaphore_signal pool;
           Lwt.return (Error "Pool exhausted - no connections available")
     in
 
@@ -319,7 +352,7 @@ module ConnectionPool = struct
           conn.state <- Idle now;
           conn.last_used <- now;
           pool.total_released <- pool.total_released + 1;
-          (* Lwt_semaphore.signal pool.semaphore; *)
+          semaphore_signal pool;
           let%lwt () = Logs_lwt.debug (fun m ->
             m "[ConnectionPool] Released connection #%d" conn.id
           ) in
@@ -329,26 +362,25 @@ module ConnectionPool = struct
           let%lwt () = Logs_lwt.warn (fun m ->
             m "[ConnectionPool] Attempted to release unknown connection"
           ) in
-          (* Lwt_semaphore.signal pool.semaphore; *)
+          semaphore_signal pool;
           Lwt.return ()
     )
 
   (** Execute function with connection (auto-release) *)
   let with_connection
       (pool: t)
-      (f: Caqti_lwt.connection -> 'a Lwt.t)
-    : ('a, string) Result.t Lwt.t =
+      (f: (module Caqti_lwt.CONNECTION) -> ('a, [> Caqti_error.t]) Result.t Lwt.t)
+    : ('a, [> Caqti_error.t]) Result.t Lwt.t =
 
     let%lwt conn_result = acquire pool in
     match conn_result with
-    | Error e -> Lwt.return (Error e)
+    | Error e -> Lwt.return (Error (Caqti_error.connect_failed ~uri:(Uri.of_string "pool") (Caqti_error.Msg e)))
     | Ok conn ->
         let%lwt result =
           try%lwt
-            let%lwt value = f conn in
-            Lwt.return (Ok value)
+            f conn
           with exn ->
-            Lwt.return (Error (Exn.to_string exn))
+            Lwt.return (Error (Caqti_error.request_failed ~uri:(Uri.of_string "pool") ~query:"" (Caqti_error.Msg (Exn.to_string exn))))
         in
         let%lwt () = release pool conn in
         Lwt.return result
@@ -476,7 +508,7 @@ module ConnectionPool = struct
         match conn.state with Failed _ -> true | _ -> false
       ) in
 
-      let waiting = 0 (* Lwt_semaphore.wait_count pool.semaphore *) in
+      let waiting = semaphore_wait_count pool in
 
       Lwt.return {
         total_connections = total;
@@ -530,5 +562,149 @@ module ConnectionPool = struct
     ) in
 
     Lwt.return ()
+
+  (** Create a raw Caqti pool for legacy functions that require it
+   *
+   * NOTE: This is for backwards compatibility with monte_carlo functions.
+   * New code should use Connection_pool.t directly via with_connection.
+   *
+   * Returns a Result-wrapped Caqti pool that can be passed to legacy APIs.
+   *)
+  let create_caqti_pool
+      ?(_max_size=20)  (* TODO: Use pool_config to set max_size *)
+      (db_uri: Uri.t)
+    : ((Caqti_lwt.connection, Caqti_error.t) Caqti_lwt_unix.Pool.t, [> Caqti_error.t]) Result.t Lwt.t =
+
+    try%lwt
+      (* Caqti_lwt_unix.connect_pool returns a Result, not a promise *)
+      match Caqti_lwt_unix.connect_pool db_uri with
+      | Ok pool -> Lwt.return (Ok pool)
+      | Error err -> Lwt.return (Error err)
+    with
+    | Caqti_error.Exn err -> Lwt.return (Error err)
+    | exn ->
+        Lwt.return (Error (Caqti_error.connect_failed
+          ~uri:db_uri
+          (Caqti_error.Msg (Exn.to_string exn))))
+
+end
+
+(** ============================================
+    GLOBAL POOL INSTANCE
+    ============================================ *)
+
+(** Global connection pool singleton *)
+module GlobalPool = struct
+
+  let global_pool : ConnectionPool.t option ref = ref None
+  let init_mutex = Lwt_mutex.create ()
+
+  (** Parse PostgreSQL connection URL (format: postgresql://user:pass@host:port/database) *)
+  let parse_database_url (url: string) : (Uri.t, string) Result.t =
+    try
+      let uri = Uri.of_string url in
+      let scheme = Uri.scheme uri in
+      match scheme with
+      | Some "postgresql" | Some "postgres" ->
+          Ok uri
+      | _ ->
+          Error (Printf.sprintf "Invalid database URL scheme: %s (expected postgresql://)"
+            (Option.value scheme ~default:"none"))
+    with exn ->
+      Error (Printf.sprintf "Failed to parse DATABASE_URL: %s" (Exn.to_string exn))
+
+  (** Build database URI from environment variables
+   *  Priority: DATABASE_URL > individual env vars > defaults *)
+  let build_db_uri_from_env () : (Uri.t, string) Result.t =
+    (* First, try DATABASE_URL (Docker/production) *)
+    match Sys.getenv "DATABASE_URL" with
+    | Some url when not (String.is_empty url) ->
+        (match parse_database_url url with
+        | Ok parsed_uri ->
+            Logs.info (fun m -> m "[GlobalPool] Using DATABASE_URL from environment");
+            Ok parsed_uri
+        | Error e -> Error e)
+
+    | _ ->
+        (* Fall back to individual env vars (local development) *)
+        let get_env key default = Option.value (Sys.getenv key) ~default in
+
+        let host = get_env "DB_HOST" "localhost" in
+        let port = get_env "DB_PORT" "5432" in
+        let database = get_env "DB_NAME" "tonsurance" in
+        let user = get_env "DB_USER" "postgres" in
+        let password = get_env "DB_PASSWORD" "" in
+
+        if String.is_empty password then
+          Logs.warn (fun m -> m "[GlobalPool] DB_PASSWORD not set - using empty password (INSECURE!)");
+
+        Logs.info (fun m -> m "[GlobalPool] Building database URI from individual env vars (DB_HOST=%s)" host);
+
+        let uri_string = Printf.sprintf "postgresql://%s:%s@%s:%s/%s"
+          user password host port database
+        in
+
+        Ok (Uri.of_string uri_string)
+
+  (** Initialize global pool from environment *)
+  let initialize ?(config=ConnectionPool.default_config) () : (ConnectionPool.t, string) Result.t Lwt.t =
+    Lwt_mutex.with_lock init_mutex (fun () ->
+      match !global_pool with
+      | Some pool ->
+          Lwt.return (Ok pool)
+      | None ->
+          let%lwt () = Logs_lwt.info (fun m ->
+            m "[GlobalPool] Initializing database connection pool from environment..."
+          ) in
+
+          match build_db_uri_from_env () with
+          | Error e -> Lwt.return (Error e)
+          | Ok db_uri ->
+              let%lwt pool = ConnectionPool.create ~config db_uri in
+              ConnectionPool.start_health_check pool;
+              global_pool := Some pool;
+
+              let%lwt () = Logs_lwt.info (fun m ->
+                m "[GlobalPool] Database connection pool initialized successfully"
+              ) in
+
+              Lwt.return (Ok pool)
+    )
+
+  (** Get or create global pool *)
+  let get_pool () : (ConnectionPool.t, string) Result.t Lwt.t =
+    match !global_pool with
+    | Some pool -> Lwt.return (Ok pool)
+    | None -> initialize ()
+
+  (** Execute query with global pool connection *)
+  let with_connection
+      (f: (module Caqti_lwt.CONNECTION) -> ('a, [> Caqti_error.t]) Result.t Lwt.t)
+    : ('a, [> Caqti_error.t]) Result.t Lwt.t =
+
+    let%lwt pool_result = get_pool () in
+    match pool_result with
+    | Error e -> Lwt.return (Error (Caqti_error.connect_failed ~uri:(Uri.of_string "global_pool") (Caqti_error.Msg e)))
+    | Ok pool -> ConnectionPool.with_connection pool f
+
+  (** Get pool statistics *)
+  let get_stats () : (ConnectionPool.pool_stats, string) Result.t Lwt.t =
+    let%lwt pool_result = get_pool () in
+    match pool_result with
+    | Error e -> Lwt.return (Error e)
+    | Ok pool ->
+        let%lwt stats = ConnectionPool.get_stats pool in
+        Lwt.return (Ok stats)
+
+  (** Shutdown global pool *)
+  let shutdown () : unit Lwt.t =
+    Lwt_mutex.with_lock init_mutex (fun () ->
+      match !global_pool with
+      | None -> Lwt.return ()
+      | Some pool ->
+          let%lwt () = ConnectionPool.close pool in
+          global_pool := None;
+          Lwt.return ()
+    )
 
 end
