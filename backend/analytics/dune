@@ -8,9 +8,10 @@
    logs
    logs.lwt
    yojson
-   ppx_yojson_conv
+   ppx_deriving_yojson.runtime
+   postgresql
    tonsurance.types
    tonsurance.math
    tonsurance.pipeline)
- (preprocess (pps ppx_jane ppx_yojson_conv))
- (modules market_correlation volatility_estimator))
+ (preprocess (pps lwt_ppx ppx_sexp_conv ppx_fields_conv ppx_compare ppx_deriving_yojson))
+ (modules volatility_estimator))
