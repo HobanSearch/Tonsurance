@@ -1,7 +1,7 @@
 open Core
 open Types
 open Monte_carlo_enhanced
-open Market_data_risk_integration
+open Market_data_risk_integration.MarketDataRiskIntegration
 
 let get_risk_factors (asset: asset) : stablecoin_risk_factors =
   match asset with
@@ -51,7 +51,7 @@ module RiskModel = struct
   let calculate_risk_assessment
       ~db_pool
       ~(vault: MonteCarloEnhanced.vault_state)
-      ~(market_conditions: Market_data_risk_integration.market_risk_multipliers) =
+      ~(market_conditions: market_risk_multipliers) =
 
     let%lwt var_result_lwt = MonteCarloEnhanced.calculate_adaptive_var
       db_pool
