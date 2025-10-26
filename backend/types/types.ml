@@ -114,6 +114,15 @@ let coverage_type_to_id = function
   | Bridge -> 3
   | CEX_liquidation -> 4
 
+(** Convert contract ID back to coverage type *)
+let coverage_type_of_id = function
+  | 0 -> Depeg
+  | 1 -> Smart_contract
+  | 2 -> Oracle
+  | 3 -> Bridge
+  | 4 -> CEX_liquidation
+  | id -> failwith (Printf.sprintf "Invalid coverage_type ID: %d (must be 0-4)" id)
+
 (** Supported blockchains *)
 type blockchain =
   | Ethereum
@@ -149,6 +158,17 @@ let blockchain_of_string = function
   | "Solana" -> Ok Solana
   | "TON" -> Ok TON
   | s -> Error (Printf.sprintf "Unknown blockchain: %s" s)
+
+(** Market conditions for dynamic pricing *)
+type market_conditions = {
+  stablecoin_prices: (asset * float * float) list; (* asset, price, confidence *)
+  bridge_health_scores: (string * float) list; (* bridge_id, health_score *)
+  cex_liquidation_rate: float; (* liquidations per hour *)
+  chain_gas_prices: (blockchain * float) list; (* chain, gas_price_gwei *)
+  protocol_exploit_count_24h: int;
+  overall_volatility_index: float; (* 0.0 - 1.0 *)
+  timestamp: float;
+} [@@deriving sexp, yojson]
 
 (** Policy status *)
 type policy_status =
@@ -940,6 +960,8 @@ type arbiter = {
   total_votes_cast: int;
   specialization: string option;
   is_active: bool;
+  staked_amount: usd_cents; (* Amount staked in USD cents *)
+  staked_at: float option; (* Unix timestamp when stake was deposited *)
 } [@@deriving sexp, yojson]
 
 (** Arbiter vote *)
@@ -961,3 +983,19 @@ type timeline_event = {
   actor_address: string option;
   event_data: string option; (* JSON string *)
 } [@@deriving sexp, yojson]
+
+(** Configuration for escrow insurance pricing *)
+type escrow_config = {
+  base_apr: float; (* 0.008 = 0.8% APR *)
+  short_duration_discount: float; (* 0.8 = 20% off for <= 7 days *)
+  medium_duration_discount: float; (* 0.9 = 10% off for <= 30 days *)
+  volume_discount: float; (* 0.9 = 10% off for 5+ escrows *)
+  both_parties_multiplier: float; (* 1.5x for dual coverage *)
+} [@@deriving sexp, yojson]
+
+(** Protection coverage types for escrow *)
+type escrow_coverage =
+  | PayerOnly
+  | PayeeOnly
+  | BothParties
+[@@deriving sexp, yojson]
