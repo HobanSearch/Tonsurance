@@ -2,5 +2,5 @@
  (name bitcoin_float)
  (public_name tonsurance.bitcoin_float)
  (modules bitcoin_float_manager bridge_aggregator)
- (libraries core types math pool integration lwt lwt.unix logs logs.lwt)
+ (libraries core types math pool integration monitoring lwt lwt.unix logs logs.lwt)
  (preprocess (pps lwt_ppx ppx_jane ppx_deriving_yojson)))

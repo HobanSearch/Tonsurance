@@ -146,24 +146,79 @@ module BridgeAggregator = struct
       }
     )
 
+  (** Convert Rubic blockchain to Types.blockchain *)
+  let rubic_to_types_blockchain (chain: blockchain) : Types.blockchain =
+    match chain with
+    | TON -> Types.TON
+    | Ethereum -> Types.Ethereum
+    | Arbitrum -> Types.Arbitrum
+    | Polygon -> Types.Polygon
+    | BNB_Chain -> Types.Ethereum (* Map BNB to Ethereum for now *)
+    | Optimism -> Types.Optimism
+    | Base -> Types.Base
+
+  (** Map Rubic provider to bridge name for health monitoring *)
+  let provider_to_bridge_name (provider: bridge_provider) : string =
+    match provider with
+    | Symbiosis -> "Symbiosis"
+    | Retrobridge -> "TON Bridge" (* Retrobridge uses TON Bridge infrastructure *)
+    | Changelly -> "Wormhole" (* Changelly often routes via Wormhole *)
+    | ChangeNOW -> "Wormhole"
+    | SimpleSwap -> "TON Bridge"
+    | Bridgers -> "TON Bridge"
+
   (** Get bridge security score from bridge health monitor *)
   let get_bridge_security_score
       ~(provider: bridge_provider)
+      ~(src_chain: blockchain)
+      ~(dst_chain: blockchain)
     : float Lwt.t =
 
-    (* Integration with backend/monitoring/bridge_monitor.ml (Phase 4 task 6)
-     * For now, use estimated scores based on provider reputation *)
+    (* Integration with backend/monitoring/bridge_health_monitor.ml *)
 
-    let score = match provider with
-      | Symbiosis -> 0.92 (* High security, audited, 1000+ tokens *)
-      | Retrobridge -> 0.88 (* TON-native, good security *)
-      | Changelly -> 0.85 (* Established, KYC-compliant *)
-      | ChangeNOW -> 0.85 (* Non-custodial, fast *)
-      | SimpleSwap -> 0.80 (* Simple, lower volume *)
-      | Bridgers -> 0.82 (* Newer but growing *)
-    in
+    try%lwt
+      let bridge_name = provider_to_bridge_name provider in
 
-    Lwt.return score
+      let%lwt health_result = Monitoring.Bridge_health_monitor.BridgeHealthMonitor.get_bridge_health
+        ~bridge_name
+        ~source_chain:(rubic_to_types_blockchain src_chain)
+        ~dest_chain:(rubic_to_types_blockchain dst_chain)
+      in
+
+      match health_result with
+      | Ok (_status, metrics) ->
+          let%lwt () = Logs_lwt.debug (fun m ->
+            m "[BridgeAgg] %s security score: %.2f (TVL: $%.2fM, failure_rate: %.2f%%)"
+              bridge_name
+              metrics.security_score
+              (metrics.tvl_usd /. 1_000_000.0)
+              (metrics.failure_rate_24h *. 100.0)
+          ) in
+          Lwt.return metrics.security_score
+
+      | Error _err ->
+          (* Fallback to estimated scores *)
+          let score = match provider with
+            | Symbiosis -> 0.92
+            | Retrobridge -> 0.88
+            | Changelly -> 0.85
+            | ChangeNOW -> 0.85
+            | SimpleSwap -> 0.80
+            | Bridgers -> 0.82
+          in
+          Lwt.return score
+
+    with _exn ->
+      (* Final fallback *)
+      let score = match provider with
+        | Symbiosis -> 0.92
+        | Retrobridge -> 0.88
+        | Changelly -> 0.85
+        | ChangeNOW -> 0.85
+        | SimpleSwap -> 0.80
+        | Bridgers -> 0.82
+      in
+      Lwt.return score
 
   (** Discover best routes for bridging asset between chains *)
   let discover_routes
@@ -201,7 +256,11 @@ module BridgeAggregator = struct
           (match quote_result with
           | Ok quote ->
               (* Get security score for this provider *)
-              let%lwt security_score = get_bridge_security_score ~provider:quote.provider in
+              let%lwt security_score = get_bridge_security_score
+                ~provider:quote.provider
+                ~src_chain
+                ~dst_chain
+              in
 
               (* Calculate total time including confirmations *)
               let confirmation_time = match (src_chain, dst_chain) with
