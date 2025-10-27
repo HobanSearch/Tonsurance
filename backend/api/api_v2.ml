@@ -509,7 +509,7 @@ let router state _ton_config = [
     (tranches_apy_handler state);
 ] @ Escrow_api.routes
   @ Transactional_api.routes state.collateral_manager
-  @ Hedging_api.routes state
+  @ Hedging_api.routes state.collateral_manager
 
 (** ========================================
  * BACKGROUND MONITORING TASKS

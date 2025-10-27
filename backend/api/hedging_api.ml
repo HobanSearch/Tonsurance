@@ -16,11 +16,6 @@ open Types
 open Dream
 open Ppx_yojson_conv_lib.Yojson_conv.Primitives
 
-(** Hedging API state *)
-type hedging_api_state = {
-  mutable collateral_manager: Pool.Collateral_manager.CollateralManager.t ref;
-}
-
 (** ============================================
  * ENDPOINT 1: GET /api/v2/hedging/swing-quote
  * ============================================
@@ -53,7 +48,7 @@ type hedging_api_state = {
  * }
  *)
 
-let swing_quote_handler _state req =
+let swing_quote_handler (_collateral_manager: Pool.Collateral_manager.CollateralManager.t ref) req =
   try%lwt
     let coverage_type_str = Dream.query req "coverage_type" |> Option.value ~default:"depeg" in
     let chain_str = Dream.query req "chain" |> Option.value ~default:"ton" in
@@ -128,25 +123,21 @@ let swing_quote_handler _state req =
     ) in
 
         Dream.json (Yojson.Safe.to_string response)
-        |> Lwt.return
 
     | Error coverage_err, _, _ ->
         Dream.json ~status:`Bad_Request (Yojson.Safe.to_string (`Assoc [
           ("error", `String ("Invalid coverage_type: " ^ coverage_err))
         ]))
-        |> Lwt.return
 
     | _, Error chain_err, _ ->
         Dream.json ~status:`Bad_Request (Yojson.Safe.to_string (`Assoc [
           ("error", `String ("Invalid chain: " ^ chain_err))
         ]))
-        |> Lwt.return
 
     | _, _, Error stablecoin_err ->
         Dream.json ~status:`Bad_Request (Yojson.Safe.to_string (`Assoc [
           ("error", `String ("Invalid stablecoin: " ^ stablecoin_err))
         ]))
-        |> Lwt.return
 
   with
   | exn ->
@@ -158,7 +149,6 @@ let swing_quote_handler _state req =
         ("error", `String "Failed to calculate swing quote");
         ("message", `String error_msg);
       ]))
-      |> Lwt.return
 
 (** ============================================
  * ENDPOINT 2: GET /api/v2/hedging/policy/:policy_id/status
@@ -184,7 +174,7 @@ let swing_quote_handler _state req =
  * }
  *)
 
-let hedge_status_handler state req =
+let hedge_status_handler (collateral_manager: Pool.Collateral_manager.CollateralManager.t ref) req =
   try%lwt
     let policy_id_str = Dream.param req "policy_id" in
     let policy_id = Int64.of_string policy_id_str in
@@ -194,7 +184,7 @@ let hedge_status_handler state req =
     ) in
 
     (* Get policy from collateral manager *)
-    let pool = (!(state.collateral_manager)).pool in
+    let pool = (!collateral_manager).pool in
 
     (* Find policy *)
     let policy_opt = List.find pool.active_policies ~f:(fun p -> Int64.(p.policy_id = policy_id)) in
@@ -208,13 +198,12 @@ let hedge_status_handler state req =
           ("error", `String "Policy not found");
           ("policy_id", `String policy_id_str);
         ]))
-        |> Lwt.return
 
     | Some policy ->
         (* For now, return mock hedge positions since database tracking is Phase 4.5 *)
         (* TODO: Query hedge_positions table in db once backend/db/hedge_persistence.ml is integrated *)
         let hedges_requested = true in
-        let fully_hedged = policy.policy_status = Active in
+        let fully_hedged = is_active policy in
 
         let response = `Assoc [
           ("policy_id", `String (Int64.to_string policy_id));
@@ -253,7 +242,6 @@ let hedge_status_handler state req =
         ) in
 
         Dream.json (Yojson.Safe.to_string response)
-        |> Lwt.return
     )
 
   with
@@ -266,10 +254,9 @@ let hedge_status_handler state req =
         ("error", `String "Failed to fetch hedge status");
         ("message", `String error_msg);
       ]))
-      |> Lwt.return
 
 (** Routes *)
-let routes state = [
-  Dream.get "/api/v2/hedging/swing-quote" (swing_quote_handler state);
-  Dream.get "/api/v2/hedging/policy/:policy_id/status" (hedge_status_handler state);
+let routes (collateral_manager: Pool.Collateral_manager.CollateralManager.t ref) = [
+  Dream.get "/api/v2/hedging/swing-quote" (swing_quote_handler collateral_manager);
+  Dream.get "/api/v2/hedging/policy/:policy_id/status" (hedge_status_handler collateral_manager);
 ]
