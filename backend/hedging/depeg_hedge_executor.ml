@@ -598,7 +598,7 @@ module DepegHedgeExecutor = struct
     ) in
 
     (* Create market_id → execution mapping for quick lookups *)
-    let execution_map = List.fold executions ~init:(Map.empty (module String)) ~f:(fun acc exec ->
+    let _execution_map = List.fold executions ~init:(Map.empty (module String)) ~f:(fun acc exec ->
       Map.set acc ~key:exec.market_id ~data:exec
     ) in
 

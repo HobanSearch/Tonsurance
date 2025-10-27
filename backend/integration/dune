@@ -7,7 +7,7 @@
           polymarket_http_client binance_http_client chainlink_http_client
           chainlink_client bridge_health_client cex_liquidation_client chain_metrics_client
           escrow_oracle_client chain_event_client binance_futures_client allianz_parametric_client
-          hyperliquid_client gmx_v2_client dydx_v4_client
+          hyperliquid_client gmx_v2_client dydx_v4_client rubic_bridge_client
           vault_sync policy_event_subscriber)
  (libraries core types math config caqti caqti-lwt.unix lwt lwt.unix cohttp cohttp-lwt-unix yojson logs logs.lwt logs.fmt digestif uri redis-lwt)
  (preprocess (pps lwt_ppx ppx_jane ppx_yojson_conv)))

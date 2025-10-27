@@ -1079,14 +1079,15 @@ module ProtocolShortExecutor = struct
           ~venue:position.venue
         in
 
-        let current_price = match price_opt with
-          | Some price -> price
+        (* Handle price fetch result *)
+        let%lwt current_price = match price_opt with
+          | Some price -> Lwt.return price
           | None ->
               (* Fallback: use entry price + small random movement if price fetch fails *)
               let%lwt () = Logs_lwt.warn (fun m ->
                 m "Using estimated price for %s (fetch failed)" position.token.token_symbol
               ) in
-              position.entry_price *. (1.0 +. (Random.float 0.04 -. 0.02))
+              Lwt.return (position.entry_price *. (1.0 +. (Random.float 0.04 -. 0.02)))
         in
 
         let updated = update_position_pnl ~position ~current_price in

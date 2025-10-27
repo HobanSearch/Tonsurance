@@ -132,10 +132,14 @@ let fetch_polymarket_bridge_cost
         | (Ethereum, Polygon) | (Polygon, Ethereum) -> "Polygon PoS Bridge"
         | _ -> "Wormhole" (* Default to Wormhole for other chains *)
       );
+      bridge_type = `Token;
       source_chain;
       dest_chain;
       tvl_usd = 0.0; (* Not needed for cost calculation *)
-      risk_score = 0.0; (* Not needed for cost calculation *)
+      security_score = 0.85; (* Estimated score *)
+      hack_history = 0;
+      last_audit_date = 0.0;
+      governance = `Multisig;
     } in
 
     (* Find relevant Polymarket markets for this bridge *)
@@ -390,7 +394,7 @@ let fetch_allianz_parametric_cost
 
     (* Request quote from Allianz API *)
     let%lwt quote_result = Allianz_parametric_client.AllianzClient.request_quote
-      ~config:allianz_config
+      ~_config:allianz_config
       ~coverage_type
       ~coverage_amount_usd:hedged_amount
       ~duration_days:30
