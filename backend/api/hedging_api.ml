@@ -189,7 +189,7 @@ let hedge_status_handler state req =
     ) in
 
     (* Get policy from collateral manager *)
-    let pool = (!(state.Api_v2_server.StateV2.collateral_manager)).pool in
+    let pool = (!(state.collateral_manager)).pool in
 
     (* Find policy *)
     let policy_opt = List.find pool.active_policies ~f:(fun p -> Int64.(p.policy_id = policy_id)) in
