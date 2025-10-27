@@ -14,10 +14,10 @@ export type DynamicPricingOracleConfig = {
 export function dynamicPricingOracleConfigToCell(config: DynamicPricingOracleConfig): Cell {
     return beginCell()
         .storeAddress(config.adminAddress)
-        .storeDict(config.authorizedKeepers)
-        .storeDict(config.multisigSigners)
+        .storeDict(undefined)  // authorizedKeepers - empty dict initially
+        .storeDict(undefined)  // multisigSigners - empty dict initially
         .storeUint(config.multisigThreshold, 8)
-        .storeDict(config.productMultipliers)
+        .storeDict(undefined)  // productMultipliers - empty dict initially
         .storeBit(config.globalCircuitBreaker)
         .storeUint(config.lastUpdateTime, 32)
         .storeUint(config.totalUpdates, 32)

@@ -1,0 +1,18 @@
+(library
+ (name hedging)
+ (public_name tonsurance.hedging)
+ (modules hedge_cost_fetcher depeg_hedge_executor bridge_hedge_executor protocol_short_executor cex_liquidation_executor hedge_orchestrator)
+ (libraries
+   core
+   lwt
+   lwt.unix
+   unix
+   logs
+   logs.lwt
+   types
+   math
+   integration
+   config
+   ppx_yojson_conv_lib)
+ (flags (:standard -w -3))
+ (preprocess (pps lwt_ppx ppx_jane ppx_deriving_yojson)))

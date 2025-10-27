@@ -40,6 +40,8 @@ module ConfigManager = struct
     retry: Yojson.Safe.t;
     pools: Yojson.Safe.t;
     thresholds: Yojson.Safe.t;
+    pricing: Yojson.Safe.t;
+    chain_baselines: Yojson.Safe.t; (* ADDED *)
     environment: Yojson.Safe.t;
     loaded_at: float;
   }
@@ -77,6 +79,8 @@ module ConfigManager = struct
     let* retry = load_json_file "retry_policies.json" in
     let* pools = load_json_file "pool_sizes.json" in
     let* thresholds = load_json_file "thresholds.json" in
+    let* pricing = load_json_file "pricing.json" in
+    let* chain_baselines = load_json_file "chain_baselines.json" in (* ADDED *)
     let* environment = load_json_file (
       Printf.sprintf "%s.json" (environment_to_string !current_environment)
     ) in
@@ -87,6 +91,8 @@ module ConfigManager = struct
       retry;
       pools;
       thresholds;
+      pricing;
+      chain_baselines; (* ADDED *)
       environment;
       loaded_at = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
     } in
@@ -159,6 +165,8 @@ module ConfigManager = struct
                     | "retry" -> cache.retry
                     | "pools" -> cache.pools
                     | "thresholds" -> cache.thresholds
+                    | "pricing" -> cache.pricing
+                    | "chain_baselines" -> cache.chain_baselines (* ADDED *)
                     | _ -> `Assoc []
                   in
                   (match get_json_path base_json path with
@@ -304,6 +312,34 @@ module ConfigManager = struct
 
     let get_vault_lock_timeout () =
       get_int ~category:"thresholds" ~path:["vault_operations"; "lock_timeout_seconds"] ~default:60
+  end
+
+  module Pricing = struct
+    let get_base_rate asset_str =
+      let* default_rate = get_float ~category:"pricing" ~path:["default_rate"] ~default:0.10 in
+      get_float ~category:"pricing" ~path:["base_rates"; asset_str] ~default:default_rate
+
+    let get_escrow_config () : Types.escrow_config Lwt.t =
+      let* base_apr = get_float ~category:"pricing" ~path:["escrow_pricing"; "base_apr"] ~default:0.008 in
+      let* short_duration_discount = get_float ~category:"pricing" ~path:["escrow_pricing"; "short_duration_discount"] ~default:0.8 in
+      let* medium_duration_discount = get_float ~category:"pricing" ~path:["escrow_pricing"; "medium_duration_discount"] ~default:0.9 in
+      let* volume_discount = get_float ~category:"pricing" ~path:["escrow_pricing"; "volume_discount"] ~default:0.9 in
+      let* both_parties_multiplier = get_float ~category:"pricing" ~path:["escrow_pricing"; "both_parties_multiplier"] ~default:1.5 in
+      Lwt.return ({
+        base_apr;
+        short_duration_discount;
+        medium_duration_discount;
+        volume_discount;
+        both_parties_multiplier;
+      } : Types.escrow_config)
+  end
+
+  module ChainBaselines = struct
+    let get_baseline_gas chain_str =
+      get_float ~category:"chain_baselines" ~path:[(String.lowercase chain_str); "gas_price_gwei"] ~default:30.0
+
+    let get_baseline_block_time chain_str =
+      get_int ~category:"chain_baselines" ~path:[(String.lowercase chain_str); "block_time_ms"] ~default:10000
   end
 
   (* Validation *)

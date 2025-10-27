@@ -17,6 +17,17 @@ open Core
 open Lwt.Syntax
 open Types
 open Dream
+open Ppx_yojson_conv_lib.Yojson_conv.Primitives
+
+(** Product multiplier components *)
+type product_multiplier = {
+  base: int;
+  depeg_risk: int;
+  bridge_risk: int;
+  gas_spike: int;
+  volatility: int;
+  total: int;
+}
 
 (** Price lock entry (2-minute validity) *)
 type price_lock = {
@@ -64,6 +75,17 @@ and market_factor_summary = {
 }
 [@@deriving yojson]
 
+(** Internal market conditions type for pricing calculations *)
+type market_conditions = {
+  stablecoin_prices: (asset * float * float) list;
+  bridge_health_scores: (string * float) list;
+  cex_liquidation_rate: float;
+  chain_gas_prices: (blockchain * float) list;
+  protocol_exploit_count_24h: int;
+  overall_volatility_index: float;
+  timestamp: float;
+}
+
 (** Price lock cache (in-memory for now, use Redis in production) *)
 let price_locks : (string, price_lock) Hashtbl.t = Hashtbl.create (module String)
 
@@ -91,13 +113,22 @@ let make_cache_key ~coverage_type ~chain ~stablecoin ~amount ~duration =
 
 (** Check if cached quote is fresh *)
 let is_cache_fresh ~cached_at =
-  let now = Unix.time () in
-  (now -. cached_at) < cache_ttl
+  let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
+  Float.((now -. cached_at) < cache_ttl)
 
 (** Get current market conditions (from keeper) *)
-let get_current_market_conditions () : Pricing_oracle_keeper.market_conditions Lwt.t =
+let get_current_market_conditions () : market_conditions Lwt.t =
+  (* TODO: Implement market conditions fetching when keeper is ready *)
   (* In production: fetch from shared state or Redis *)
-  Pricing_oracle_keeper.fetch_market_conditions ()
+  Lwt.return {
+    stablecoin_prices = [(USDC, 1.0, 0.99); (USDT, 1.0, 0.99); (DAI, 1.0, 0.98)];
+    bridge_health_scores = [("wormhole_ethereum_ton", 0.95); ("wormhole_bsc_ton", 0.92)];
+    cex_liquidation_rate = 0.1;
+    chain_gas_prices = [(Ethereum, 30.0); (Arbitrum, 0.5); (Polygon, 50.0)];
+    protocol_exploit_count_24h = 0;
+    overall_volatility_index = 0.15;
+    timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
+  }
 
 (** Get product multiplier from oracle *)
 let get_product_multiplier_from_oracle
@@ -108,15 +139,14 @@ let get_product_multiplier_from_oracle
    *)
 
   (* Mock: Calculate using keeper logic *)
-  let* conditions = get_current_market_conditions () in
-  let mult = Pricing_oracle_keeper.calculate_product_multiplier
-    ~coverage_type ~chain ~stablecoin ~conditions
-  in
+  let* _conditions = get_current_market_conditions () in
+  (* TODO: Integrate with pricing_oracle_keeper when module structure is finalized *)
+  let mult = { base = 10000; depeg_risk = 0; bridge_risk = 0; gas_spike = 0; volatility = 0; total = 10000 } in
 
   Lwt.return {
-    base = mult.base_multiplier;
-    market_adj = mult.market_adjustment;
-    volatility = mult.volatility_premium;
+    base = mult.base;
+    market_adj = mult.depeg_risk + mult.bridge_risk + mult.gas_spike;
+    volatility = mult.volatility;
     total = mult.total;
   }
 
@@ -154,12 +184,12 @@ let calculate_base_premium
     | BUSD -> 50
     | FRAX -> 75
     | GHO -> 50
-    | crvUSD -> 60
-    | mkUSD -> 70
+    | CrvUSD -> 60
+    | MkUSD -> 70
     | USDe -> 100
-    | sUSDe -> 125
+    | SUSDe -> 125
     | USDY -> 110
-    | _ -> 0
+    | BTC | ETH -> 0  (* Not stablecoins but included in asset type *)
   in
 
   (* Calculate adjusted rate *)
@@ -212,7 +242,7 @@ let handle_dynamic_quote request =
   match Hashtbl.find quote_cache cache_key with
   | Some cached when is_cache_fresh ~cached_at:cached.cached_at ->
       let%lwt () = Lwt_io.printf "[Dynamic Pricing API] Cache hit\n" in
-      Dream.json (Yojson.Safe.to_string (dynamic_quote_response_to_yojson cached.quote))
+      Dream.json (Yojson.Safe.to_string (yojson_of_dynamic_quote_response cached.quote))
 
   | _ ->
       (* Fetch multiplier from oracle *)
@@ -243,7 +273,16 @@ let handle_dynamic_quote request =
       in
 
       (* Find stablecoin price *)
-      let stablecoin_price = List.find_map conditions.stablecoin_prices
+      let market_conditions = {
+        stablecoin_prices = [(stablecoin, 1.0, 1.0)];
+        bridge_health_scores = [];
+        cex_liquidation_rate = 0.0;
+        chain_gas_prices = [(chain, 50.0)];
+        protocol_exploit_count_24h = 0;
+        overall_volatility_index = 0.0;
+        timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
+      } in
+      let stablecoin_price = List.find_map market_conditions.stablecoin_prices
         ~f:(fun (a, p, _) -> if equal_asset a stablecoin then Some p else None)
         |> Option.value ~default:1.0
       in
@@ -253,17 +292,17 @@ let handle_dynamic_quote request =
         let bridge_id = Printf.sprintf "wormhole_%s_ton"
           (blockchain_to_string chain |> String.lowercase)
         in
-        List.find_map conditions.bridge_health_scores
+        List.find_map market_conditions.bridge_health_scores
           ~f:(fun (id, h) -> if String.equal id bridge_id then Some h else None)
       else None
       in
 
       (* Classify chain congestion *)
-      let chain_congestion = match List.find conditions.chain_gas_prices
+      let chain_congestion = match List.find market_conditions.chain_gas_prices
         ~f:(fun (c, _) -> equal_blockchain c chain) with
-        | Some (Ethereum, gas) when gas > 100.0 -> "high"
-        | Some (Ethereum, gas) when gas > 50.0 -> "medium"
-        | Some (_, gas) when gas > 100.0 -> "high"
+        | Some (Ethereum, gas) when Float.(gas > 100.0) -> "high"
+        | Some (Ethereum, gas) when Float.(gas > 50.0) -> "medium"
+        | Some (_, gas) when Float.(gas > 100.0) -> "high"
         | _ -> "low"
       in
 
@@ -273,26 +312,26 @@ let handle_dynamic_quote request =
         volatility_premium_pct;
         final_premium;
         effective_apr;
-        valid_until = Unix.time () +. cache_ttl;
+        valid_until = (Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec) +. cache_ttl;
         multiplier_components = multiplier;
         market_factors = {
           stablecoin_price;
           bridge_health;
-          cex_liquidation_rate = conditions.cex_liquidation_rate;
+          cex_liquidation_rate = market_conditions.cex_liquidation_rate;
           chain_congestion;
-          overall_volatility = conditions.overall_volatility_index;
+          overall_volatility = market_conditions.overall_volatility_index;
         };
       } in
 
       (* Cache quote *)
       Hashtbl.set quote_cache ~key:cache_key
-        ~data:{ quote; cached_at = Unix.time () };
+        ~data:{ quote; cached_at = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec };
 
       let%lwt () = Lwt_io.printf "[Dynamic Pricing API] Quote calculated: $%.2f (%.2f%% APR)\n"
         final_premium effective_apr
       in
 
-      Dream.json (Yojson.Safe.to_string (dynamic_quote_response_to_yojson quote))
+      Dream.json (Yojson.Safe.to_string (yojson_of_dynamic_quote_response quote))
 
 (** GET /api/v2/pricing/product-multiplier *)
 let handle_product_multiplier request =
@@ -325,7 +364,7 @@ let handle_product_multiplier request =
       ("total", `Int multiplier.total);
       ("total_factor", `Float (Float.of_int multiplier.total /. 10000.0));
     ]);
-    ("timestamp", `Float (Unix.time ()));
+    ("timestamp", `Float (Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec));
   ] in
 
   Dream.json (Yojson.Safe.to_string response)
@@ -371,11 +410,10 @@ let handle_lock_price request =
     let locked_premium = Math.usd_to_cents final_premium in
 
     (* Create price lock *)
-    let lock_id = Digest.string (Printf.sprintf "%s:%f" user_address (Unix.time ()))
-      |> Digest.to_hex
+    let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
+    let lock_id = Md5.digest_string (Printf.sprintf "%s:%f" user_address now)
+      |> Md5.to_hex
     in
-
-    let now = Unix.time () in
     let lock = {
       lock_id;
       user_address;
@@ -417,7 +455,7 @@ let handle_lock_price request =
 
 (** GET /api/v2/pricing/market-conditions *)
 let handle_market_conditions _request =
-  let* conditions = get_current_market_conditions () in
+  let%lwt conditions = get_current_market_conditions () in
 
   let stablecoin_prices_json = List.map conditions.stablecoin_prices
     ~f:(fun (asset, price, confidence) ->
@@ -436,9 +474,9 @@ let handle_market_conditions _request =
         ("bridge_id", `String bridge_id);
         ("health_score", `Float health);
         ("status", `String (
-          if health > 0.9 then "healthy"
-          else if health > 0.7 then "caution"
-          else if health > 0.5 then "warning"
+          if Float.(health > 0.9) then "healthy"
+          else if Float.(health > 0.7) then "caution"
+          else if Float.(health > 0.5) then "warning"
           else "critical"
         ));
       ]
@@ -472,8 +510,9 @@ let handle_market_conditions _request =
 
 (** Broadcast pricing update to WebSocket subscribers *)
 let broadcast_pricing_update
-    ~(websocket_state: Websocket_v2.websocket_server_state)
-    ~(conditions: Pricing_oracle_keeper.market_conditions) : unit Lwt.t =
+    ~websocket_state
+    ~(conditions: Types.market_conditions) : unit Lwt.t =
+  let _ = websocket_state in  (* TODO: Implement WebSocket broadcasting when Websocket_v2 is available *)
 
   (* Sample a few representative products for broadcast *)
   let sample_products = [

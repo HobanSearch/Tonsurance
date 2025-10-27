@@ -4,7 +4,6 @@
  *)
 
 open Core
-open Lwt.Syntax
 
 (** Cached quote *)
 type cached_quote = {
@@ -24,7 +23,7 @@ let store_quote ~user_id ~quote =
   let cached = {
     user_id;
     quote;
-    created_at = Unix.time ();
+    created_at = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
   } in
   Hashtbl.set quote_cache ~key:user_id ~data:cached;
   Lwt.return_unit
@@ -34,8 +33,9 @@ let get_quote user_id =
   match Hashtbl.find quote_cache user_id with
   | None -> None
   | Some cached ->
-      let age = Unix.time () -. cached.created_at in
-      if age <= quote_validity_seconds then
+      let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
+      let age = now -. cached.created_at in
+      if Float.(age <= quote_validity_seconds) then
         Some cached.quote
       else (
         (* Expired - remove from cache *)
@@ -52,7 +52,8 @@ let get_quote_age user_id =
   match Hashtbl.find quote_cache user_id with
   | None -> None
   | Some cached ->
-      Some (Unix.time () -. cached.created_at)
+      let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
+      Some (now -. cached.created_at)
 
 (** Clear quote for user *)
 let clear_quote user_id =
@@ -63,17 +64,17 @@ let clear_quote user_id =
 let get_freshness_warning user_id =
   match get_quote_age user_id with
   | None -> None
-  | Some age when age > quote_validity_seconds ->
+  | Some age when Float.(age > quote_validity_seconds) ->
       Some "⚠️ Quote expired - pricing may have changed. Please request a new quote with /quote"
-  | Some age when age > 60.0 ->
+  | Some age when Float.(age > 60.0) ->
       Some "ℹ️ Note: Quote is getting old. Pricing may have updated. Consider refreshing."
   | _ -> None
 
 (** Clean up expired quotes (call periodically) *)
 let cleanup_expired () =
-  let now = Unix.time () in
+  let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
   let to_remove = Hashtbl.fold quote_cache ~init:[] ~f:(fun ~key:user_id ~data:cached acc ->
-    if now -. cached.created_at > quote_validity_seconds then
+    if Float.(now -. cached.created_at > quote_validity_seconds) then
       user_id :: acc
     else
       acc
@@ -86,7 +87,7 @@ let get_stats () =
   let total_cached = Hashtbl.length quote_cache in
   let avg_age =
     if total_cached > 0 then
-      let now = Unix.time () in
+      let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
       let total_age = Hashtbl.fold quote_cache ~init:0.0 ~f:(fun ~key:_ ~data:cached acc ->
         acc +. (now -. cached.created_at)
       ) in

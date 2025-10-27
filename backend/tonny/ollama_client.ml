@@ -4,7 +4,6 @@
  *)
 
 open Core
-open Lwt.Syntax
 open Cohttp
 open Cohttp_lwt_unix
 
@@ -20,9 +19,43 @@ type chat_request = {
   model: string;
   messages: message list;
   stream: bool;
-  options: (string * Yojson.Safe.t) option;
+  options: Yojson.Safe.t option;
 }
-[@@deriving yojson]
+
+(* Manual Yojson conversion since options is already Yojson.Safe.t *)
+let yojson_of_chat_request (req : chat_request) : Yojson.Safe.t =
+  let fields = [
+    ("model", `String req.model);
+    ("messages", `List (List.map req.messages ~f:message_to_yojson));
+    ("stream", `Bool req.stream);
+  ] in
+  let fields = match req.options with
+    | Some opts -> ("options", opts) :: fields
+    | None -> fields
+  in
+  `Assoc fields
+
+let chat_request_of_yojson (json : Yojson.Safe.t) : (chat_request, string) Result.t =
+  match json with
+  | `Assoc fields ->
+      (match List.Assoc.find fields "model" ~equal:String.equal,
+             List.Assoc.find fields "messages" ~equal:String.equal,
+             List.Assoc.find fields "stream" ~equal:String.equal with
+      | Some (`String model), Some (`List msgs), Some (`Bool stream) ->
+          let messages_result =
+            List.fold_result msgs ~init:[] ~f:(fun acc msg ->
+              match message_of_yojson msg with
+              | Ok m -> Ok (m :: acc)
+              | Error e -> Error e
+            )
+          in
+          (match messages_result with
+          | Ok messages ->
+              let options = List.Assoc.find fields "options" ~equal:String.equal in
+              Ok { model; messages = List.rev messages; stream; options }
+          | Error e -> Error e)
+      | _ -> Error "Invalid chat_request JSON")
+  | _ -> Error "Expected JSON object for chat_request"
 
 (** Chat response from Ollama *)
 type chat_response = {
@@ -123,8 +156,9 @@ let send_chat_request ~config ~messages =
         | `OK ->
             (try
               let json = Yojson.Safe.from_string body_str in
-              let response = chat_response_of_yojson json in
-              Lwt.return (Ok response.message.content)
+              match chat_response_of_yojson json with
+              | Ok response -> Lwt.return (Ok response.message.content)
+              | Error e -> Lwt.return (Error (sprintf "Failed to parse response: %s" e))
             with
             | Yojson.Json_error msg ->
                 Lwt.return (Error (sprintf "JSON parse error: %s" msg))

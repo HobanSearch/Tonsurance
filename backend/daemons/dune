@@ -1,7 +1,7 @@
 (library
  (name daemons)
  (public_name tonsurance.daemons)
- (modules trigger_monitor risk_management_daemon etl_orchestrator)
+ (modules trigger_monitor etl_orchestrator)
  (libraries
    core
    types
@@ -20,6 +20,13 @@
    logs
    logs.lwt)
  (preprocess (pps lwt_ppx ppx_sexp_conv ppx_deriving_yojson)))
+
+; Temporarily disabled - db_pool type mismatch needs investigation
+; (library
+;  (name risk_daemon)
+;  (modules risk_management_daemon)
+;  (libraries daemons db)
+;  (preprocess (pps lwt_ppx ppx_sexp_conv)))
 
 (executable
  (name integration_daemon)

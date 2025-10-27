@@ -13,10 +13,25 @@
  *)
 
 open Core
-open Lwt.Syntax
 open Types
 
 module RiskScoreCalculator = struct
+  (** Market data snapshot to avoid circular dependency with MarketDataAggregator *)
+  type market_data_snapshot = {
+    stablecoin_prices: (string * float) list;  (* asset_id -> price *)
+    bridge_health_scores: (string * float) list;  (* bridge_id -> health score *)
+    chain_congestion_levels: (string * float) list;  (* chain_id -> congestion 0.0-1.0 *)
+    market_stress_level: market_stress_level;
+    timestamp: float;
+  } [@@deriving sexp, yojson]
+
+  and market_stress_level =
+    | Normal
+    | Elevated
+    | High
+    | Extreme
+  [@@deriving sexp, yojson]
+
   (** Product key for identifying unique insurance products *)
   type product_key = {
     coverage_type: coverage_type;
@@ -127,7 +142,7 @@ module RiskScoreCalculator = struct
       ~(coverage_type: coverage_type)
       ~(chain: blockchain)
       ~(stablecoin: asset)
-      ~(market_data: unit) (* TODO: fix circular dependency with MarketDataAggregator *)
+      ~(market_data: market_data_snapshot)
       ~(exploit_db: (string * float) list)
     : risk_multiplier_breakdown Lwt.t =
 
@@ -141,37 +156,31 @@ module RiskScoreCalculator = struct
     (* Get base rate *)
     let base_rate = get_base_rate coverage_type in
 
-    (* Get stablecoin price *)
-    let _stablecoin_id = asset_to_string stablecoin in
-    (* TODO: Fix circular dependency with MarketDataAggregator *)
-    (* let price_opt = List.Assoc.find market_data.stablecoin_prices stablecoin_id
+    (* Get stablecoin price from market data *)
+    let stablecoin_id = asset_to_string stablecoin in
+    let current_price = List.Assoc.find market_data.stablecoin_prices stablecoin_id
       ~equal:String.equal
-      |> Option.map ~f:(fun (_, price, _) -> price)
-    in *)
-    let current_price = 1.0 in (* Default until circular dependency resolved *)
+      |> Option.value ~default:1.0  (* Default to $1.00 if not found *)
+    in
     let price_depeg_factor = calculate_depeg_factor current_price in
 
     (* Get bridge health (average across all bridges for this chain) *)
-    let _chain_name = blockchain_to_string chain in
-    (* TODO: Fix circular dependency - market_data is unit *)
-    let bridge_healths = [] in
-    (* List.filter_map market_data.bridge_health ~f:(fun (bridge_id, health, _) ->
+    let chain_name = blockchain_to_string chain in
+    let bridge_healths = List.filter_map market_data.bridge_health_scores ~f:(fun (bridge_id, health) ->
       if String.is_substring bridge_id ~substring:chain_name then Some health
       else None
-    ) *)
+    ) in
     let avg_bridge_health =
       if List.is_empty bridge_healths then 0.85 (* Default *)
       else Math.mean bridge_healths
     in
     let bridge_health_factor = calculate_bridge_factor avg_bridge_health in
 
-    (* Get chain congestion *)
-    (* TODO: Fix circular dependency - market_data is unit *)
-    let congestion_opt = None in
-    (* List.Assoc.find market_data.chain_metrics chain_name
+    (* Get chain congestion from market data *)
+    let congestion = List.Assoc.find market_data.chain_congestion_levels chain_name
       ~equal:String.equal
-      |> Option.map ~f:(fun congestion -> congestion.congestion_score) *)
-    let congestion = Option.value congestion_opt ~default:0.3 in
+      |> Option.value ~default:0.3  (* Default to moderate congestion *)
+    in
     let chain_congestion_factor = calculate_congestion_factor congestion in
 
     (* Get exploit frequency factor *)
@@ -181,9 +190,8 @@ module RiskScoreCalculator = struct
       ~exploit_db
     in
 
-    (* Get liquidation stress factor *)
-    (* TODO: Fix circular dependency - market_data is unit *)
-    let stress_level : market_stress_level = Normal in (* Default stress level *)
+    (* Get liquidation stress factor from market data *)
+    let stress_level = market_data.market_stress_level in
     let liquidation_stress_factor =
       calculate_liquidation_factor stress_level
     in
@@ -215,7 +223,7 @@ module RiskScoreCalculator = struct
 
   (** Calculate risk multipliers for all 560 products *)
   let calculate_all_560_products
-      ~(market_data: unit) (* TODO: fix circular dependency with MarketDataAggregator *)
+      ~(market_data: market_data_snapshot)
       ~(exploit_db: (string * float) list)
     : risk_multiplier_breakdown list Lwt.t =
 
@@ -358,7 +366,7 @@ module RiskScoreCalculator = struct
 
   (** Persist risk multipliers to database *)
   let persist_risk_multipliers
-      ~(conn_string: string)
+      ~(_conn_string: string)
       ~(multipliers: risk_multiplier_breakdown list)
     : unit Lwt.t =
 
@@ -397,7 +405,7 @@ module RiskScoreCalculator = struct
 
   (** Continuous risk calculation monitor *)
   let start_risk_calculator_monitor
-      ~(market_data_source: unit -> unit Lwt.t)  (* TODO: Fix circular dependency *)
+      ~(market_data_source: unit -> market_data_snapshot Lwt.t)
       ~(exploit_db: (string * float) list)
       ~(update_interval_seconds: float)
       ~(on_update: risk_multiplier_breakdown list -> unit Lwt.t)
@@ -424,7 +432,7 @@ module RiskScoreCalculator = struct
       ) in
 
       (* Persist to database *)
-      let%lwt () = persist_risk_multipliers ~conn_string ~multipliers in
+      let%lwt () = persist_risk_multipliers ~_conn_string:conn_string ~multipliers in
 
       (* Call update callback *)
       let%lwt () = on_update multipliers in
@@ -432,7 +440,7 @@ module RiskScoreCalculator = struct
       (* Alert if extreme risk products found *)
       let%lwt () =
         if summary.extreme_tier_count > 0 then
-          let extreme_products = get_products_by_tier ~multipliers ~tier:Extreme in
+          let _extreme_products = get_products_by_tier ~multipliers ~tier:Extreme in
           Logs_lwt.warn (fun m ->
             m "ALERT: %d products in EXTREME risk tier (>2.0x multiplier)" summary.extreme_tier_count
           )

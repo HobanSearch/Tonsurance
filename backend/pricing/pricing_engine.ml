@@ -24,20 +24,29 @@ type vault_state = {
 
 module PricingEngine = struct
 
-  (** Base rates by asset type (annual) *)
-  let base_rates = [
-    (USDC, 0.04);  (* 4% - lowest risk *)
-    (USDT, 0.06);  (* 6% - medium risk *)
-    (DAI,  0.05);  (* 5% - medium-low risk *)
-    (FRAX, 0.08);  (* 8% - algorithmic, higher risk *)
-    (BUSD, 0.045); (* 4.5% - low risk *)
-  ]
+  open Lwt.Syntax
 
-  (** Get base rate for asset *)
-  let get_base_rate (asset: asset) : float =
-    match List.Assoc.find base_rates asset ~equal:Poly.equal with
-    | Some rate -> rate
-    | None -> 0.10 (* Default 10% for unknown assets *)
+  (** Pricing engine configuration *)
+  type pricing_config = {
+    base_rates_source: [`Config | `Dynamic];
+    enable_market_adjustments: bool;
+    enable_size_discounts: bool;
+    min_premium_usd: float;
+    max_coverage_per_policy_usd: float;
+  } [@@deriving sexp]
+
+  (** Default configuration *)
+  let default_config : pricing_config = {
+    base_rates_source = `Config;
+    enable_market_adjustments = true;
+    enable_size_discounts = true;
+    min_premium_usd = 10.0;
+    max_coverage_per_policy_usd = 10_000_000.0;
+  }
+
+  (** Get base rate for asset from config *)
+  let get_base_rate_async (asset: asset) : float Lwt.t =
+    Config_manager.ConfigManager.Pricing.get_base_rate (asset_to_string asset)
 
   (** Risk adjustments based on current factors *)
   module RiskAdjustments = struct
@@ -139,8 +148,8 @@ module PricingEngine = struct
 
   end
 
-  (** Main pricing function *)
-  let calculate_premium
+  (** Main pricing function (now async) *)
+  let calculate_premium_async
       ~(asset: asset)
       ~(coverage_amount: usd_cents)
       ~(trigger_price: float)
@@ -150,10 +159,10 @@ module PricingEngine = struct
       ~(market_stress: float)
       ~(risk_factors: stablecoin_risk_factors)
       ~(actual_loss_ratio: float option)
-    : usd_cents =
+    : usd_cents Lwt.t =
 
     (* Get base annual rate *)
-    let base_rate = get_base_rate asset in
+    let* base_rate = get_base_rate_async asset in
 
     (* Calculate risk adjustments *)
     let risk_adjustment = RiskAdjustments.calculate_total risk_factors in
@@ -199,61 +208,20 @@ module PricingEngine = struct
     let min_premium = Float.max 100.0 (coverage_usd *. 0.01) in (* At least 1% or $100 *)
     let final_premium = Float.max actual_premium min_premium in
 
-    usd_to_cents final_premium
+    Lwt.return (usd_to_cents final_premium)
 
-  (** Batch pricing for multiple policies *)
-  let price_portfolio
+  (** Batch pricing for multiple policies (now async) *)
+  let price_portfolio_async
       ~(requests: (asset * usd_cents * float * float * int) list)
       ~(vault_state: vault_state)
       ~(market_stress: float)
-    : (asset * usd_cents) list =
+    : (asset * usd_cents) list Lwt.t =
 
-    List.map requests ~f:(fun (asset, coverage, trigger, floor, days) ->
+    Lwt_list.map_p (fun (asset, coverage, trigger, floor, days) ->
       (* Get risk factors for asset *)
-      let risk_factors = match asset with
-        | USDC -> {
-            reserve_quality = 0.10;
-            banking_exposure = 0.20;
-            redemption_velocity = 0.15;
-            market_depth = 0.05;
-            regulatory_clarity = 0.80;
-            historical_volatility = 0.02;
-            audit_frequency = 12.0;
-            transparency_score = 0.90;
-          }
-        | USDT -> {
-            reserve_quality = 0.30;
-            banking_exposure = 0.35;
-            redemption_velocity = 0.10;
-            market_depth = 0.03;
-            regulatory_clarity = 0.40;
-            historical_volatility = 0.03;
-            audit_frequency = 4.0;
-            transparency_score = 0.60;
-          }
-        | DAI -> {
-            reserve_quality = 0.15;
-            banking_exposure = 0.05;
-            redemption_velocity = 0.20;
-            market_depth = 0.10;
-            regulatory_clarity = 0.70;
-            historical_volatility = 0.025;
-            audit_frequency = 6.0;
-            transparency_score = 0.85;
-          }
-        | _ -> {
-            reserve_quality = 0.50;
-            banking_exposure = 0.50;
-            redemption_velocity = 0.50;
-            market_depth = 0.50;
-            regulatory_clarity = 0.50;
-            historical_volatility = 0.10;
-            audit_frequency = 2.0;
-            transparency_score = 0.50;
-          }
-      in
+      let risk_factors = Risk_model.get_risk_factors asset in
 
-      let premium = calculate_premium
+      let* premium = calculate_premium_async
         ~asset
         ~coverage_amount:coverage
         ~trigger_price:trigger
@@ -265,8 +233,8 @@ module PricingEngine = struct
         ~actual_loss_ratio:None
       in
 
-      (asset, premium)
-    )
+      Lwt.return (asset, premium)
+    ) requests
 
   (** Quote with detailed breakdown (for transparency) *)
   type quote_breakdown = {
@@ -281,7 +249,7 @@ module PricingEngine = struct
     annual_equivalent_rate: float;
   } [@@deriving sexp]
 
-  let calculate_quote_with_breakdown
+  let calculate_quote_with_breakdown_async
       ~(asset: asset)
       ~(coverage_amount: usd_cents)
       ~(trigger_price: float)
@@ -290,9 +258,9 @@ module PricingEngine = struct
       ~(vault_state: vault_state)
       ~(market_stress: float)
       ~(risk_factors: stablecoin_risk_factors)
-    : quote_breakdown =
+    : quote_breakdown Lwt.t =
 
-    let base_rate = get_base_rate asset in
+    let* base_rate = get_base_rate_async asset in
     let risk_adjustment = RiskAdjustments.calculate_total risk_factors in
 
     let coverage_usd = cents_to_usd coverage_amount in
@@ -302,7 +270,7 @@ module PricingEngine = struct
     let utilization_mult = MarketAdjustments.utilization_adjustment vault_state in
     let stress_mult = MarketAdjustments.market_stress_adjustment ~stress_index:market_stress in
 
-    let final_premium = calculate_premium
+    let* final_premium = calculate_premium_async
       ~asset
       ~coverage_amount
       ~trigger_price
@@ -318,7 +286,7 @@ module PricingEngine = struct
       (cents_to_usd final_premium /. coverage_usd) *. (365.0 /. Float.of_int duration_days)
     in
 
-    {
+    Lwt.return {
       base_rate;
       risk_adjustment;
       size_discount;
@@ -335,31 +303,10 @@ end
 (** Escrow-specific pricing extensions *)
 module EscrowPricing = struct
 
-  (** Configuration for escrow insurance pricing *)
-  type escrow_config = {
-    base_apr: float; (* 0.008 = 0.8% APR *)
-    short_duration_discount: float; (* 0.8 = 20% off for <= 7 days *)
-    medium_duration_discount: float; (* 0.9 = 10% off for <= 30 days *)
-    volume_discount: float; (* 0.9 = 10% off for 5+ escrows *)
-    both_parties_multiplier: float; (* 1.5x for dual coverage *)
-  }
-
-  let default_escrow_config = {
-    base_apr = 0.008;
-    short_duration_discount = 0.8;
-    medium_duration_discount = 0.9;
-    volume_discount = 0.9;
-    both_parties_multiplier = 1.5;
-  }
-
-  (** Protection coverage types for escrow *)
-  type escrow_coverage =
-    | PayerOnly
-    | PayeeOnly
-    | BothParties
+  open Lwt.Syntax
 
   (** Premium calculation result with breakdown *)
-  type escrow_premium_result = {
+type escrow_premium_result = {
     base_premium: usd_cents;
     duration_discount: float;
     volume_discount: float;
@@ -391,15 +338,16 @@ module EscrowPricing = struct
     | PayeeOnly -> 1.0
     | BothParties -> config.both_parties_multiplier (* 1.5x *)
 
-  (** Main escrow premium calculation function *)
-  let calculate_escrow_premium
+  (** Main escrow premium calculation function (now async) *)
+  let calculate_escrow_premium_async
       ~(escrow_amount: usd_cents)
       ~(duration_days: int)
       ~(protection_coverage: escrow_coverage)
       ~(active_escrow_count: int)
-      ?(config = default_escrow_config)
       ()
-    : escrow_premium_result =
+    : escrow_premium_result Lwt.t =
+
+    let* config = Config_manager.ConfigManager.Pricing.get_escrow_config () in
 
     (* Base premium: amount × APR × (days/365) *)
     let amount_usd = cents_to_usd escrow_amount in
@@ -431,7 +379,7 @@ module EscrowPricing = struct
         (cents_to_usd final_premium /. amount_usd) *. (365.0 /. Float.of_int duration_days)
     in
 
-    {
+    Lwt.return {
       base_premium;
       duration_discount;
       volume_discount;
@@ -467,33 +415,31 @@ module EscrowPricing = struct
       result.coverage_multiplier
       (result.annual_rate *. 100.0)
 
-  (** Batch quote for multiple escrows *)
-  let calculate_batch_quotes
+  (** Batch quote for multiple escrows (now async) *)
+  let calculate_batch_quotes_async
       ~(escrow_requests: (usd_cents * int * escrow_coverage) list)
       ~(active_escrow_count: int)
-      ?(config = default_escrow_config)
       ()
-    : escrow_premium_result list =
+    : escrow_premium_result list Lwt.t =
 
-    List.map escrow_requests ~f:(fun (amount, days, coverage) ->
-      calculate_escrow_premium
+    Lwt_list.map_p (fun (amount, days, coverage) ->
+      calculate_escrow_premium_async
         ~escrow_amount:amount
         ~duration_days:days
         ~protection_coverage:coverage
         ~active_escrow_count
-        ~config
         ()
-    )
+    ) escrow_requests
 
-  (** Compare escrow premium to standard insurance *)
-  let compare_to_standard_insurance
+  (** Compare escrow premium to standard insurance (now async) *)
+  let compare_to_standard_insurance_async
       ~(escrow_amount: usd_cents)
       ~(duration_days: int)
       ~(vault_state: vault_state)
-    : (escrow_premium_result * usd_cents * float) =
+    : (escrow_premium_result * usd_cents * float) Lwt.t =
 
     (* Calculate escrow premium *)
-    let escrow_result = calculate_escrow_premium
+    let* escrow_result = calculate_escrow_premium_async
       ~escrow_amount
       ~duration_days
       ~protection_coverage:PayerOnly
@@ -503,7 +449,7 @@ module EscrowPricing = struct
 
     (* Calculate equivalent standard insurance premium *)
     let risk_factors = default_risk_factors in
-    let standard_premium = PricingEngine.calculate_premium
+    let* standard_premium = PricingEngine.calculate_premium_async
       ~asset:USDC (* Assume USDC *)
       ~coverage_amount:escrow_amount
       ~trigger_price:0.97
@@ -525,7 +471,7 @@ module EscrowPricing = struct
         0.0
     in
 
-    (escrow_result, standard_premium, savings_pct)
+    Lwt.return (escrow_result, standard_premium, savings_pct)
 
 end
 
@@ -567,7 +513,7 @@ end
 (*  *)
 (*     let premium_usd = Math.cents_to_usd premium in *)
 (*  *)
-(*     (* Premium should be roughly $1,000 - $1,500 for $100k coverage *) *)
+(*     Premium should be roughly $1,000 - $1,500 for $100k coverage *)
 (*     check bool "premium in expected range" *)
 (*       (premium_usd > 800.0 && premium_usd < 2000.0) true *)
 (*  *)
@@ -591,7 +537,7 @@ end
 (*       historical_volatility = 0.02; *)
 (*     } in *)
 (*  *)
-(*     (* Small coverage *) *)
+(*     Small coverage *)
 (*     let premium_small = PricingEngine.calculate_premium *)
 (*       ~asset:USDC *)
 (*       ~coverage_amount:(Math.usd_to_cents 10_000.0) *)
@@ -604,7 +550,7 @@ end
 (*       ~actual_loss_ratio:None *)
 (*     in *)
 (*  *)
-(*     (* Large coverage *) *)
+(*     Large coverage *)
 (*     let premium_large = PricingEngine.calculate_premium *)
 (*       ~asset:USDC *)
 (*       ~coverage_amount:(Math.usd_to_cents 10_000_000.0) *)
@@ -620,7 +566,7 @@ end
 (*     let rate_small = Math.cents_to_usd premium_small /. 10_000.0 in *)
 (*     let rate_large = Math.cents_to_usd premium_large /. 10_000_000.0 in *)
 (*  *)
-(*     (* Large coverage should have lower rate due to discount *) *)
+(*     Large coverage should have lower rate due to discount *)
 (*     check bool "large coverage gets discount" *)
 (*       (rate_large < rate_small) true *)
 (*  *)

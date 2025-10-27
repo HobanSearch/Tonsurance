@@ -21,6 +21,7 @@
 open Core
 open Lwt.Syntax
 
+
 (** Rate limit configuration per endpoint *)
 type endpoint_config = {
   path_pattern: string;
@@ -210,6 +211,29 @@ end
 
 (** Public API - currently uses in-memory fallback *)
 
+(** Redis keys for statistics *)
+let stats_key_prefix = "rate_limit:stats"
+let total_requests_key () = Printf.sprintf "%s:total_requests" stats_key_prefix
+let blocked_requests_key () = Printf.sprintf "%s:blocked_requests" stats_key_prefix
+
+(** Increment request counter in Redis *)
+let incr_total_requests () : unit Lwt.t =
+  try%lwt
+    let%lwt result = Redis_client.GlobalRedis.incr (total_requests_key ()) in
+    match result with
+    | Ok _ -> Lwt.return ()
+    | Error _ -> Lwt.return ()
+  with _ -> Lwt.return ()
+
+(** Increment blocked request counter in Redis *)
+let incr_blocked_requests () : unit Lwt.t =
+  try%lwt
+    let%lwt result = Redis_client.GlobalRedis.incr (blocked_requests_key ()) in
+    match result with
+    | Ok _ -> Lwt.return ()
+    | Error _ -> Lwt.return ()
+  with _ -> Lwt.return ()
+
 (** Initialize rate limiter (Redis optional) *)
 let init ?(_redis_host="127.0.0.1") ?(_redis_port=6379) () =
   (* Uncomment when Redis bindings available:
@@ -222,10 +246,16 @@ let init ?(_redis_host="127.0.0.1") ?(_redis_port=6379) () =
 
 (** Check if request is allowed *)
 let check_rate_limit ~key ~limit =
-  (* Uncomment when Redis available:
-     RedisBackend.is_allowed ~key ~limit
-  *)
-  Lwt.return (InMemoryFallback.is_allowed ~key ~limit)
+  (* Track total requests *)
+  let%lwt () = incr_total_requests () in
+
+  (* Check rate limit using fallback (Redis if available, else in-memory) *)
+  let%lwt is_allowed = Lwt.return (InMemoryFallback.is_allowed ~key ~limit) in
+
+  (* Track blocked requests *)
+  let%lwt () = if not is_allowed then incr_blocked_requests () else Lwt.return () in
+
+  Lwt.return is_allowed
 
 (** Get remaining requests in current window *)
 let get_remaining ~key ~limit =
@@ -290,11 +320,27 @@ type rate_limit_stats = {
   backend: string;
 }
 
+(** Get statistics from Redis *)
 let get_stats () =
   let active_keys = Hashtbl.length InMemoryFallback.cache in
+
+  (* Fetch counters from Redis *)
+  let%lwt total_requests_opt = Redis_client.GlobalRedis.get (total_requests_key ()) in
+  let%lwt blocked_requests_opt = Redis_client.GlobalRedis.get (blocked_requests_key ()) in
+
+  let total_requests = match total_requests_opt with
+    | Some count_str -> (try Int.of_string count_str with _ -> 0)
+    | None -> 0
+  in
+
+  let blocked_requests = match blocked_requests_opt with
+    | Some count_str -> (try Int.of_string count_str with _ -> 0)
+    | None -> 0
+  in
+
   Lwt.return {
-    total_requests = 0;  (* TODO: Track in Redis *)
-    blocked_requests = 0;
+    total_requests;
+    blocked_requests;
     active_keys;
     backend = match !redis_state with
       | Connected _ -> "redis"

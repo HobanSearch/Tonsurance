@@ -1,9 +1,16 @@
 (library
  (name api_server)
  (public_name tonsurance.api_server)
- (modules api_server bulk_protection_api ocaml_price_api admin_api)
- (libraries core types math pricing_engine risk_model pool claims_engine monitoring config opium dream lwt lwt.unix yojson logs logs.lwt)
+ (modules bulk_protection_api ocaml_price_api)
+ (libraries core types math pricing_engine risk_model pool claims_engine monitoring config dream lwt lwt.unix yojson logs logs.lwt digestif base64)
  (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
+
+; Temporarily disabled - need Opium Request module and Websocket_v2
+; (library
+;  (name admin_dynamic_apis)
+;  (modules admin_api dynamic_pricing_api)
+;  (libraries core types config opium dream lwt lwt.unix yojson)
+;  (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
 
 (executable
  (name tranche_apy_api)
@@ -23,21 +30,21 @@
  (name transactional_api)
  (public_name tonsurance.transactional_api)
  (modules transactional_api)
- (libraries core types math pricing_engine db integration dream lwt lwt.unix yojson)
+ (libraries core types math pricing_engine pool db integration crypto dream lwt lwt.unix yojson)
  (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
 
 (library
  (name security_middleware)
  (public_name tonsurance.security_middleware)
  (modules security_middleware rate_limiter)
- (libraries core dream lwt lwt.unix yojson logs logs.lwt base64)
+ (libraries core integration dream lwt lwt.unix yojson logs logs.lwt base64)
  (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
 
 (library
  (name api_v2)
  (public_name tonsurance.api_v2)
  (modules api_v2)
- (libraries core types math pricing_engine risk_model pool monitoring escrow_api transactional_api integration security_middleware dream lwt lwt.unix yojson logs logs.lwt)
+ (libraries core types math pricing_engine risk_model pool monitoring escrow_api transactional_api hedging_api integration security_middleware dream lwt lwt.unix yojson logs logs.lwt)
  (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
 
 (library
@@ -45,6 +52,20 @@
  (public_name tonsurance.websocket_v2)
  (modules websocket_v2)
  (libraries core types pool monitoring dream lwt lwt.unix yojson)
+ (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
+
+(library
+ (name bridge_api)
+ (public_name tonsurance.bridge_api)
+ (modules bridge_api)
+ (libraries core types db integration monitoring dream lwt lwt.unix yojson)
+ (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
+
+(library
+ (name hedging_api)
+ (public_name tonsurance.hedging_api)
+ (modules hedging_api)
+ (libraries core types hedging pricing_engine pool dream lwt lwt.unix yojson logs logs.lwt)
  (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
 
 (executable

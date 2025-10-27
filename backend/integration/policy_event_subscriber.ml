@@ -10,10 +10,10 @@
 
 open Core
 open Lwt.Syntax
+open Lwt.Infix
 open Types
-open Integration.Database
-open Integration.Ton_client
-open Monitoring.Unified_risk_monitor
+open Database
+open Ton_client
 
 module PolicyEventSubscriber = struct
 
@@ -22,7 +22,7 @@ module PolicyEventSubscriber = struct
     ton_config: TonClient.ton_config;
     policy_factory_address: TonClient.ton_address;
     poll_interval_seconds: float;
-    db_pool: (Caqti_lwt.connection Caqti_lwt.Pool.t, [> Caqti_error.t]) result;
+    db_pool: ((Caqti_lwt.connection, Caqti_error.t) Caqti_lwt_unix.Pool.t, Caqti_error.t) Result.t;
   }
 
   let default_subscriber_config factory_address db_pool = {
@@ -78,18 +78,18 @@ module PolicyEventSubscriber = struct
     | 4 -> FRAX
     | 5 -> BUSD
     | 6 -> USDe
-    | 7 -> sUSDe
+    | 7 -> SUSDe
     | 8 -> USDY
     | 9 -> PYUSD
     | 10 -> GHO
     | 11 -> LUSD
-    | 12 -> crvUSD
-    | 13 -> mkUSD
+    | 12 -> CrvUSD
+    | 13 -> MkUSD
     | _ -> USDC (* Default *)
 
   (** Store event in database audit log *)
   let store_event_log
-      (pool: (Caqti_lwt.connection Caqti_lwt.Pool.t, [> Caqti_error.t]) result)
+      (pool: ((Caqti_lwt.connection, Caqti_error.t) Caqti_lwt_unix.Pool.t, Caqti_error.t) Result.t)
       ~(event_type: string)
       ~(policy_id: int64)
       ~(metadata: (string * string) list)
@@ -107,10 +107,9 @@ module PolicyEventSubscriber = struct
       |> Yojson.Safe.to_string
     in
 
-    let request = Caqti_request.exec
-      Caqti_type.(tup3 string int64 string)
-      query
-    in
+    let request = Caqti_request.Infix.(
+      Caqti_type.(t3 string int64 string) ->. Caqti_type.unit
+    ) query in
 
     match pool with
     | Error _ -> Lwt.return_unit
@@ -122,11 +121,14 @@ module PolicyEventSubscriber = struct
 
   (** Update product exposure aggregation *)
   let update_product_exposure
-      (pool: (Caqti_lwt.connection Caqti_lwt.Pool.t, [> Caqti_error.t]) result)
+      (pool: ((Caqti_lwt.connection, Caqti_error.t) Caqti_lwt_unix.Pool.t, Caqti_error.t) Result.t)
       ~(coverage_type: int)
       ~(chain_id: int)
       ~(stablecoin_id: int)
     : unit Lwt.t =
+
+    (* Unused for now - TODO: integrate with UnifiedRiskMonitor *)
+    let _ = (coverage_type, chain_id, stablecoin_id) in
 
     (* The PostgreSQL trigger handles this automatically *)
     (* But we can also manually refresh the materialized view *)
@@ -135,7 +137,9 @@ module PolicyEventSubscriber = struct
     match pool with
     | Error _ -> Lwt.return_unit
     | Ok pool ->
-        let request = Caqti_request.exec Caqti_type.unit query in
+        let request = Caqti_request.Infix.(
+          Caqti_type.unit ->. Caqti_type.unit
+        ) query in
         let* _ = Database.with_connection (Ok pool) (fun (module Db : Database.CONNECTION) ->
           Db.exec request ()
         ) in
@@ -160,21 +164,24 @@ module PolicyEventSubscriber = struct
         (* Update statistics *)
         stats.policy_created_count := !(stats.policy_created_count) + 1;
         stats.total_events_processed := !(stats.total_events_processed) + 1;
-        stats.last_event_time := Unix.time ();
+        stats.last_event_time := Time_float.now ()
+          |> Time_float.to_span_since_epoch
+          |> Time_float.Span.to_sec;
 
         (* Map to backend types *)
-        let coverage_type_enum = coverage_type_of_id coverage_type in
-        let chain_enum = chain_of_id chain_id in
+        let _coverage_type_enum = coverage_type_of_id coverage_type in
+        let _chain_enum = chain_of_id chain_id in
         let stablecoin_enum = stablecoin_of_id stablecoin_id in
 
-        (* Create product key for exposure tracking *)
-        let product_key = {
-          UnifiedRiskMonitor.coverage_type = coverage_type_to_string coverage_type_enum;
-          chain = chain_enum;
-          stablecoin = stablecoin_enum;
-        } in
+        (* TODO: Create product key for exposure tracking
+         * Requires UnifiedRiskMonitor from monitoring module
+         * Commented out for now to avoid circular dependency *)
 
         (* Store in database *)
+        let current_time = Time_float.now ()
+          |> Time_float.to_span_since_epoch
+          |> Time_float.Span.to_sec
+        in
         let%lwt _ = Database.insert_policy config.db_pool
           ~buyer
           ~beneficiary:buyer (* Default to buyer as beneficiary *)
@@ -183,8 +190,8 @@ module PolicyEventSubscriber = struct
           ~premium
           ~trigger:0.97  (* Default depeg trigger *)
           ~floor:0.90    (* Default floor *)
-          ~start_time:(Unix.time ())
-          ~expiry_time:(Unix.time () +. (Float.of_int duration *. 86400.0))
+          ~start_time:current_time
+          ~expiry_time:(current_time +. (Float.of_int duration *. 86400.0))
         in
 
         (* Update exposure aggregation *)
@@ -278,13 +285,17 @@ module PolicyEventSubscriber = struct
       let rec loop () =
         let%lwt () = Lwt_unix.sleep 60.0 in (* Every minute *)
 
+        let current_time = Time_float.now ()
+          |> Time_float.to_span_since_epoch
+          |> Time_float.Span.to_sec
+        in
         let%lwt () = Logs_lwt.info (fun m ->
           m "📊 Event Stats: total=%d, policies=%d, payouts=%d, errors=%d, last_event=%.0fs ago"
             !(stats.total_events_processed)
             !(stats.policy_created_count)
             !(stats.payout_executed_count)
             !(stats.errors)
-            (Unix.time () -. !(stats.last_event_time))
+            (current_time -. !(stats.last_event_time))
         ) in
 
         loop ()

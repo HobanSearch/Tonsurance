@@ -2,7 +2,7 @@
  (name pricing_engine)
  (public_name tonsurance.pricing_engine)
  (modules pricing_engine)
- (libraries core types math)
+ (libraries core types math lwt config risk_model)
  (preprocess (pps ppx_sexp_conv)))
 
 (library
@@ -16,5 +16,12 @@
  (name pricing_oracle_keeper)
  (public_name pricing_oracle_keeper)
  (modules pricing_oracle_keeper)
- (libraries core types monitoring lwt lwt.unix cohttp-lwt-unix yojson)
+ (libraries core types monitoring hedging integration lwt lwt.unix cohttp-lwt-unix yojson)
  (preprocess (pps lwt_ppx ppx_sexp_conv)))
+
+(executable
+ (name pricing_oracle_keeper_v2)
+ (public_name pricing_oracle_keeper_v2)
+ (modules pricing_oracle_keeper_v2)
+ (libraries core types monitoring hedging db lwt lwt.unix cohttp-lwt-unix yojson)
+ (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))

@@ -2,7 +2,7 @@ import type { ButtonHTMLAttributes, ReactNode } from 'react';
 
 interface RetroButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   children: ReactNode;
-  variant?: 'default' | 'primary';
+  variant?: 'default' | 'primary' | 'secondary';
 }
 
 export const RetroButton = ({
@@ -11,7 +11,9 @@ export const RetroButton = ({
   className = '',
   ...props
 }: RetroButtonProps) => {
-  const variantClass = variant === 'primary' ? 'retro-btn-primary' : '';
+  const variantClass =
+    variant === 'primary' ? 'retro-btn-primary' :
+    variant === 'secondary' ? 'retro-btn-secondary' : '';
 
   return (
     <button

@@ -82,16 +82,30 @@ global int test_mode;  ;; When true, skip token minting/burning for tests
     paused = ds~load_uint(1);
     admin_address = ds~load_msg_addr();
     claims_processor_address = ds~load_msg_addr();
-    reentrancy_guard = ds~load_uint(1);
-    seq_no = ds~load_uint(32);
-    circuit_breaker_window_start = ds~load_uint(32);
-    circuit_breaker_losses = ds~load_coins();
-    pending_txs = ds~load_dict();
-    tranche_locks = ds~load_dict();
-    test_mode = ds~load_uint(1);
+
+    ;; Load extended data from reference to avoid cell overflow
+    slice ext = ds~load_ref().begin_parse();
+    reentrancy_guard = ext~load_uint(1);
+    seq_no = ext~load_uint(32);
+    circuit_breaker_window_start = ext~load_uint(32);
+    circuit_breaker_losses = ext~load_coins();
+    pending_txs = ext~load_dict();
+    tranche_locks = ext~load_dict();
+    test_mode = ext~load_uint(1);
 }
 
 () save_data() impure {
+    ;; Store extended data in separate cell to avoid 1023 bit limit
+    cell ext_data = begin_cell()
+        .store_uint(reentrancy_guard, 1)
+        .store_uint(seq_no, 32)
+        .store_uint(circuit_breaker_window_start, 32)
+        .store_coins(circuit_breaker_losses)
+        .store_dict(pending_txs)
+        .store_dict(tranche_locks)
+        .store_uint(test_mode, 1)
+        .end_cell();
+
     set_data(begin_cell()
         .store_slice(owner_address)
         .store_coins(total_capital)
@@ -103,13 +117,7 @@ global int test_mode;  ;; When true, skip token minting/burning for tests
         .store_uint(paused, 1)
         .store_slice(admin_address)
         .store_slice(claims_processor_address)
-        .store_uint(reentrancy_guard, 1)
-        .store_uint(seq_no, 32)
-        .store_uint(circuit_breaker_window_start, 32)
-        .store_coins(circuit_breaker_losses)
-        .store_dict(pending_txs)
-        .store_dict(tranche_locks)
-        .store_uint(test_mode, 1)
+        .store_ref(ext_data)
         .end_cell());
 }
 
@@ -179,13 +187,12 @@ int calculate_tranche_nav(int tranche_id) inline {
 }
 
 ;; Helper to store depositor balance
-cell store_depositor_balance(cell balances, slice depositor, int tranche_id, int token_amount, int lock_until, int stake_start_time) inline {
+cell store_depositor_balance(cell balances, slice depositor, int tranche_id, int token_amount, int lock_until) inline {
     cell empty_positions = begin_cell().end_cell();
     cell balance_cell = begin_cell()
         .store_uint(tranche_id, 8)
         .store_coins(token_amount)
         .store_uint(lock_until, 32)
-        .store_uint(stake_start_time, 32)
         .store_ref(empty_positions)
         .end_cell();
     balances~udict_set_ref(267, slice_hash(depositor), balance_cell);
@@ -226,7 +233,7 @@ cell store_depositor_balance(cell balances, slice depositor, int tranche_id, int
     ;; In test mode, skip async token minting
     if (test_mode) {
         ;; Directly update depositor balance
-        depositor_balances = store_depositor_balance(depositor_balances, depositor, tranche_id, tokens, 0, now());
+        depositor_balances = store_depositor_balance(depositor_balances, depositor, tranche_id, tokens, 0);
     } else {
         ;; Production mode: async 2PC token minting
         int tx_id = init_2pc_transaction(seq_no);
@@ -319,6 +326,8 @@ cell store_depositor_balance(cell balances, slice depositor, int tranche_id, int
 () distribute_premiums(int premium_amount) impure {
     throw_unless(ERR_INVALID_AMOUNT, premium_amount > 0);
     int remaining_premium = premium_amount;
+
+    accumulated_premiums += premium_amount;
 
     int i = TRANCHE_BTC;
     while (i <= TRANCHE_EQT) {
@@ -777,7 +786,8 @@ int get_tranche_nav(int tranche_id) method_id {
     int stored_tranche_id = balance_data~load_uint(8);
     int balance = balance_data~load_coins();
     int lock_until = balance_data~load_uint(32);
-    int stake_start_time = balance_data~load_uint(32);
-    return (stored_tranche_id, balance, lock_until, stake_start_time);
+    ;; Skip the positions cell reference
+    cell positions = balance_data~load_ref();
+    return (stored_tranche_id, balance, lock_until, 0);
 }
 

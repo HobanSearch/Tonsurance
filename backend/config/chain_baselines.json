@@ -1,0 +1,24 @@
+{
+  "ethereum": {
+    "gas_price_gwei": 30.0,
+    "block_time_ms": 12000
+  },
+  "arbitrum": {
+    "gas_price_gwei": 0.1,
+    "block_time_ms": 250
+  },
+  "base": {
+    "gas_price_gwei": 0.05,
+    "block_time_ms": 2000
+  },
+  "polygon": {
+    "gas_price_gwei": 50.0,
+    "block_time_ms": 2000
+  },
+  "solana": {
+    "block_time_ms": 400
+  },
+  "ton": {
+    "block_time_ms": 5000
+  }
+}

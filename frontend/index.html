@@ -5,6 +5,13 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>frontend</title>
+
+    <!-- Buffer polyfill for @ton/core - must load before main app -->
+    <script type="module">
+      import { Buffer } from 'buffer';
+      window.Buffer = Buffer;
+      window.global = window.global || window;
+    </script>
   </head>
   <body>
     <div id="root"></div>

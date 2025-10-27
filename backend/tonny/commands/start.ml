@@ -31,11 +31,12 @@ What I can do:
 
 Ready to protect your assets? Let's go! 💎|}
 
-let handle ~user_id ~chat_id ~send_message =
+let handle ~user_id:_ ~chat_id ~send_message =
   let open Lwt.Syntax in
 
   (* Clear any existing conversation for fresh start *)
-  let* () = Conversation_state.clear_conversation user_id in
+  (* TODO: Conversation_state module disabled until Ollama_client is implemented *)
+  let* () = Lwt.return_unit in
 
   (* Send welcome message *)
   let* () = send_message chat_id welcome_message in

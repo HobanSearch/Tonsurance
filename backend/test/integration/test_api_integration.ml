@@ -41,33 +41,108 @@ let test_cex_config () =
     api_keys = None;  (* Public endpoints only for testing *)
   }
 
-(* TODO: Fix Chainlink tests - config API changed
 (** Test suite: Chainlink integration *)
 module TestChainlink = struct
 
   (** Test: Fetch USDT price from Chainlink *)
   let test_fetch_usdt_price () =
-    (* Temporarily disabled - needs config API update *)
-    Logs.info (fun m -> m "⊘ Chainlink tests temporarily disabled - config API needs update");
-    Lwt.return_unit
+    let config = test_chainlink_config () in
+    let%lwt price_opt = Integration.Chainlink_client.ChainlinkClient.fetch_price
+      ~config
+      ~chain:Ethereum
+      ~asset:USDT
+    in
+
+    match price_opt with
+    | Some price ->
+        (* USDT should be close to $1.00 *)
+        let is_reasonable = price > 0.95 && price < 1.05 in
+        Alcotest.(check bool) "USDT price near $1.00" true is_reasonable;
+
+        Logs.info (fun m -> m "✓ USDT price: $%.4f" price);
+        Lwt.return_unit
+
+    | None ->
+        (* Don't fail if API is down - just log warning *)
+        Logs.warn (fun m -> m "⚠ Failed to fetch USDT price (Chainlink API may be down)");
+        Lwt.return_unit
 
   (** Test: Fetch multiple stablecoin prices *)
   let test_fetch_all_prices () =
-    Logs.info (fun m -> m "⊘ Chainlink tests temporarily disabled - config API needs update");
+    let config = test_chainlink_config () in
+    let stablecoins = [USDT; USDC; DAI] in
+
+    let%lwt prices = Lwt_list.map_p (fun asset ->
+      Integration.Chainlink_client.ChainlinkClient.fetch_price
+        ~config
+        ~chain:Ethereum
+        ~asset
+    ) stablecoins in
+
+    let successful_fetches = List.count prices ~f:Option.is_some in
+
+    (* At least 1 stablecoin price should be fetchable *)
+    let has_data = successful_fetches > 0 in
+    Alcotest.(check bool) "At least one price fetched" true has_data;
+
+    Logs.info (fun m -> m "✓ Fetched %d/3 stablecoin prices" successful_fetches);
     Lwt.return_unit
 
   (** Test: Handle network failure gracefully *)
   let test_network_failure () =
-    Logs.info (fun m -> m "⊘ Chainlink tests temporarily disabled - config API needs update");
+    (* Create config with invalid endpoint *)
+    let bad_config = Integration.Chainlink_client.ChainlinkClient.{
+      rpc_endpoints = [(Ethereum, ["https://invalid.endpoint.test"])];
+      api_keys = [];
+      rate_limit_per_second = 5;
+      timeout_seconds = 2.0;  (* Short timeout *)
+      retry_attempts = 1;      (* Single retry *)
+      cache_ttl_seconds = 300;
+    } in
+
+    let%lwt price_opt = Integration.Chainlink_client.ChainlinkClient.fetch_price
+      ~config:bad_config
+      ~chain:Ethereum
+      ~asset:USDT
+    in
+
+    (* Should return None gracefully without crashing *)
+    Alcotest.(check bool) "Returns None on network failure" true (Option.is_none price_opt);
+
+    Logs.info (fun m -> m "✓ Network failure handled gracefully");
     Lwt.return_unit
 
   (** Test: Rate limiting works *)
   let test_rate_limiting () =
-    Logs.info (fun m -> m "⊘ Chainlink tests temporarily disabled - config API needs update");
+    let config = Integration.Chainlink_client.ChainlinkClient.{
+      rpc_endpoints = [(Ethereum, ["https://eth-mainnet.g.alchemy.com/v2/demo"])];
+      api_keys = [];
+      rate_limit_per_second = 2;  (* Very restrictive limit *)
+      timeout_seconds = 10.0;
+      retry_attempts = 3;
+      cache_ttl_seconds = 0;  (* Disable cache *)
+    } in
+
+    let start_time = Unix.gettimeofday () in
+
+    (* Make 5 rapid requests *)
+    let%lwt _prices = Lwt_list.map_s (fun _ ->
+      Integration.Chainlink_client.ChainlinkClient.fetch_price
+        ~config
+        ~chain:Ethereum
+        ~asset:USDT
+    ) [1; 2; 3; 4; 5] in
+
+    let elapsed = Unix.gettimeofday () -. start_time in
+
+    (* 5 requests at 2/sec should take at least 2 seconds *)
+    let is_rate_limited = elapsed >= 2.0 in
+    Alcotest.(check bool) "Rate limiting enforced" true is_rate_limited;
+
+    Logs.info (fun m -> m "✓ Rate limiting works (5 requests took %.1fs)" elapsed);
     Lwt.return_unit
 
 end
-*)
 
 (** Test suite: Bridge health integration *)
 module TestBridgeHealth = struct
@@ -248,12 +323,12 @@ let () =
     Logs.set_level (Some Logs.Info);
 
     Alcotest_lwt.run "API Integration Tests" [
-      (* "Chainlink", [
+      "Chainlink", [
         Alcotest_lwt.test_case "Fetch USDT price" `Slow TestChainlink.test_fetch_usdt_price;
         Alcotest_lwt.test_case "Fetch all prices" `Slow TestChainlink.test_fetch_all_prices;
         Alcotest_lwt.test_case "Handle network failure" `Quick TestChainlink.test_network_failure;
         Alcotest_lwt.test_case "Rate limiting" `Slow TestChainlink.test_rate_limiting;
-      ]; *)
+      ];
 
       "Bridge Health", [
         Alcotest_lwt.test_case "Fetch bridge TVL" `Slow TestBridgeHealth.test_fetch_bridge_tvl;

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useTonAddress } from '@tonconnect/ui-react';
 import { toNano } from '@ton/core';
 import { useContracts } from '../hooks/useContracts';
@@ -107,16 +107,39 @@ export const PolicyPurchase = () => {
   const [newItemDuration, setNewItemDuration] = useState<string>('30');
   const [newItemCexVenue, setNewItemCexVenue] = useState<string>('Binance');
 
+  // Load coverage items from localStorage on mount
+  useEffect(() => {
+    const saved = localStorage.getItem('tonsurance_coverage_items');
+    if (saved) {
+      try {
+        const items = JSON.parse(saved);
+        setCoverageItems(items);
+      } catch (e) {
+        console.error('Failed to load saved coverage items:', e);
+        localStorage.removeItem('tonsurance_coverage_items');
+      }
+    }
+  }, []);
+
+  // Save coverage items to localStorage whenever they change
+  useEffect(() => {
+    if (coverageItems.length > 0) {
+      localStorage.setItem('tonsurance_coverage_items', JSON.stringify(coverageItems));
+    } else {
+      localStorage.removeItem('tonsurance_coverage_items');
+    }
+  }, [coverageItems]);
+
   // Filtering helper functions
   const getAvailableBlockchains = (): string[] => {
     if (!selectedCoverageType) return [];
 
     // CEX liquidation doesn't need blockchain selection
-    if (selectedCoverageType === 'cex_liquidation') return [];
+    if (selectedCoverageType === 'cex_liquidation' as any) return [];
 
     // If no stablecoins selected yet, show all blockchains
     if (selectedStablecoins.size === 0) {
-      return BLOCKCHAINS.filter(chain => chain !== 'bitcoin' || selectedCoverageType === 'cex_liquidation');
+      return BLOCKCHAINS.filter(chain => chain !== 'bitcoin' || selectedCoverageType === 'cex_liquidation' as any);
     }
 
     // Show only blockchains that support ALL selected stablecoins
@@ -339,6 +362,8 @@ export const PolicyPurchase = () => {
         await contracts.policyFactory.sendCreatePolicy(sender, {
           value: gasAmount + premiumNano,
           coverageType: coverageTypeMapping[item.coverageType],
+          chainId: 0, // Default to TON chain
+          stablecoinId: 0, // Default to USDT
           coverageAmount: coverageAmountNano,
           duration: parseInt(item.durationDays),
         });
@@ -348,6 +373,7 @@ export const PolicyPurchase = () => {
 
       // Reset
       setCoverageItems([]);
+      localStorage.removeItem('tonsurance_coverage_items');
       setBeneficiaryMode('self');
       setBeneficiaryAddress(null);
       setGiftMessage('');

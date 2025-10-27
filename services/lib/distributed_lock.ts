@@ -1,4 +1,4 @@
-import Redlock from 'redlock';
+import Redlock, { Lock } from 'redlock';
 import Redis from 'ioredis';
 
 export interface LockConfig {
@@ -51,7 +51,7 @@ export class DistributedLock {
    * @param ttl_ms - Time to live in milliseconds (defaults to config.lock_ttl_ms)
    * @returns Lock handle or null if failed
    */
-  async acquire(resource: string, ttl_ms?: number): Promise<Redlock.Lock | null> {
+  async acquire(resource: string, ttl_ms?: number): Promise<Lock | null> {
     const lockTTL = ttl_ms || this.config.lock_ttl_ms;
 
     try {
@@ -68,7 +68,7 @@ export class DistributedLock {
    * Release lock
    * @param lock - Lock handle from acquire()
    */
-  async release(lock: Redlock.Lock): Promise<void> {
+  async release(lock: Lock): Promise<void> {
     try {
       await lock.release();
       console.log(`Lock released for resources: ${lock.resources.join(', ')}`);
@@ -83,7 +83,7 @@ export class DistributedLock {
    * @param lock - Current lock
    * @param ttl_ms - Additional time
    */
-  async extend(lock: Redlock.Lock, ttl_ms: number): Promise<void> {
+  async extend(lock: Lock, ttl_ms: number): Promise<void> {
     try {
       await lock.extend(ttl_ms);
       console.log(`Lock extended for resources: ${lock.resources.join(', ')}, TTL: ${ttl_ms}ms`);

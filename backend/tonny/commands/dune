@@ -1,6 +1,6 @@
 (library
  (name tonny_commands)
- (modules start help quote buy policies claim bridges tonny)
+ (modules start help quote buy policies claim bridges)
  (libraries
   core
   lwt
@@ -9,4 +9,10 @@
   tonny_lib
   pricing_engine
   pool
-  monitoring))
+  monitoring
+  db
+  caqti
+  caqti-lwt
+  logs
+  logs.lwt)
+ (preprocess (pps lwt_ppx ppx_sexp_conv)))

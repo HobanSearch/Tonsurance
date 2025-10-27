@@ -12,13 +12,14 @@
 
 open Core
 open Lwt.Syntax
+open Lwt.Infix
 open Types
 
 (** Server state *)
 type server_state = {
-  mutable collateral_manager: Collateral_manager.CollateralManager.t ref;
-  mutable bridge_states: Bridge_monitor.bridge_health list;
-  mutable last_risk_snapshot: Unified_risk_monitor.UnifiedRiskMonitor.risk_snapshot option;
+  mutable collateral_manager: Pool.Collateral_manager.CollateralManager.t ref;
+  mutable bridge_states: Monitoring.Bridge_monitor.bridge_health list;
+  mutable last_risk_snapshot: Monitoring.Unified_risk_monitor.UnifiedRiskMonitor.risk_snapshot option;
   mutable websocket_clients: Dream.websocket list;
   pricing_config: Pricing_engine.PricingEngine.pricing_config;
 }
@@ -55,9 +56,9 @@ let parse_json_body req =
  * ========================================
  * Calculate premium for 560-product matrix
  *)
-let multi_dimensional_quote_handler state req =
+let multi_dimensional_quote_handler _state req =
   parse_json_body req >>= function
-  | Error err -> Lwt.return (error_response err)
+  | Error err -> error_response err
   | Ok json ->
       try
         let open Yojson.Safe.Util in
@@ -116,13 +117,13 @@ let multi_dimensional_quote_handler state req =
           | USDP -> 0.0001
           | BUSD -> 0.0010
           | USDe -> 0.0015
-          | sUSDe -> 0.0020
+          | SUSDe -> 0.0020
           | USDY -> 0.0008
           | PYUSD -> 0.0005
           | GHO -> 0.0004
           | LUSD -> 0.0003
-          | crvUSD -> 0.0006
-          | mkUSD -> 0.0007
+          | CrvUSD -> 0.0006
+          | MkUSD -> 0.0007
           | _ -> 0.0 (* BTC/ETH not stablecoins *)
         in
 
@@ -138,8 +139,8 @@ let multi_dimensional_quote_handler state req =
           coverage_type_str
           (blockchain_to_string chain)
           (asset_to_string stablecoin)
-          |> Digest.string
-          |> Digest.to_hex
+          |> Md5.digest_string
+          |> Md5.to_hex
         in
 
         (* Build response *)
@@ -157,13 +158,15 @@ let multi_dimensional_quote_handler state req =
           ("coverage_type", `String coverage_type_str);
           ("chain", `String (blockchain_to_string chain));
           ("stablecoin", `String (asset_to_string stablecoin));
-          ("timestamp", `Float (Unix.time ()));
+          ("timestamp", `Float (Time_float.now ()
+            |> Time_float.to_span_since_epoch
+            |> Time_float.Span.to_sec));
         ] in
 
-        Lwt.return (ok_json response)
+        ok_json response
 
       with exn ->
-        Lwt.return (error_response (Exn.to_string exn))
+        error_response (Exn.to_string exn)
 
 (** ========================================
  * ENDPOINT 2: GET /api/v2/risk/exposure
@@ -172,22 +175,16 @@ let multi_dimensional_quote_handler state req =
  *)
 let risk_exposure_handler state _req =
   try
-    let pool = Collateral_manager.CollateralManager.get_pool_state !(state.collateral_manager) in
+    let pool = (!(state.collateral_manager)).pool in
 
     (* Aggregate by coverage_type *)
-    let exposure_by_type = Hashtbl.create (module struct
-      type t = coverage_type [@@deriving sexp, compare]
-    end) in
+    let exposure_by_type = Hashtbl.Poly.create () in
 
     (* Aggregate by chain *)
-    let exposure_by_chain = Hashtbl.create (module struct
-      type t = blockchain [@@deriving sexp, compare]
-    end) in
+    let exposure_by_chain = Hashtbl.Poly.create () in
 
     (* Aggregate by stablecoin *)
-    let exposure_by_asset = Hashtbl.create (module struct
-      type t = asset [@@deriving sexp, compare]
-    end) in
+    let exposure_by_asset = Hashtbl.Poly.create () in
 
     (* Process all policies *)
     List.iter pool.active_policies ~f:(fun policy ->
@@ -242,11 +239,14 @@ let risk_exposure_handler state _req =
       | None -> `List []
       | Some snapshot ->
           snapshot.top_10_products
-          |> List.map ~f:(fun (product_key, exposure, count) ->
+          |> List.map ~f:(fun ((product_key : Monitoring.Unified_risk_monitor.UnifiedRiskMonitor.product_key), exposure, count) ->
+            let cov_type = product_key.coverage_type in
+            let chain_str = blockchain_to_string product_key.chain in
+            let asset_str = asset_to_string product_key.stablecoin in
             `Assoc [
-              ("coverage_type", `String product_key.coverage_type);
-              ("chain", `String (blockchain_to_string product_key.chain));
-              ("stablecoin", `String (asset_to_string product_key.stablecoin));
+              ("coverage_type", `String cov_type);
+              ("chain", `String chain_str);
+              ("stablecoin", `String asset_str);
               ("exposure_usd", `Float exposure);
               ("policy_count", `Int count);
             ])
@@ -259,13 +259,15 @@ let risk_exposure_handler state _req =
       ("by_stablecoin", `List asset_json);
       ("top_10_products", top_10_json);
       ("total_policies", `Int (List.length pool.active_policies));
-      ("timestamp", `Float (Unix.time ()));
+      ("timestamp", `Float (Time_float.now ()
+        |> Time_float.to_span_since_epoch
+        |> Time_float.Span.to_sec));
     ] in
 
-    Lwt.return (ok_json response)
+    ok_json response
 
   with exn ->
-    Lwt.return (error_response (Exn.to_string exn))
+    error_response (Exn.to_string exn)
 
 (** ========================================
  * ENDPOINT 3: GET /api/v2/bridge-health/:bridge_id
@@ -282,7 +284,7 @@ let bridge_health_handler state req =
     ) in
 
     match bridge_opt with
-    | None -> Lwt.return (error_response "Bridge not found")
+    | None -> error_response "Bridge not found"
     | Some bridge ->
         (* Calculate TVL change percentage *)
         let tvl_change_pct =
@@ -296,7 +298,7 @@ let bridge_health_handler state req =
         (* Map alerts to JSON *)
         let alerts_json = List.map bridge.alerts ~f:(fun alert ->
           let severity_str = match alert.severity with
-            | Bridge_monitor.Critical -> "Critical"
+            | Monitoring.Bridge_monitor.Critical -> "Critical"
             | High -> "High"
             | Medium -> "Medium"
             | Low -> "Low"
@@ -316,9 +318,9 @@ let bridge_health_handler state req =
           ("dest_chain", `String (blockchain_to_string bridge.dest_chain));
           ("health_score", `Float bridge.health_score);
           ("health_status", `String (
-            if bridge.health_score >= 0.9 then "Healthy"
-            else if bridge.health_score >= 0.7 then "Caution"
-            else if bridge.health_score >= 0.5 then "Warning"
+            if Float.(bridge.health_score >= 0.9) then "Healthy"
+            else if Float.(bridge.health_score >= 0.7) then "Caution"
+            else if Float.(bridge.health_score >= 0.5) then "Warning"
             else "Critical"
           ));
           ("tvl_usd", `Float (Int64.to_float bridge.current_tvl_usd /. 100.0));
@@ -331,13 +333,15 @@ let bridge_health_handler state req =
           )));
           ("last_updated", `Float bridge.last_updated);
           ("oracle_consensus", `Float 0.95); (* TODO: Extract from monitor *)
-          ("timestamp", `Float (Unix.time ()));
+          ("timestamp", `Float (Time_float.now ()
+            |> Time_float.to_span_since_epoch
+            |> Time_float.Span.to_sec));
         ] in
 
-        Lwt.return (ok_json response)
+        ok_json response
 
   with exn ->
-    Lwt.return (error_response (Exn.to_string exn))
+    error_response (Exn.to_string exn)
 
 (** ========================================
  * ENDPOINT 4: GET /api/v2/risk/alerts
@@ -351,11 +355,13 @@ let risk_alerts_handler state req =
 
     match state.last_risk_snapshot with
     | None ->
-        Lwt.return (ok_json (`Assoc [
+        ok_json (`Assoc [
           ("alerts", `List []);
           ("message", `String "No risk snapshot available yet");
-          ("timestamp", `Float (Unix.time ()));
-        ]))
+          ("timestamp", `Float (Time_float.now ()
+            |> Time_float.to_span_since_epoch
+            |> Time_float.Span.to_sec));
+        ])
     | Some snapshot ->
         let all_alerts = snapshot.breach_alerts @ snapshot.warning_alerts in
 
@@ -391,7 +397,7 @@ let risk_alerts_handler state req =
           in
 
           let alert_type_str = match alert.alert_type with
-            | Unified_risk_monitor.UnifiedRiskMonitor.LTV_Breach -> "LTV_Breach"
+            | Monitoring.Unified_risk_monitor.UnifiedRiskMonitor.LTV_Breach -> "LTV_Breach"
             | Reserve_Low -> "Reserve_Low"
             | Concentration_High -> "Concentration_High"
             | Correlation_Spike -> "Correlation_Spike"
@@ -405,7 +411,7 @@ let risk_alerts_handler state req =
             ("message", `String alert.message);
             ("current_value", `Float alert.current_value);
             ("limit_value", `Float alert.limit_value);
-            ("timestamp", `Float alert.timestamp);
+            ("timestamp", `Float alert.alert_timestamp);
           ]
         ) in
 
@@ -417,13 +423,15 @@ let risk_alerts_handler state req =
             | "Critical" -> true
             | _ -> false
           )));
-          ("timestamp", `Float (Unix.time ()));
+          ("timestamp", `Float (Time_float.now ()
+            |> Time_float.to_span_since_epoch
+            |> Time_float.Span.to_sec));
         ] in
 
-        Lwt.return (ok_json response)
+        ok_json response
 
   with exn ->
-    Lwt.return (error_response (Exn.to_string exn))
+    error_response (Exn.to_string exn)
 
 (** ========================================
  * ENDPOINT 5: GET /api/v2/tranches/apy
@@ -432,14 +440,14 @@ let risk_alerts_handler state req =
  *)
 let tranches_apy_handler _state _req =
   try
-    let* all_utilizations = Pool.UtilizationTracker.get_all_utilizations () in
+    let* all_utilizations = Pool.Utilization_tracker.UtilizationTracker.get_all_utilizations () in
 
     let tranches_json = List.map all_utilizations ~f:(fun util ->
-      let* available_capacity = Pool.UtilizationTracker.get_available_capacity
+      let* available_capacity = Pool.Utilization_tracker.UtilizationTracker.get_available_capacity
         ~tranche:util.tranche_id in
 
       Lwt.return (`Assoc [
-        ("tranche_id", `String (tranche_to_string util.tranche_id));
+        ("tranche_id", `String util.tranche_id);
         ("apy", `Float (util.current_apy *. 100.0)); (* Convert to percentage *)
         ("utilization", `Float util.utilization_ratio);
         ("total_capital_ton", `Float (Int64.to_float util.total_capital /. 1_000_000_000.0));
@@ -453,13 +461,15 @@ let tranches_apy_handler _state _req =
 
     let response = `Assoc [
       ("tranches", `List tranches_list);
-      ("timestamp", `Float (Unix.time ()));
+      ("timestamp", `Float (Time_float.now ()
+        |> Time_float.to_span_since_epoch
+        |> Time_float.Span.to_sec));
     ] in
 
-    Lwt.return (ok_json response)
+    ok_json response
 
   with exn ->
-    Lwt.return (error_response (Exn.to_string exn))
+    error_response (Exn.to_string exn)
 
 (** ========================================
  * HEALTH CHECK ENDPOINT
@@ -470,14 +480,16 @@ let health_handler _req =
     ("status", `String "healthy");
     ("service", `String "tonsurance-api-v2");
     ("version", `String "2.0.0");
-    ("timestamp", `Float (Unix.time ()));
+    ("timestamp", `Float (Time_float.now ()
+      |> Time_float.to_span_since_epoch
+      |> Time_float.Span.to_sec));
   ])
 
 (** ========================================
  * ROUTER SETUP
  * ========================================
  *)
-let router state ton_config = [
+let router state _ton_config = [
   Dream.get "/health" health_handler;
 
   (* v2 GET endpoints *)
@@ -496,7 +508,8 @@ let router state ton_config = [
   Dream.get "/api/v2/tranches/apy"
     (tranches_apy_handler state);
 ] @ Escrow_api.routes
-  @ Transactional_api.routes ton_config state.pricing_config
+  @ Transactional_api.routes state.collateral_manager
+  @ Hedging_api.routes state
 
 (** ========================================
  * BACKGROUND MONITORING TASKS
@@ -507,17 +520,19 @@ let start_monitoring_tasks state =
   let bridge_monitor_task () =
     let rec loop prev_states =
       let* () = Lwt_unix.sleep 60.0 in
-      let* new_states = Bridge_monitor.monitor_all_bridges ~previous_states:prev_states in
+      let* new_states = Monitoring.Bridge_monitor.monitor_all_bridges ~previous_states:prev_states in
       state.bridge_states <- new_states;
 
       (* Broadcast bridge health updates via WebSocket *)
-      let critical_alerts = Bridge_monitor.get_critical_alerts ~states:new_states in
+      let critical_alerts = Monitoring.Bridge_monitor.get_critical_alerts ~states:new_states in
       List.iter critical_alerts ~f:(fun alert ->
         let msg = Yojson.Safe.to_string (`Assoc [
           ("channel", `String "bridge_health");
           ("alert", `String alert.message);
           ("severity", `String "Critical");
-          ("timestamp", `Float (Unix.time ()));
+          ("timestamp", `Float (Time_float.now ()
+            |> Time_float.to_span_since_epoch
+            |> Time_float.Span.to_sec));
         ]) in
         List.iter state.websocket_clients ~f:(fun ws ->
           Lwt.async (fun () -> Dream.send ws msg)
@@ -531,31 +546,34 @@ let start_monitoring_tasks state =
   in
 
   (* Task 2: Update risk snapshot every 60 seconds *)
+  (* TODO: Re-enable when db_pool is available in server_state *)
   let risk_monitor_task () =
     let rec loop () =
       let* () = Lwt_unix.sleep 60.0 in
 
-      (* Calculate risk snapshot *)
-      let snapshot = Unified_risk_monitor.UnifiedRiskMonitor.calculate_risk_snapshot
+      (* Calculate risk snapshot - DISABLED: requires db_pool *)
+      (* let snapshot = Monitoring.Unified_risk_monitor.UnifiedRiskMonitor.calculate_risk_snapshot
+        db_pool
         !(state.collateral_manager)
-        ~config:Unified_risk_monitor.UnifiedRiskMonitor.default_config
+        ~config:Monitoring.Unified_risk_monitor.UnifiedRiskMonitor.default_config
         ~price_history_opt:None
       in
+      state.last_risk_snapshot <- Some snapshot; *)
 
-      state.last_risk_snapshot <- Some snapshot;
-
-      (* Broadcast risk alerts via WebSocket *)
-      if not (List.is_empty snapshot.breach_alerts) then (
+      (* Broadcast risk alerts via WebSocket - DISABLED *)
+      (* if not (List.is_empty snapshot.breach_alerts) then (
         let msg = Yojson.Safe.to_string (`Assoc [
           ("channel", `String "risk_alerts");
           ("alerts", `Int (List.length snapshot.breach_alerts));
           ("severity", `String "Critical");
-          ("timestamp", `Float (Unix.time ()));
+          ("timestamp", `Float (Time_float.now ()
+            |> Time_float.to_span_since_epoch
+            |> Time_float.Span.to_sec));
         ]) in
         List.iter state.websocket_clients ~f:(fun ws ->
           Lwt.async (fun () -> Dream.send ws msg)
         )
-      );
+      ); *)
 
       loop ()
     in
@@ -570,7 +588,9 @@ let start_monitoring_tasks state =
       let msg = Yojson.Safe.to_string (`Assoc [
         ("channel", `String "tranche_apy");
         ("message", `String "APY updated");
-        ("timestamp", `Float (Unix.time ()));
+        ("timestamp", `Float (Time_float.now ()
+        |> Time_float.to_span_since_epoch
+        |> Time_float.Span.to_sec));
       ]) in
 
       List.iter state.websocket_clients ~f:(fun ws ->
@@ -616,6 +636,8 @@ let start_server ?(port = 8080) ~collateral_manager ~ton_config () =
   Printf.printf "  GET  /api/v2/bridge-health/:bridge_id\n";
   Printf.printf "  GET  /api/v2/risk/alerts\n";
   Printf.printf "  GET  /api/v2/tranches/apy\n";
+  Printf.printf "  GET  /api/v2/hedging/swing-quote (Phase 4 Hedged Insurance)\n";
+  Printf.printf "  GET  /api/v2/hedging/policy/:policy_id/status\n";
   Printf.printf "\nTransactional Endpoints:\n";
   Printf.printf "  POST /api/v2/policies (Buy Policy)\n";
   Printf.printf "  POST /api/v2/claims (File Claim)\n";

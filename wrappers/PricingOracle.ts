@@ -30,17 +30,13 @@ export enum CoverageType {
 
 export function pricingOracleConfigToCell(config: PricingOracleConfig): Cell {
     // Build authorized keepers dictionary
-    let keepersDict: Cell | null = null;
-    if (config.authorizedKeepers && config.authorizedKeepers.length > 0) {
-        const dict = beginCell().endCell();
-        // In production, would populate dict with keepers
-        keepersDict = dict;
-    }
+    // TODO: In production, populate with actual keepers
+    const keepersDict = undefined;
 
     return beginCell()
         .storeAddress(config.adminAddress)
         .storeDict(keepersDict)
-        .storeDict(null)  // hedge_prices initially empty
+        .storeDict(undefined)  // hedge_prices initially empty
         .storeUint(0, 32) // last_update_time = 0
         .endCell();
 }

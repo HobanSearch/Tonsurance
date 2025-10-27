@@ -70,97 +70,41 @@ type claim_result = {
   transaction_hash: string option;
 } [@@deriving sexp, yojson]
 
-(** Configuration for escrow insurance *)
-type insurance_config = {
-  base_apr: float; (* 0.008 = 0.8% APR *)
-  short_duration_threshold_days: int; (* 7 days *)
-  short_duration_discount: float; (* 0.8 = 20% off *)
-  medium_duration_threshold_days: int; (* 30 days *)
-  medium_duration_discount: float; (* 0.9 = 10% off *)
-  volume_threshold: int; (* 5 active escrows *)
-  volume_discount: float; (* 0.9 = 10% off *)
-  both_parties_multiplier: float; (* 1.5x for dual coverage *)
-  minimum_premium_cents: usd_cents; (* $1.00 minimum *)
-}
 
-let default_config = {
-  base_apr = 0.008; (* 0.8% APR - competitive rate *)
-  short_duration_threshold_days = 7;
-  short_duration_discount = 0.8;
-  medium_duration_threshold_days = 30;
-  medium_duration_discount = 0.9;
-  volume_threshold = 5;
-  volume_discount = 0.9;
-  both_parties_multiplier = 1.5;
-  minimum_premium_cents = 100_00L; (* $1.00 *)
-}
 
 (** Premium calculation for escrow protection *)
 module PremiumCalculator = struct
 
-  (** Calculate duration discount based on escrow length *)
-  let calculate_duration_discount ~duration_days ~config : float =
-    if duration_days <= config.short_duration_threshold_days then
-      config.short_duration_discount (* 20% off for week or less *)
-    else if duration_days <= config.medium_duration_threshold_days then
-      config.medium_duration_discount (* 10% off for month or less *)
-    else
-      1.0 (* No discount for longer durations *)
-
-  (** Calculate volume discount based on active escrow count *)
-  let calculate_volume_discount ~active_escrow_count ~config : float =
-    if active_escrow_count >= config.volume_threshold then
-      config.volume_discount (* 10% off for 5+ active escrows *)
-    else
-      1.0 (* No discount *)
-
-  (** Calculate coverage multiplier based on protection type *)
-  let calculate_coverage_multiplier ~protection_type ~config : float =
-    match protection_type with
-    | PayerOnly -> 1.0
-    | PayeeOnly -> 1.0
-    | BothParties -> config.both_parties_multiplier (* 1.5x for both *)
-
-  (** Main premium calculation function *)
-  let calculate_escrow_premium
+  (** Main premium calculation function (now async) *)
+  let calculate_escrow_premium_async
       ~(escrow_amount: usd_cents)
       ~(duration_days: int)
       ~(protection_coverage: protection_coverage)
       ~(active_escrow_count: int)
-      ?(config = default_config)
       ()
-    : protection_breakdown =
+    : protection_breakdown Lwt.t =
 
-    (* Base premium: amount × APR × (days/365) *)
-    let escrow_amount_usd = Math.cents_to_usd escrow_amount in
-    let base_annual = escrow_amount_usd *. config.base_apr in
-    let base_premium_usd = base_annual *. (Float.of_int duration_days /. 365.0) in
-    let base_premium = Math.usd_to_cents base_premium_usd in
-
-    (* Apply discounts and multipliers *)
-    let duration_discount = calculate_duration_discount ~duration_days ~config in
-    let volume_discount = calculate_volume_discount ~active_escrow_count ~config in
-    let coverage_mult = calculate_coverage_multiplier
-      ~protection_type:protection_coverage ~config in
-
-    (* Calculate final premium *)
-    let final_premium_usd =
-      base_premium_usd
-      *. duration_discount
-      *. volume_discount
-      *. coverage_mult
+    (* Convert protection_coverage to escrow_coverage *)
+    let escrow_coverage : escrow_coverage = match protection_coverage with
+      | PayerOnly -> PayerOnly
+      | PayeeOnly -> PayeeOnly
+      | BothParties -> BothParties
     in
-    let final_premium = Math.usd_to_cents final_premium_usd in
 
-    (* Apply minimum premium floor *)
-    let final_premium = Int64.max final_premium config.minimum_premium_cents in
+    let* result = Pricing_engine.EscrowPricing.calculate_escrow_premium_async
+      ~escrow_amount
+      ~duration_days
+      ~protection_coverage:escrow_coverage
+      ~active_escrow_count
+      ()
+    in
 
-    {
-      base_premium;
-      duration_discount;
-      volume_discount;
-      coverage_multiplier = coverage_mult;
-      final_premium;
+    Lwt.return {
+      base_premium = result.base_premium;
+      duration_discount = result.duration_discount;
+      volume_discount = result.volume_discount;
+      coverage_multiplier = result.coverage_multiplier;
+      final_premium = result.final_premium;
     }
 
   (** Get human-readable premium quote *)
@@ -180,6 +124,45 @@ module PremiumCalculator = struct
 
 end
 
+(** Policy parameters configuration based on asset risk *)
+module PolicyParameters = struct
+
+  (** Determine trigger price based on asset risk profile *)
+  let get_trigger_price (asset: asset) : float =
+    (* Use asset-specific risk factors from risk_model.ml to determine trigger
+       Lower risk assets can have tighter triggers (closer to $1.00)
+       Higher risk assets need wider cushions (further from $1.00) *)
+    let risk_factors = Risk_model.get_risk_factors asset in
+
+    (* Base trigger at 0.97, adjusted by historical volatility *)
+    let base_trigger = 0.97 in
+    let volatility_adjustment = risk_factors.historical_volatility *. 0.5 in
+    let reserve_adjustment = risk_factors.reserve_quality *. 0.03 in
+
+    (* Lower trigger = more conservative (triggers earlier at higher prices) *)
+    base_trigger -. volatility_adjustment -. reserve_adjustment
+
+  (** Determine floor price based on asset risk profile *)
+  let get_floor_price (asset: asset) : float =
+    (* Floor price represents maximum tolerable depeg before full payout
+       Lower risk assets: Can use higher floor (e.g., 0.92)
+       Higher risk assets: Need lower floor for full coverage (e.g., 0.85) *)
+    let risk_factors = Risk_model.get_risk_factors asset in
+
+    (* Base floor at 0.90, adjusted by risk factors *)
+    let base_floor = 0.90 in
+    let volatility_adjustment = risk_factors.historical_volatility *. 1.0 in
+    let reserve_adjustment = risk_factors.reserve_quality *. 0.10 in
+
+    (* Lower floor = more protection (pays out at less severe depegs) *)
+    base_floor -. volatility_adjustment -. reserve_adjustment
+
+  (** Get both trigger and floor for convenience *)
+  let get_policy_prices (asset: asset) : (float * float) =
+    (get_trigger_price asset, get_floor_price asset)
+
+end
+
 (** Policy creation and management *)
 module PolicyManager = struct
 
@@ -191,9 +174,10 @@ module PolicyManager = struct
     : protection_result Lwt.t =
 
     let duration_seconds = Float.of_int escrow.timeout_seconds in
-    let duration_days = Int.of_float (duration_seconds /. 86400.0) in
 
-    (* Create policy structure *)
+    (* Determine trigger and floor prices based on asset risk profile *)
+    let (trigger_price, floor_price) = PolicyParameters.get_policy_prices escrow.asset in
+
     let policy = {
       policy_id = 0L; (* Will be assigned by PolicyFactory *)
       policyholder = escrow.payer;
@@ -203,10 +187,10 @@ module PolicyManager = struct
       asset = escrow.asset;
       coverage_amount = escrow.amount;
       premium_paid = premium_breakdown.final_premium;
-      trigger_price = 0.98; (* Standard depeg trigger for stablecoin escrow *)
-      floor_price = 0.90; (* Full coverage at 10% depeg *)
-      start_time = Unix.time ();
-      expiry_time = Unix.time () +. duration_seconds;
+      trigger_price; (* Derived from asset risk profile *)
+      floor_price; (* Derived from asset risk profile *)
+      start_time = Core.Time_float.now () |> Core.Time_float.to_span_since_epoch |> Core.Time_float.Span.to_sec;
+      expiry_time = (Core.Time_float.now () |> Core.Time_float.to_span_since_epoch |> Core.Time_float.Span.to_sec) +. duration_seconds;
       status = Active;
       payout_amount = None;
       payout_time = None;
@@ -214,7 +198,7 @@ module PolicyManager = struct
       gift_message = Some (Printf.sprintf "Escrow #%Ld Protection" escrow.escrow_id);
     } in
 
-    let%lwt policy_id = create_policy_fn policy in
+    let* policy_id = create_policy_fn policy in
 
     Lwt.return {
       policy_id;
@@ -264,17 +248,17 @@ module ClaimsProcessor = struct
         (* Dispute resolved - pay the winner if protected *)
         (match escrow.protection_covers with
          | BothParties -> Some winner
-         | PayerOnly when winner = escrow.payer -> Some winner
-         | PayeeOnly when winner = escrow.payee -> Some winner
+         | PayerOnly when String.(winner = escrow.payer) -> Some winner
+         | PayeeOnly when String.(winner = escrow.payee) -> Some winner
          | _ -> None)
 
     | UnfairCancellation { canceller; _ } ->
         (* Unfair cancellation - pay the non-canceller if protected *)
-        let victim = if canceller = escrow.payer then escrow.payee else escrow.payer in
+        let victim = if String.(canceller = escrow.payer) then escrow.payee else escrow.payer in
         (match escrow.protection_covers with
          | BothParties -> Some victim
-         | PayerOnly when victim = escrow.payer -> Some victim
-         | PayeeOnly when victim = escrow.payee -> Some victim
+         | PayerOnly when String.(victim = escrow.payer) -> Some victim
+         | PayeeOnly when String.(victim = escrow.payee) -> Some victim
          | _ -> None)
 
   (** Calculate claim payout amount *)
@@ -327,7 +311,7 @@ module ClaimsProcessor = struct
       claim_reason = reason;
       payout_amount;
       recipient;
-      processed_at = Unix.time ();
+      processed_at = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
       transaction_hash = Some tx_hash;
     }
 
@@ -345,7 +329,7 @@ module ClaimsProcessor = struct
       contract_address;
       amount_lost;
       exploit_type;
-      verified_at = Unix.time ();
+      verified_at = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
     } in
 
     process_escrow_claim ~escrow ~policy_id ~reason ~execute_payout_fn
@@ -360,7 +344,7 @@ module ClaimsProcessor = struct
     let reason = TimeoutProtection {
       original_payee = escrow.payee;
       timeout_at = escrow.created_at +. Float.of_int escrow.timeout_seconds;
-      protection_activated_at = Unix.time ();
+      protection_activated_at = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
     } in
 
     process_escrow_claim ~escrow ~policy_id ~reason ~execute_payout_fn
@@ -379,7 +363,7 @@ module ClaimsProcessor = struct
       dispute_id;
       winner;
       resolution_reason;
-      resolved_at = Unix.time ();
+      resolved_at = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
     } in
 
     process_escrow_claim ~escrow ~policy_id ~reason ~execute_payout_fn
@@ -390,7 +374,7 @@ end
 module EscrowInsurance = struct
 
   (** Create protection for escrow *)
-  let create_protection
+  let create_protection_async
       ~(escrow: escrow_contract)
       ~(active_escrow_count: int)
       ~(create_policy_fn: policy -> int64 Lwt.t)
@@ -401,7 +385,7 @@ module EscrowInsurance = struct
     else
       (* Calculate premium *)
       let duration_days = escrow.timeout_seconds / 86400 in
-      let premium_breakdown = PremiumCalculator.calculate_escrow_premium
+      let* premium_breakdown = PremiumCalculator.calculate_escrow_premium_async
         ~escrow_amount:escrow.amount
         ~duration_days
         ~protection_coverage:escrow.protection_covers
@@ -433,14 +417,14 @@ module EscrowInsurance = struct
           ~execute_payout_fn
 
   (** Get premium quote without creating policy *)
-  let get_premium_quote
+  let get_premium_quote_async
       ~(escrow_amount: usd_cents)
       ~(duration_days: int)
       ~(protection_coverage: protection_coverage)
       ~(active_escrow_count: int)
-    : protection_breakdown =
+    : protection_breakdown Lwt.t =
 
-    PremiumCalculator.calculate_escrow_premium
+    PremiumCalculator.calculate_escrow_premium_async
       ~escrow_amount
       ~duration_days
       ~protection_coverage

@@ -1,0 +1,35 @@
+# Tonny MLX Model Server Dockerfile
+# Serves the fine-tuned Tonny-7B model via Ollama-compatible API
+
+FROM python:3.11-slim
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /app
+
+# Copy requirements
+COPY deploy/requirements.txt ./
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy model server code
+COPY tonny_server.py ./
+
+# Copy the fine-tuned model
+COPY training_data/models/tonny-7b-merged ./models/tonny-7b-merged
+
+# Expose Ollama-compatible port
+EXPOSE 11434
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:11434/health || exit 1
+
+# Run the model server
+CMD ["python", "tonny_server.py", "--host", "0.0.0.0", "--port", "11434", "--model-path", "models/tonny-7b-merged"]

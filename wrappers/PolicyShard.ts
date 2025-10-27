@@ -18,7 +18,7 @@ export function policyShardConfigToCell(config: PolicyShardConfig): Cell {
         .storeAddress(config.claimsProcessorAddress)
         .storeUint(config.shardPolicyCount, 32)
         .storeBit(config.paused)
-        .storeDict(config.policiesDict)
+        .storeDict(undefined)  // policiesDict - empty dict initially
         .endCell();
 }
 

@@ -40,11 +40,11 @@ Or just chat naturally - I'm here to help! 🤖|}
 
     (* Get conversation history *)
     let conversation_history =
-      Option.value (Conversation_state.get_conversation user_id) ~default:[]
+      Option.value (Tonny_lib.Conversation_state.get_conversation user_id) ~default:[]
     in
 
     (* Ask Tonny (smart version detects pricing queries) *)
-    let* response_result = Ollama_client.ask_tonny_smart
+    let* response_result = Tonny_lib.Ollama_client.ask_tonny_smart
       ~config:ollama_config
       ~conversation_history
       ~user_message:user_query
@@ -57,7 +57,7 @@ Or just chat naturally - I'm here to help! 🤖|}
         let* () = send_message chat_id tonny_response in
 
         (* Update conversation history *)
-        let* () = Conversation_state.update_conversation
+        let* () = Tonny_lib.Conversation_state.update_conversation
           user_id user_query tonny_response
         in
 

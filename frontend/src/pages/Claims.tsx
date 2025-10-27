@@ -165,6 +165,8 @@ export const Claims = () => {
         value: gasAmount,
         policyId: BigInt(selectedPolicy),
         coverageType: coverageType,
+        chainId: 0, // Default to TON chain
+        stablecoinId: 0, // Default to USDT
         coverageAmount: toNano(selectedPolicyData.coverageAmount),
         evidence: evidenceCell.endCell(),
       });

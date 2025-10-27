@@ -345,9 +345,10 @@ cell create_state_snapshot(
 ;; Lock format: tranche_id -> (lock_holder_seq_no, expiry_timestamp)
 (int, cell) acquire_tranche_lock(cell lock_dict, int tranche_id, int seq_no, int lock_duration) inline {
     ;; Check if lock already exists
-    (slice existing_lock, int found) = lock_dict.udict_get?(8, tranche_id);
+    (cell existing_lock_cell, int found) = lock_dict.udict_get_ref?(8, tranche_id);
 
     if (found) {
+        slice existing_lock = existing_lock_cell.begin_parse();
         int lock_holder = existing_lock~load_uint(64);
         int expiry = existing_lock~load_uint(32);
 
@@ -373,9 +374,10 @@ cell create_state_snapshot(
 ;; Release lock for a tranche
 cell release_tranche_lock(cell lock_dict, int tranche_id, int seq_no) inline {
     ;; Check if lock exists and belongs to this transaction
-    (slice existing_lock, int found) = lock_dict.udict_get?(8, tranche_id);
+    (cell existing_lock_cell, int found) = lock_dict.udict_get_ref?(8, tranche_id);
 
     if (found) {
+        slice existing_lock = existing_lock_cell.begin_parse();
         int lock_holder = existing_lock~load_uint(64);
 
         ;; Only release if we own the lock

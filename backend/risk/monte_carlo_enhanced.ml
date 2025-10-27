@@ -245,7 +245,7 @@ module MonteCarloEnhanced = struct
   let calculate_var_with_scenarios
       pool
       ~(vault: vault_state)
-      ~(confidence_level: float)
+      ~(_confidence_level: float)
       ~(num_simulations: int)
     : (var_result, [> Caqti_error.t]) Result.t Lwt.t =
 
@@ -382,7 +382,7 @@ module MonteCarloEnhanced = struct
     calculate_var_with_scenarios
       pool
       ~vault
-      ~confidence_level
+      ~_confidence_level:confidence_level
       ~num_simulations:adaptive_count
 
   (** Run stress test suite using database scenarios *)

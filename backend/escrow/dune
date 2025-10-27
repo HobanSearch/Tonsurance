@@ -1,5 +1,6 @@
 (library
  (name escrow)
  (public_name tonsurance.escrow)
- (libraries core types integration crypto db lwt lwt.unix logs logs.lwt)
- (preprocess (pps lwt_ppx ppx_sexp_conv ppx_yojson_conv)))
+ (modules arbiter_registry dispute_engine escrow_engine insurance_integration)
+ (libraries core types integration crypto db risk_model pricing_engine ppx_deriving_yojson.runtime lwt lwt.unix logs logs.lwt)
+ (preprocess (pps lwt_ppx ppx_sexp_conv ppx_deriving_yojson)))

@@ -246,7 +246,7 @@ export class HedgingWebSocket {
 
         // Get hedge costs from PricingOracle
         const provider = this.config.tonClient.provider(this.config.pricingOracleAddress);
-        const oracle = provider.open(PricingOracle.fromAddress(this.config.pricingOracleAddress)) as any;
+        const oracle = provider.open(PricingOracle.createFromAddress(this.config.pricingOracleAddress)) as any;
 
         const coverageTypeEnum = this.mapCoverageType(coverageType);
         const coverageAmountNano = BigInt(Math.floor(coverageAmount * 1e9 / 5)); // Convert USD to nanoTON

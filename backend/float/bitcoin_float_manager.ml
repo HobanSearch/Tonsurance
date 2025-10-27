@@ -31,16 +31,59 @@ open Math
 
 module BitcoinFloatManager = struct
 
-  (** Vault state for Bitcoin float management *)
+  (** Bitcoin-specific float state integrated with CollateralManager *)
+  type bitcoin_float_state = {
+    btc_float_sats: int64;
+    btc_float_value_usd: usd_cents;
+    usd_reserves: usd_cents;
+    last_rebalance_timestamp: float;
+    rebalance_count: int;
+  } [@@deriving sexp, yojson]
+
+  (** Extended vault state including Bitcoin float *)
+  type vault_with_btc_float = {
+    (* Use real unified_pool from CollateralManager *)
+    pool: Pool.Collateral_manager.CollateralManager.unified_pool;
+    (* Bitcoin float overlay *)
+    btc_float: bitcoin_float_state;
+  } [@@deriving sexp]
+
+  (** Legacy vault_state type for backward compatibility *)
   type vault_state = {
     total_capital_usd: usd_cents;
     btc_float_sats: int64;
     btc_float_value_usd: usd_cents;
     usd_reserves: usd_cents;
-    collateral_positions: unit list; (* Placeholder *)
-    active_policies: unit list; (* Placeholder *)
     total_coverage_sold: usd_cents;
   }
+
+  (** Convert from integrated vault to legacy format for existing functions *)
+  let to_legacy_vault (vault: vault_with_btc_float) (btc_price_usd: float) : vault_state =
+    let btc_float_value =
+      (Int64.to_float vault.btc_float.btc_float_sats *. btc_price_usd /. 100_000_000.0)
+      |> usd_to_cents
+    in
+    {
+      total_capital_usd = vault.pool.total_capital_usd;
+      btc_float_sats = vault.btc_float.btc_float_sats;
+      btc_float_value_usd = btc_float_value;
+      usd_reserves = vault.btc_float.usd_reserves;
+      total_coverage_sold = vault.pool.total_coverage_sold;
+    }
+
+  (** Convert from legacy to integrated vault *)
+  let from_legacy_vault (vault: vault_state) (pool: Pool.Collateral_manager.CollateralManager.unified_pool) : vault_with_btc_float =
+    let btc_float = {
+      btc_float_sats = vault.btc_float_sats;
+      btc_float_value_usd = vault.btc_float_value_usd;
+      usd_reserves = vault.usd_reserves;
+      last_rebalance_timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
+      rebalance_count = 0;
+    } in
+    {
+      pool;
+      btc_float;
+    }
 
   (** Allocation strategy parameters *)
   module AllocationStrategy = struct
@@ -54,15 +97,42 @@ module BitcoinFloatManager = struct
       dca_frequency_hours: int;    (* DCA purchase frequency *)
     } [@@deriving sexp]
 
-    (** Default allocation rules *)
-    let default_rule = {
-      min_float_btc = 50.0;            (* Always keep >=50 BTC *)
-      max_float_btc = 10_000.0;        (* Cap at 10,000 BTC *)
-      target_usd_pct = 0.40;           (* 40% USD, 60% BTC *)
-      rebalance_threshold = 0.10;      (* Rebalance if >10% drift *)
-      dca_enabled = true;              (* Use DCA for accumulation *)
-      dca_frequency_hours = 24;        (* Daily DCA *)
-    }
+    (** Load allocation rules from environment or use defaults *)
+    let load_allocation_rule () : allocation_rule =
+      {
+        min_float_btc =
+          (match Sys.getenv "BTC_FLOAT_MIN_BTC" with
+           | Some v -> Float.of_string v
+           | None -> 50.0);            (* Default: Always keep >=50 BTC *)
+
+        max_float_btc =
+          (match Sys.getenv "BTC_FLOAT_MAX_BTC" with
+           | Some v -> Float.of_string v
+           | None -> 10_000.0);        (* Default: Cap at 10,000 BTC *)
+
+        target_usd_pct =
+          (match Sys.getenv "BTC_FLOAT_TARGET_USD_PCT" with
+           | Some v -> Float.of_string v
+           | None -> 0.40);            (* Default: 40% USD, 60% BTC *)
+
+        rebalance_threshold =
+          (match Sys.getenv "BTC_FLOAT_REBALANCE_THRESHOLD" with
+           | Some v -> Float.of_string v
+           | None -> 0.10);            (* Default: Rebalance if >10% drift *)
+
+        dca_enabled =
+          (match Sys.getenv "BTC_FLOAT_DCA_ENABLED" with
+           | Some "false" | Some "0" -> false
+           | _ -> true);               (* Default: Use DCA for accumulation *)
+
+        dca_frequency_hours =
+          (match Sys.getenv "BTC_FLOAT_DCA_FREQUENCY_HOURS" with
+           | Some v -> Int.of_string v
+           | None -> 24);              (* Default: Daily DCA *)
+      }
+
+    (** Default allocation rules (for backwards compatibility) *)
+    let default_rule = load_allocation_rule ()
 
     (** Calculate optimal allocation given current state *)
     let calculate_allocation
@@ -193,10 +263,9 @@ module BitcoinFloatManager = struct
         (vault: vault_state)
         ~(btc_price: float)
         ~(reason: string)
-        ~(binance_config: Integration.Binance_futures_client.BinanceFuturesClient.config)
+        ~(binance_config: Binance_futures_client.BinanceFuturesClient.config)
         ~(hedge_state: hedge_state)
       : (vault_state * trade_execution option * hedge_state, string) Result.t Lwt.t =
-      let open Lwt.Syntax in
 
       match signal with
       | BuyBTC usd_amount ->
@@ -207,7 +276,7 @@ module BitcoinFloatManager = struct
             let usd_cents = usd_to_cents usd_amount in
 
             (* Open short hedge on Binance Futures *)
-            let%lwt hedge_result = Integration.Binance_futures_client.BinanceFuturesClient.open_short
+            let%lwt hedge_result = Binance_futures_client.BinanceFuturesClient.open_short
               ~config:binance_config
               ~symbol:"BTCUSDT"
               ~quantity:btc_amount
@@ -216,7 +285,7 @@ module BitcoinFloatManager = struct
 
             (match hedge_result with
             | Error e ->
-                let err_msg = Integration.Binance_futures_client.BinanceFuturesClient.error_to_string e in
+                let err_msg = Binance_futures_client.BinanceFuturesClient.error_to_string e in
                 let%lwt () = Logs_lwt.warn (fun m ->
                   m "Failed to open hedge position: %s (continuing without hedge)" err_msg
                 ) in
@@ -293,7 +362,7 @@ module BitcoinFloatManager = struct
             | None ->
                 Lwt.return (None, hedge_state)
             | Some hedge_pos ->
-                let%lwt close_result = Integration.Binance_futures_client.BinanceFuturesClient.close_position
+                let%lwt close_result = Binance_futures_client.BinanceFuturesClient.close_position
                   ~config:binance_config
                   ~position_id:hedge_pos.binance_position_id
                 in
@@ -302,7 +371,7 @@ module BitcoinFloatManager = struct
                 | Error e ->
                     let%lwt () = Logs_lwt.warn (fun m ->
                       m "Failed to close hedge: %s"
-                        (Integration.Binance_futures_client.BinanceFuturesClient.error_to_string e)
+                        (Binance_futures_client.BinanceFuturesClient.error_to_string e)
                     ) in
                     Lwt.return (None, hedge_state)
                 | Ok pnl ->
@@ -647,86 +716,5 @@ module BitcoinFloatManager = struct
 end
 
 (* TODO: Move Tests module to separate test file
-(** Unit tests *)
-module Tests = struct
-  open Alcotest
-  open BitcoinFloatManager
-
-  let test_allocation_calculation () =
-    let rule = AllocationStrategy.default_rule in
-
-    let (to_usd, to_btc) = AllocationStrategy.calculate_allocation
-      ~premiums_collected:(Math.usd_to_cents 5_000_000.0)
-      ~required_yield_usd:(Math.usd_to_cents 3_000_000.0)
-      ~claims_reserve:(Math.usd_to_cents 1_000_000.0)
-      ~rule
-    in
-
-    (* Available: $5M - $3M - $1M = $1M *)
-    (* Should split: 40% USD ($400k), 60% BTC ($600k) *)
-    let to_usd_float = Math.cents_to_usd to_usd in
-    let to_btc_float = Math.cents_to_usd to_btc in
-
-    check bool "USD allocation ~40%"
-      (to_usd_float > 350_000.0 && to_usd_float < 450_000.0) true;
-    check bool "BTC allocation ~60%"
-      (to_btc_float > 550_000.0 && to_btc_float < 650_000.0) true
-
-  let test_rebalancing_signal () =
-    let rule = AllocationStrategy.default_rule in
-
-    (* Vault with too much USD *)
-    let vault = {
-      total_capital_usd = Math.usd_to_cents 100_000_000.0;
-      btc_float_sats = Math.btc_to_sats 100.0;
-      btc_float_value_usd = Math.usd_to_cents 5_000_000.0;  (* 5% in BTC *)
-      usd_reserves = Math.usd_to_cents 95_000_000.0;         (* 95% in USD *)
-      collateral_positions = [];
-      active_policies = [];
-      total_coverage_sold = Math.usd_to_cents 50_000_000.0;
-    } in
-
-    let signal = TradingEngine.generate_signal vault
-      ~btc_price:50_000.0
-      ~rule
-    in
-
-    (* Should signal to buy BTC *)
-    match signal with
-    | TradingEngine.BuyBTC amount ->
-        check bool "Buy BTC signal amount is positive" (amount > 0.0) true
-    | _ ->
-        check bool "Should generate BuyBTC signal" false true
-
-  let test_sustainability_calculation () =
-    let vault = {
-      total_capital_usd = Math.usd_to_cents 100_000_000.0;
-      btc_float_sats = Math.btc_to_sats 200.0;
-      btc_float_value_usd = Math.usd_to_cents 10_000_000.0;
-      usd_reserves = Math.usd_to_cents 10_000_000.0;
-      collateral_positions = [];
-      active_policies = [];
-      total_coverage_sold = Math.usd_to_cents 50_000_000.0;
-    } in
-
-    let years = YieldSustainability.sustainability_period vault
-      ~btc_price:50_000.0
-      ~required_annual_yield_btc:60.0  (* Need to pay 60 BTC per year *)
-      ~annual_premiums_usd:2_000_000.0 (* Only collecting $2M premiums *)
-    in
-
-    (* Required: 60 BTC * $50k = $3M *)
-    (* Have: $2M premiums + $10M float *)
-    (* Shortfall: $1M per year *)
-    (* Years: $10M / $1M = 10 years *)
-    check bool "Sustainability ~10 years"
-      (years >= 8 && years <= 12) true
-
-  let suite = [
-    ("allocation calculation", `Quick, test_allocation_calculation);
-    ("rebalancing signal", `Quick, test_rebalancing_signal);
-    ("sustainability calculation", `Quick, test_sustainability_calculation);
-  ]
-
-end
+(** Unit tests extracted to test/bitcoin_float_manager_test.ml *)
 *)

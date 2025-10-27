@@ -1,7 +1,8 @@
 (library
  (name config)
  (public_name tonsurance.config)
- (modules config_manager)
+ (wrapped false)
+ (modules config_manager config_loader)
  (libraries
    core
    lwt

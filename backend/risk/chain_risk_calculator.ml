@@ -1,7 +1,5 @@
 open Core
-open Lwt.Syntax
 open Types
-open Integration.Database
 
 module ChainRiskCalculator = struct
 
@@ -13,8 +11,8 @@ module ChainRiskCalculator = struct
     (* Other metrics can be added here *)
   }
 
-  let get_chain_metrics (db_pool: Db.db_pool) (chain: blockchain) : (chain_metrics option, [> Caqti_error.t]) result Lwt.t =
-    let%lwt result = RiskDb.get_chain_risk_parameters db_pool (blockchain_to_string chain) in
+  let get_chain_metrics (db_pool: Db.Connection_pool.ConnectionPool.t) (chain: blockchain) : (chain_metrics option, [> Caqti_error.t]) Result.t Lwt.t =
+    let%lwt result = Db.Risk_db.RiskDb.get_chain_risk_parameters db_pool (blockchain_to_string chain) in
     match result with
     | Ok (Some record) ->
         Lwt.return (Ok (Some {
@@ -26,7 +24,7 @@ module ChainRiskCalculator = struct
     | Ok None -> Lwt.return (Ok None)
     | Error e -> Lwt.return (Error e)
 
-  let calculate_bridge_risk ~(db_pool: Db.db_pool) ~(source_chain: blockchain) ~(dest_chain: blockchain) : (float, [> Caqti_error.t]) result Lwt.t =
+  let calculate_bridge_risk ~(db_pool: Db.Connection_pool.ConnectionPool.t) ~(source_chain: blockchain) ~(dest_chain: blockchain) : (float, [> Caqti_error.t]) Result.t Lwt.t =
     let%lwt source_metrics_res = get_chain_metrics db_pool source_chain in
     let%lwt dest_metrics_res = get_chain_metrics db_pool dest_chain in
 

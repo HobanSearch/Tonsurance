@@ -12,7 +12,7 @@
  *)
 
 open Core
-(* open Lwt.Syntax *)
+open Lwt.Syntax
 open Types
 
 module ChainMetricsClient = struct
@@ -41,6 +41,19 @@ module ChainMetricsClient = struct
     rate_limit_per_minute: int;
     timeout_seconds: float;
   } [@@deriving sexp]
+
+  (** Default configuration *)
+  let default_config : client_config = {
+    etherscan_api_key = "";
+    arbiscan_api_key = "";
+    basescan_api_key = "";
+    polygonscan_api_key = "";
+    solana_rpc_url = "https://api.mainnet-beta.solana.com";
+    ton_api_url = "https://toncenter.com/api/v2";
+    ton_api_key = None;
+    rate_limit_per_minute = 60;
+    timeout_seconds = 10.0;
+  }
 
   (** Etherscan-based metrics fetcher (works for Ethereum, Arbitrum, Base, Polygon) *)
   module EtherscanLike = struct
@@ -180,11 +193,90 @@ module ChainMetricsClient = struct
   (** Solana metrics fetcher *)
   module Solana = struct
 
+    (** Fetch recent block fill rates to estimate pending transaction pressure *)
+    let fetch_block_fill_rates
+        ~(rpc_url: string)
+        ~(headers: Cohttp.Header.t)
+      : int option Lwt.t =
+
+      try%lwt
+        (* Get recent block to check transaction count *)
+        let json_rpc = `Assoc [
+          ("jsonrpc", `String "2.0");
+          ("id", `Int 1);
+          ("method", `String "getRecentBlockhash");
+          ("params", `List []);
+        ] in
+
+        let body = Yojson.Safe.to_string json_rpc in
+
+        let%lwt (_, resp_body) =
+          Cohttp_lwt_unix.Client.post
+            ~body:(`String body)
+            ~headers
+            (Uri.of_string rpc_url)
+        in
+
+        let%lwt body_string = Cohttp_lwt.Body.to_string resp_body in
+        let json = Yojson.Safe.from_string body_string in
+
+        let open Yojson.Safe.Util in
+        let blockhash = json |> member "result" |> member "value" |> member "blockhash" |> to_string in
+
+        (* Get block by recent blockhash with transaction details *)
+        let json_rpc_block = `Assoc [
+          ("jsonrpc", `String "2.0");
+          ("id", `Int 2);
+          ("method", `String "getBlock");
+          ("params", `List [
+            `String blockhash;
+            `Assoc [("encoding", `String "json"); ("transactionDetails", `String "full")]
+          ]);
+        ] in
+
+        let body_block = Yojson.Safe.to_string json_rpc_block in
+
+        let%lwt (_, block_body) =
+          Cohttp_lwt_unix.Client.post
+            ~body:(`String body_block)
+            ~headers
+            (Uri.of_string rpc_url)
+        in
+
+        let%lwt block_str = Cohttp_lwt.Body.to_string block_body in
+        let block_json = Yojson.Safe.from_string block_str in
+
+        let transactions = block_json |> member "result" |> member "transactions" |> to_list in
+        let tx_count = List.length transactions in
+
+        (* Solana max TPS ~65,000, with 400ms slots = ~26,000 tx per slot at max capacity
+           Estimate pending based on how full blocks are *)
+        let max_tx_per_block = 26000 in
+        let fill_rate = Float.of_int tx_count /. Float.of_int max_tx_per_block in
+
+        (* Estimate pending: higher fill rate = more backlog *)
+        let estimated_pending =
+          if Float.(fill_rate > 0.9) then 5000      (* Heavy congestion *)
+          else if Float.(fill_rate > 0.7) then 2000 (* Moderate *)
+          else if Float.(fill_rate > 0.5) then 800  (* Light *)
+          else 200                                   (* Minimal *)
+        in
+
+        Lwt.return (Some estimated_pending)
+
+      with exn ->
+        let%lwt () = Logs_lwt.warn (fun m ->
+          m "Error fetching Solana block fill rates: %s" (Exn.to_string exn)
+        ) in
+        Lwt.return None
+
     let fetch_metrics
         ~(rpc_url: string)
       : (int * int) option Lwt.t =
 
       try%lwt
+        let headers = Cohttp.Header.of_list [("Content-Type", "application/json")] in
+
         (* Get performance samples *)
         let _json_rpc = `Assoc [
           ("jsonrpc", `String "2.0");
@@ -194,7 +286,6 @@ module ChainMetricsClient = struct
         ] in
 
         let body = Yojson.Safe.to_string _json_rpc in
-        let headers = Cohttp.Header.of_list [("Content-Type", "application/json")] in
 
         let%lwt (_resp, resp_body) =
           Cohttp_lwt_unix.Client.post
@@ -222,27 +313,9 @@ module ChainMetricsClient = struct
 
           let avg_slot_time_ms = (total_time * 1000) / total_slots in
 
-          (* Get pending transactions *)
-          let json_rpc_pending = `Assoc [
-            ("jsonrpc", `String "2.0");
-            ("id", `Int 2);
-            ("method", `String "getBlockProduction");
-          ] in
-
-          let body_pending = Yojson.Safe.to_string json_rpc_pending in
-
-          let%lwt (_, pending_body) =
-            Cohttp_lwt_unix.Client.post
-              ~body:(`String body_pending)
-              ~headers
-              (Uri.of_string rpc_url)
-          in
-
-          let%lwt pending_str = Cohttp_lwt.Body.to_string pending_body in
-          let _pending_json = Yojson.Safe.from_string pending_str in
-
-          (* Solana doesn't have a mempool, but we can estimate congestion *)
-          let pending_count = 0 in (* Placeholder *)
+          (* Estimate pending transaction count from block fill rates *)
+          let%lwt pending_opt = fetch_block_fill_rates ~rpc_url ~headers in
+          let pending_count = Option.value pending_opt ~default:500 in
 
           Lwt.return (Some (avg_slot_time_ms, pending_count))
 
@@ -257,30 +330,112 @@ module ChainMetricsClient = struct
   (** TON metrics fetcher *)
   module TON = struct
 
+    (** Estimate pending transactions from recent block transaction counts *)
+    let estimate_pending_from_blocks
+        ~(api_url: string)
+        ~(headers: Cohttp.Header.t)
+      : int option Lwt.t =
+
+      try%lwt
+        (* Get masterchain info to fetch recent seqno *)
+        let url_info = Printf.sprintf "%s/masterchain-info" api_url in
+
+        let%lwt (_resp, body) = Cohttp_lwt_unix.Client.get ~headers (Uri.of_string url_info) in
+        let%lwt body_string = Cohttp_lwt.Body.to_string body in
+        let json = Yojson.Safe.from_string body_string in
+
+        let open Yojson.Safe.Util in
+        let last_seqno = json |> member "last" |> member "seqno" |> to_int in
+
+        (* Fetch last 3 blocks to calculate average transaction volume *)
+        let seqnos = [last_seqno; last_seqno - 1; last_seqno - 2] in
+
+        let%lwt tx_counts =
+          Lwt_list.map_p (fun seqno ->
+            try%lwt
+              let url_block = Printf.sprintf "%s/masterchain-block/%d" api_url seqno in
+
+              let%lwt (_, block_body) = Cohttp_lwt_unix.Client.get ~headers (Uri.of_string url_block) in
+              let%lwt block_str = Cohttp_lwt.Body.to_string block_body in
+              let block_json = Yojson.Safe.from_string block_str in
+
+              (* Get transaction count from block *)
+              let tx_count = block_json |> member "tx_count" |> to_int_option in
+
+              Lwt.return (Option.value tx_count ~default:0)
+
+            with _exn -> Lwt.return 0
+          ) seqnos
+        in
+
+        (* Calculate average transaction count *)
+        let total_txs = List.fold tx_counts ~init:0 ~f:(+) in
+        let avg_txs = total_txs / 3 in
+
+        (* TON processes ~100k TPS at max capacity across shards
+           Per masterchain block (~5s): ~500k tx theoretical max
+           Estimate pending based on current throughput *)
+        let estimated_pending =
+          if avg_txs > 400000 then 8000      (* Very heavy *)
+          else if avg_txs > 300000 then 4000 (* Heavy *)
+          else if avg_txs > 150000 then 1500 (* Moderate *)
+          else if avg_txs > 50000 then 500   (* Light *)
+          else 150                            (* Minimal *)
+        in
+
+        Lwt.return (Some estimated_pending)
+
+      with exn ->
+        let%lwt () = Logs_lwt.warn (fun m ->
+          m "Error estimating TON pending txs: %s" (Exn.to_string exn)
+        ) in
+        Lwt.return None
+
     let fetch_metrics
         ~(api_url: string)
         ~(api_key: string option)
       : (int * int) option Lwt.t =
 
       try%lwt
-        let url = Printf.sprintf "%s/masterchain-info" api_url in
-
         let headers = match api_key with
           | Some key -> Cohttp.Header.of_list [("X-API-Key", key)]
           | None -> Cohttp.Header.init ()
         in
 
+        let url = Printf.sprintf "%s/masterchain-info" api_url in
+
         let%lwt (_resp, body) = Cohttp_lwt_unix.Client.get ~headers (Uri.of_string url) in
         let%lwt body_string = Cohttp_lwt.Body.to_string body in
-        let _json = Yojson.Safe.from_string body_string in
+        let json = Yojson.Safe.from_string body_string in
 
-        (* let open Yojson.Safe.Util in *)
+        let open Yojson.Safe.Util in
 
-        (* TON average block time is ~5 seconds *)
-        let block_time_ms = 5000 in
+        (* Calculate block time from recent blocks *)
+        let last_seqno = json |> member "last" |> member "seqno" |> to_int in
+        let last_utime = json |> member "last" |> member "utime" |> to_int in
 
-        (* Get unconfirmed transactions (if available) *)
-        let pending_count = 0 in (* TON doesn't expose mempool directly *)
+        (* Fetch previous block to calculate time delta *)
+        let%lwt block_time_ms =
+          try%lwt
+            let url_prev = Printf.sprintf "%s/masterchain-block/%d" api_url (last_seqno - 1) in
+
+            let%lwt (_, prev_body) = Cohttp_lwt_unix.Client.get ~headers (Uri.of_string url_prev) in
+            let%lwt prev_str = Cohttp_lwt.Body.to_string prev_body in
+            let prev_json = Yojson.Safe.from_string prev_str in
+
+            let prev_utime = prev_json |> member "utime" |> to_int in
+            let time_diff_ms = (last_utime - prev_utime) * 1000 in
+
+            Lwt.return time_diff_ms
+
+          with _exn ->
+            (* Fallback to typical 5 second block time *)
+            Lwt.return 5000
+        in
+
+        (* Estimate pending transaction count from block analysis *)
+        let%lwt pending_opt = estimate_pending_from_blocks ~api_url ~headers in
+        let pending_count = Option.value pending_opt ~default:200 in
 
         Lwt.return (Some (block_time_ms, pending_count))
 
@@ -293,32 +448,19 @@ module ChainMetricsClient = struct
   end
 
   (** Calculate congestion score *)
-  let calculate_congestion_score
+  let calculate_congestion_score_async
       ~(chain: blockchain)
       ~(gas_price_opt: float option)
       ~(block_time_ms: int)
       ~(pending_tx: int)
-    : float =
+    : float Lwt.t =
 
-    (* Baseline gas prices (in gwei) for each chain *)
-    let baseline_gas = match chain with
-      | Ethereum -> 30.0
-      | Arbitrum -> 0.1
-      | Base -> 0.05
-      | Polygon -> 50.0
-      | _ -> 1.0
-    in
+    let chain_str = blockchain_to_string chain in
 
-    (* Baseline block times (in ms) *)
-    let baseline_block_time = match chain with
-      | Ethereum -> 12000
-      | Arbitrum -> 250
-      | Base -> 2000
-      | Polygon -> 2000
-      | Solana -> 400
-      | TON -> 5000
-      | _ -> 10000
-    in
+    (* Get baselines from config *)
+    let* baseline_gas = Config_manager.ConfigManager.ChainBaselines.get_baseline_gas chain_str in
+    let* baseline_block_time_ms = Config_manager.ConfigManager.ChainBaselines.get_baseline_block_time chain_str in
+    let baseline_block_time = Float.of_int baseline_block_time_ms in
 
     (* Gas price factor (0.0 - 1.0) *)
     let gas_factor = match gas_price_opt with
@@ -330,7 +472,7 @@ module ChainMetricsClient = struct
 
     (* Block time factor (0.0 - 1.0) - slower = more congested *)
     let block_time_factor =
-      let ratio = Float.of_int block_time_ms /. Float.of_int baseline_block_time in
+      let ratio = Float.of_int block_time_ms /. baseline_block_time in
       Float.min 1.0 (ratio /. 3.0) (* Cap at 3x baseline *)
     in
 
@@ -347,7 +489,7 @@ module ChainMetricsClient = struct
       (pending_factor *. 0.20)
     in
 
-    Float.max 0.0 (Float.min 1.0 score)
+    Lwt.return (Float.max 0.0 (Float.min 1.0 score))
 
   (** Fetch metrics for a single chain *)
   let fetch_chain_metrics
@@ -377,7 +519,7 @@ module ChainMetricsClient = struct
         (match block_time_opt with
          | Some block_time_ms ->
              let pending = Option.value pending_opt ~default:0 in
-             let congestion = calculate_congestion_score
+             let* congestion = calculate_congestion_score_async
                ~chain
                ~gas_price_opt
                ~block_time_ms
@@ -402,7 +544,7 @@ module ChainMetricsClient = struct
 
         (match metrics_opt with
          | Some (block_time_ms, pending) ->
-             let congestion = calculate_congestion_score
+             let* congestion = calculate_congestion_score_async
                ~chain
                ~gas_price_opt:None
                ~block_time_ms
@@ -430,7 +572,7 @@ module ChainMetricsClient = struct
 
         (match metrics_opt with
          | Some (block_time_ms, pending) ->
-             let congestion = calculate_congestion_score
+             let* congestion = calculate_congestion_score_async
                ~chain
                ~gas_price_opt:None
                ~block_time_ms

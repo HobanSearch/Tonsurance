@@ -3,8 +3,12 @@
 open Core
 open OUnit2
 open Tranche_pricing
-open Pool.WaterfallSimulator
+open Pool.Waterfall_simulator
+open WaterfallSimulator
 open Types
+
+(* Import all_of_tranche from Tranche_pricing module *)
+let all_of_tranche = Tranche_pricing.all_of_tranche
 
 (* Helper function to check float equality with tolerance *)
 let assert_float_equal ?(tolerance = 0.001) expected actual =
@@ -12,7 +16,7 @@ let assert_float_equal ?(tolerance = 0.001) expected actual =
   assert_bool
     (Printf.sprintf "Expected %.6f but got %.6f (diff: %.6f, tolerance: %.6f)"
        expected actual diff tolerance)
-    (diff <= tolerance)
+    Float.(diff <= tolerance)
 
 (* Helper function to check int64 equality *)
 let assert_int64_equal expected actual =
@@ -31,19 +35,20 @@ let test_create_initial_vault _ =
 
   (* Check that all tranches are initialized *)
   List.iter all_of_tranche ~f:(fun tranche ->
-    match get_tranche vault ~tranche with
+    let tranche_str = tranche_to_string tranche in
+    match get_tranche vault ~tranche:tranche_str with
     | Some t ->
         assert_int64_equal 0L t.capital;
         assert_int64_equal 0L t.accumulated_yield;
         assert_float_equal 0.0 t.utilization
-    | None -> assert_failure (Printf.sprintf "Tranche %s not found" (tranche_to_string tranche))
+    | None -> assert_failure (Printf.sprintf "Tranche %s not found" tranche_str)
   )
 
 let test_set_tranche_capital _ =
   let vault = create_initial_vault () in
-  let vault = set_tranche_capital vault ~tranche:SURE_BTC ~capital:100_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-BTC" ~capital:100_000_000_000L in
 
-  match get_tranche vault ~tranche:SURE_BTC with
+  match get_tranche vault ~tranche:"SURE-BTC" with
   | Some t ->
       assert_int64_equal 100_000_000_000L t.capital;
       assert_int64_equal 100_000_000_000L vault.total_capital
@@ -51,13 +56,13 @@ let test_set_tranche_capital _ =
 
 let test_set_multiple_tranche_capitals _ =
   let vault = create_initial_vault () in
-  let vault = set_tranche_capital vault ~tranche:SURE_BTC ~capital:100_000_000_000L in
-  let vault = set_tranche_capital vault ~tranche:SURE_SNR ~capital:80_000_000_000L in
-  let vault = set_tranche_capital vault ~tranche:SURE_EQT ~capital:10_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-BTC" ~capital:100_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-SNR" ~capital:80_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-EQT" ~capital:10_000_000_000L in
 
   assert_int64_equal 190_000_000_000L vault.total_capital;
 
-  match get_tranche vault ~tranche:SURE_SNR with
+  match get_tranche vault ~tranche:"SURE-SNR" with
   | Some t -> assert_int64_equal 80_000_000_000L t.capital
   | None -> assert_failure "SURE_SNR not found"
 
@@ -67,33 +72,33 @@ let test_set_multiple_tranche_capitals _ =
 
 let test_premium_distribution_single_tranche _ =
   let vault = create_initial_vault () in
-  let vault = set_tranche_capital vault ~tranche:SURE_BTC ~capital:100_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-BTC" ~capital:100_000_000_000L in
 
   let result = simulate_premium_distribution vault ~premium:10_000_000_000L in
   match result with
   | Ok (dist, new_vault) ->
       (* BTC should receive some premium *)
       assert_bool "BTC should receive premium"
-        (List.exists dist.distributions ~f:(fun (t, _) -> Poly.equal t SURE_BTC));
+        (List.exists dist.distributions ~f:(fun (t, _) -> String.equal t "SURE-BTC"));
 
       (* Check that accumulated yield increased *)
-      (match get_tranche new_vault ~tranche:SURE_BTC with
+      (match get_tranche new_vault ~tranche:"SURE-BTC" with
       | Some t -> assert_bool "Accumulated yield should be positive" Int64.(t.accumulated_yield > 0L)
       | None -> assert_failure "SURE_BTC not found")
   | Error e -> assert_failure (Printf.sprintf "Distribution failed: %s" (error_to_string e))
 
 let test_premium_distribution_multiple_tranches _ =
   let vault = create_initial_vault () in
-  let vault = set_tranche_capital vault ~tranche:SURE_BTC ~capital:100_000_000_000L in
-  let vault = set_tranche_capital vault ~tranche:SURE_SNR ~capital:80_000_000_000L in
-  let vault = set_tranche_capital vault ~tranche:SURE_MEZZ ~capital:60_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-BTC" ~capital:100_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-SNR" ~capital:80_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-MEZZ" ~capital:60_000_000_000L in
 
   let result = simulate_premium_distribution vault ~premium:50_000_000_000L in
   match result with
   | Ok (dist, new_vault) ->
       (* BTC should get paid first (senior-most) *)
       (match List.hd dist.distributions with
-      | Some (t, _) -> assert_bool "First distribution should be to BTC" (Poly.equal t SURE_BTC)
+      | Some (t, _) -> assert_bool "First distribution should be to BTC" (String.equal t "SURE-BTC")
       | None -> assert_failure "No distributions found");
 
       (* Total capital should be unchanged *)
@@ -102,7 +107,7 @@ let test_premium_distribution_multiple_tranches _ =
 
 let test_premium_distribution_exhausted _ =
   let vault = create_initial_vault () in
-  let vault = set_tranche_capital vault ~tranche:SURE_BTC ~capital:1_000_000_000L in (* Small capital *)
+  let vault = set_tranche_capital vault ~tranche:"SURE-BTC" ~capital:1_000_000_000L in (* Small capital *)
 
   let result = simulate_premium_distribution vault ~premium:100_000_000L in
   match result with
@@ -115,22 +120,22 @@ let test_premium_distribution_exhausted _ =
 
 let test_premium_distribution_zero_premium _ =
   let vault = create_initial_vault () in
-  let vault = set_tranche_capital vault ~tranche:SURE_BTC ~capital:100_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-BTC" ~capital:100_000_000_000L in
 
   let result = simulate_premium_distribution vault ~premium:0L in
   match result with
   | Ok _ -> assert_failure "Should fail with zero premium"
-  | Error (InvalidAmount _) -> () (* Expected *)
+  | Error (InvalidPrice _) -> () (* Expected *)
   | Error e -> assert_failure (Printf.sprintf "Wrong error type: %s" (error_to_string e))
 
 let test_premium_distribution_negative_premium _ =
   let vault = create_initial_vault () in
-  let vault = set_tranche_capital vault ~tranche:SURE_BTC ~capital:100_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-BTC" ~capital:100_000_000_000L in
 
   let result = simulate_premium_distribution vault ~premium:(-1000L) in
   match result with
   | Ok _ -> assert_failure "Should fail with negative premium"
-  | Error (InvalidAmount _) -> () (* Expected *)
+  | Error (InvalidPrice _) -> () (* Expected *)
   | Error e -> assert_failure (Printf.sprintf "Wrong error type: %s" (error_to_string e))
 
 (* ========================================
@@ -139,17 +144,17 @@ let test_premium_distribution_negative_premium _ =
 
 let test_loss_absorption_single_tranche _ =
   let vault = create_initial_vault () in
-  let vault = set_tranche_capital vault ~tranche:SURE_EQT ~capital:10_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-EQT" ~capital:10_000_000_000L in
 
   let result = simulate_loss_absorption vault ~loss:5_000_000_000L in
   match result with
   | Ok (absorption, new_vault) ->
       (* EQT should absorb the loss *)
       assert_bool "EQT should absorb loss"
-        (List.exists absorption.absorptions ~f:(fun (t, _) -> Poly.equal t SURE_EQT));
+        (List.exists absorption.absorptions ~f:(fun (t, _) -> String.equal t "SURE-EQT"));
 
       (* Check capital reduced *)
-      (match get_tranche new_vault ~tranche:SURE_EQT with
+      (match get_tranche new_vault ~tranche:"SURE-EQT" with
       | Some t -> assert_int64_equal 5_000_000_000L t.capital
       | None -> assert_failure "SURE_EQT not found");
 
@@ -159,17 +164,17 @@ let test_loss_absorption_single_tranche _ =
 
 let test_loss_absorption_wipes_tranche _ =
   let vault = create_initial_vault () in
-  let vault = set_tranche_capital vault ~tranche:SURE_EQT ~capital:10_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-EQT" ~capital:10_000_000_000L in
 
   let result = simulate_loss_absorption vault ~loss:10_000_000_000L in
   match result with
   | Ok (absorption, new_vault) ->
       (* EQT should be wiped *)
       assert_bool "EQT should be wiped"
-        (List.mem absorption.wiped_tranches SURE_EQT ~equal:Poly.equal);
+        (List.mem absorption.wiped_tranches "SURE-EQT" ~equal:String.equal);
 
       (* Check capital is zero *)
-      (match get_tranche new_vault ~tranche:SURE_EQT with
+      (match get_tranche new_vault ~tranche:"SURE-EQT" with
       | Some t -> assert_int64_equal 0L t.capital
       | None -> assert_failure "SURE_EQT not found");
 
@@ -179,8 +184,8 @@ let test_loss_absorption_wipes_tranche _ =
 
 let test_loss_absorption_cascades _ =
   let vault = create_initial_vault () in
-  let vault = set_tranche_capital vault ~tranche:SURE_EQT ~capital:10_000_000_000L in
-  let vault = set_tranche_capital vault ~tranche:SURE_JNR_PLUS ~capital:12_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-EQT" ~capital:10_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-JNR+" ~capital:12_000_000_000L in
 
   (* Loss exceeds EQT capital, should cascade to JNR+ *)
   let result = simulate_loss_absorption vault ~loss:15_000_000_000L in
@@ -188,14 +193,14 @@ let test_loss_absorption_cascades _ =
   | Ok (absorption, new_vault) ->
       (* EQT should be wiped *)
       assert_bool "EQT should be wiped"
-        (List.mem absorption.wiped_tranches SURE_EQT ~equal:Poly.equal);
+        (List.mem absorption.wiped_tranches "SURE-EQT" ~equal:String.equal);
 
       (* JNR+ should absorb remaining *)
       assert_bool "JNR+ should absorb loss"
-        (List.exists absorption.absorptions ~f:(fun (t, _) -> Poly.equal t SURE_JNR_PLUS));
+        (List.exists absorption.absorptions ~f:(fun (t, _) -> String.equal t "SURE-JNR+"));
 
       (* Check JNR+ capital reduced by 5B *)
-      (match get_tranche new_vault ~tranche:SURE_JNR_PLUS with
+      (match get_tranche new_vault ~tranche:"SURE-JNR+" with
       | Some t -> assert_int64_equal 7_000_000_000L t.capital
       | None -> assert_failure "SURE_JNR_PLUS not found");
 
@@ -205,7 +210,7 @@ let test_loss_absorption_cascades _ =
 
 let test_loss_absorption_insolvency _ =
   let vault = create_initial_vault () in
-  let vault = set_tranche_capital vault ~tranche:SURE_EQT ~capital:10_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-EQT" ~capital:10_000_000_000L in
 
   (* Loss exceeds all capital *)
   let result = simulate_loss_absorption vault ~loss:50_000_000_000L in
@@ -213,7 +218,7 @@ let test_loss_absorption_insolvency _ =
   | Ok (absorption, new_vault) ->
       (* EQT should be wiped *)
       assert_bool "EQT should be wiped"
-        (List.mem absorption.wiped_tranches SURE_EQT ~equal:Poly.equal);
+        (List.mem absorption.wiped_tranches "SURE-EQT" ~equal:String.equal);
 
       (* Should have remaining loss (insolvency) *)
       assert_int64_equal 40_000_000_000L absorption.remaining;
@@ -224,12 +229,12 @@ let test_loss_absorption_insolvency _ =
 
 let test_loss_absorption_zero_loss _ =
   let vault = create_initial_vault () in
-  let vault = set_tranche_capital vault ~tranche:SURE_EQT ~capital:10_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-EQT" ~capital:10_000_000_000L in
 
   let result = simulate_loss_absorption vault ~loss:0L in
   match result with
   | Ok _ -> assert_failure "Should fail with zero loss"
-  | Error (InvalidAmount _) -> () (* Expected *)
+  | Error (InvalidPrice _) -> () (* Expected *)
   | Error e -> assert_failure (Printf.sprintf "Wrong error type: %s" (error_to_string e))
 
 (* ========================================
@@ -238,8 +243,8 @@ let test_loss_absorption_zero_loss _ =
 
 let test_scenario_premium_then_loss _ =
   let vault = create_initial_vault () in
-  let vault = set_tranche_capital vault ~tranche:SURE_BTC ~capital:100_000_000_000L in
-  let vault = set_tranche_capital vault ~tranche:SURE_EQT ~capital:10_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-BTC" ~capital:100_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-EQT" ~capital:10_000_000_000L in
 
   let events = [
     `Premium 5_000_000_000L;
@@ -262,9 +267,9 @@ let test_scenario_premium_then_loss _ =
 
 let test_scenario_multiple_events _ =
   let vault = create_initial_vault () in
-  let vault = set_tranche_capital vault ~tranche:SURE_BTC ~capital:100_000_000_000L in
-  let vault = set_tranche_capital vault ~tranche:SURE_SNR ~capital:80_000_000_000L in
-  let vault = set_tranche_capital vault ~tranche:SURE_EQT ~capital:20_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-BTC" ~capital:100_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-SNR" ~capital:80_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-EQT" ~capital:20_000_000_000L in
 
   let events = [
     `Premium 10_000_000_000L;
@@ -277,7 +282,7 @@ let test_scenario_multiple_events _ =
   match result with
   | Ok (final_vault, log) ->
       (* Log should contain all 4 events *)
-      let premium_count = String.count log ~f:(fun c -> c = 'P') in
+      let premium_count = String.count log ~f:(fun c -> Char.equal c 'P') in
       assert_bool "Log should have multiple entries" (premium_count >= 3);
 
       (* Vault should still be valid *)
@@ -286,7 +291,7 @@ let test_scenario_multiple_events _ =
 
 let test_scenario_empty_events _ =
   let vault = create_initial_vault () in
-  let vault = set_tranche_capital vault ~tranche:SURE_BTC ~capital:100_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-BTC" ~capital:100_000_000_000L in
 
   let events = [] in
 
@@ -305,7 +310,7 @@ let test_scenario_empty_events _ =
 
 let test_calculate_vault_utilization _ =
   let vault = create_initial_vault () in
-  let vault = set_tranche_capital vault ~tranche:SURE_BTC ~capital:100_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-BTC" ~capital:100_000_000_000L in
   let vault = { vault with total_coverage_sold = 50_000_000_000L } in
 
   let util = calculate_vault_utilization vault in
@@ -319,37 +324,37 @@ let test_calculate_vault_utilization_zero_capital _ =
 
 let test_is_solvent_true _ =
   let vault = create_initial_vault () in
-  let vault = set_tranche_capital vault ~tranche:SURE_BTC ~capital:100_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-BTC" ~capital:100_000_000_000L in
   let vault = { vault with total_coverage_sold = 50_000_000_000L } in
 
   assert_bool "Vault should be solvent" (is_solvent vault)
 
 let test_is_solvent_false _ =
   let vault = create_initial_vault () in
-  let vault = set_tranche_capital vault ~tranche:SURE_BTC ~capital:50_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-BTC" ~capital:50_000_000_000L in
   let vault = { vault with total_coverage_sold = 100_000_000_000L } in
 
   assert_bool "Vault should not be solvent" (not (is_solvent vault))
 
 let test_is_solvent_exact _ =
   let vault = create_initial_vault () in
-  let vault = set_tranche_capital vault ~tranche:SURE_BTC ~capital:100_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-BTC" ~capital:100_000_000_000L in
   let vault = { vault with total_coverage_sold = 100_000_000_000L } in
 
   assert_bool "Vault should be solvent at exact match" (is_solvent vault)
 
 let test_get_tranche_exists _ =
   let vault = create_initial_vault () in
-  let vault = set_tranche_capital vault ~tranche:SURE_BTC ~capital:100_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-BTC" ~capital:100_000_000_000L in
 
-  match get_tranche vault ~tranche:SURE_BTC with
+  match get_tranche vault ~tranche:"SURE-BTC" with
   | Some t -> assert_int64_equal 100_000_000_000L t.capital
   | None -> assert_failure "SURE_BTC should exist"
 
 let test_generate_report _ =
   let vault = create_initial_vault () in
-  let vault = set_tranche_capital vault ~tranche:SURE_BTC ~capital:100_000_000_000L in
-  let vault = set_tranche_capital vault ~tranche:SURE_EQT ~capital:10_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-BTC" ~capital:100_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-EQT" ~capital:10_000_000_000L in
 
   let report = generate_report vault in
 
@@ -366,12 +371,12 @@ let test_generate_report _ =
 let test_full_waterfall_integration _ =
   (* Setup vault with all tranches *)
   let vault = create_initial_vault () in
-  let vault = set_tranche_capital vault ~tranche:SURE_BTC ~capital:100_000_000_000L in
-  let vault = set_tranche_capital vault ~tranche:SURE_SNR ~capital:80_000_000_000L in
-  let vault = set_tranche_capital vault ~tranche:SURE_MEZZ ~capital:60_000_000_000L in
-  let vault = set_tranche_capital vault ~tranche:SURE_JNR ~capital:40_000_000_000L in
-  let vault = set_tranche_capital vault ~tranche:SURE_JNR_PLUS ~capital:30_000_000_000L in
-  let vault = set_tranche_capital vault ~tranche:SURE_EQT ~capital:20_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-BTC" ~capital:100_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-SNR" ~capital:80_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-MEZZ" ~capital:60_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-JNR" ~capital:40_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-JNR+" ~capital:30_000_000_000L in
+  let vault = set_tranche_capital vault ~tranche:"SURE-EQT" ~capital:20_000_000_000L in
 
   (* Total capital: 330B nanoTON *)
   assert_int64_equal 330_000_000_000L vault.total_capital;

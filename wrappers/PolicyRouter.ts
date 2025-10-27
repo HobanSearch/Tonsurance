@@ -17,9 +17,9 @@ export function policyRouterConfigToCell(config: PolicyRouterConfig): Cell {
         .storeUint(config.nextPolicyId, 64)
         .storeUint(config.totalPolicies, 64)
         .storeBit(config.paused)
-        .storeDict(config.shardAddresses)
+        .storeDict(undefined)  // shardAddresses - empty dict initially
         .storeAddress(config.treasuryAddress)
-        .storeDict(config.pendingTxs)
+        .storeDict(undefined)  // pendingTxs - empty dict initially
         .storeUint(config.seqNo, 32)
         .endCell();
 }

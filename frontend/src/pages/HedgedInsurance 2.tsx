@@ -70,6 +70,9 @@ export const HedgedInsurance = () => {
     const multipliers: Record<number, number> = { 1: 1, 2: 1.8, 3: 2.5, 4: 3.0 };
     const multiplier = multipliers[selectedCoverageTypes.length] || 1;
 
+    // Calculate base premium (0.8% APR for hedged insurance)
+    const basePremium = amount * baseApr * (days / 365) * multiplier;
+
     const totalPremium = basePremium; // No hedge costs charged to user
     const fixedPremium = amount * baseApr * (days / 365) * 2.5; // Core insurance equivalent
     const savings = fixedPremium - totalPremium;

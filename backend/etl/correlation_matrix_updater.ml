@@ -19,7 +19,6 @@
  *)
 
 open Core
-open Lwt.Syntax
 open Lwt.Infix
 open Types
 open Math
@@ -92,7 +91,7 @@ module CorrelationMatrixUpdater = struct
     let rec calc_returns acc prev_prices =
       match prev_prices with
       | [] | [_] -> List.rev acc
-      | (t1, p1) :: (t2, p2) :: rest ->
+      | (_t1, p1) :: (t2, p2) :: rest ->
           if Float.O.(Float.abs p1 < 1e-10) then
             (* Skip zero prices *)
             calc_returns acc ((t2, p2) :: rest)
@@ -352,7 +351,7 @@ module CorrelationMatrixUpdater = struct
             (* Self-correlation = 1.0 *)
             Lwt.return (Ok 1.0)
           else
-            (* Query database *)
+            (* Query database - uses get_correlation() function from migration 007 *)
             let query =
               (t3 string string int)
               ->? float
@@ -410,6 +409,7 @@ module CorrelationMatrixUpdater = struct
       (t2 float int)
       ->* (t3 string string float)
       @@ {|
+        -- Uses latest_correlations view from migration 007
         SELECT asset_1, asset_2, correlation
         FROM latest_correlations
         WHERE correlation >= $1

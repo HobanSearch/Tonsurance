@@ -30,6 +30,7 @@
    logs.fmt
    config
    etl
+   integration
    risk_model
    reporting
    types)

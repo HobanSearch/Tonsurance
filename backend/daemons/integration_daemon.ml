@@ -10,18 +10,13 @@
  *)
 
 open Core
-open Lwt.Syntax
-open Types
-open Integration.Database
-open Integration.Vault_sync
-open Integration.Policy_event_subscriber
 
 module IntegrationDaemon = struct
 
   (** Daemon configuration *)
   type daemon_config = {
     (* TON blockchain *)
-    ton_network: Integration.Ton_client.TonClient.network;
+    ton_network: Ton_client.TonClient.network;
     ton_api_key: string option;
 
     (* Contract addresses *)
@@ -29,7 +24,7 @@ module IntegrationDaemon = struct
     policy_factory_address: string;
 
     (* Database *)
-    db_config: Database.db_config;
+    db_config: Database.Database.db_config;
 
     (* Sync intervals *)
     vault_sync_interval_seconds: float;
@@ -39,14 +34,14 @@ module IntegrationDaemon = struct
     capital_drift_threshold_pct: float;
   }
 
-  let default_config ~vault_address ~policy_factory_address = {
-    ton_network = Integration.Ton_client.TonClient.Testnet;
+  let _default_config ~vault_address ~policy_factory_address = {
+    ton_network = Ton_client.TonClient.Testnet;
     ton_api_key = None;
 
     vault_address;
     policy_factory_address;
 
-    db_config = Database.default_config;
+    db_config = Database.Database.default_config;
 
     vault_sync_interval_seconds = 300.0;  (* 5 minutes *)
     event_poll_interval_seconds = 10.0;   (* 10 seconds *)
@@ -57,7 +52,7 @@ module IntegrationDaemon = struct
   (** Daemon state *)
   type daemon_state = {
     config: daemon_config;
-    db_pool: (Caqti_lwt.connection Caqti_lwt.Pool.t, [> Caqti_error.t]) result;
+    db_pool: ((Caqti_lwt.connection, Caqti_error.t) Caqti_lwt_unix.Pool.t, Caqti_error.t) Result.t;
     started_at: float;
     vault_syncs_completed: int ref;
     events_processed: int ref;
@@ -67,13 +62,14 @@ module IntegrationDaemon = struct
   (** Initialize daemon *)
   let initialize (config: daemon_config) : daemon_state Lwt.t =
     (* Create database pool *)
-    let db_pool = Database.create_pool config.db_config in
+    let db_pool = Database.Database.create_pool config.db_config in
 
     (* Initialize database schema *)
     let%lwt () = match db_pool with
       | Ok pool ->
-          let%lwt _ = Database.with_connection (Ok pool) (fun db ->
-            Database.initialize_schema db
+          let%lwt _result = Database.Database.with_connection (Ok pool) (fun db ->
+            let%lwt () = Database.Database.initialize_schema db in
+            Lwt.return (Ok ())
           ) in
           Lwt.return_unit
       | Error e ->
@@ -88,7 +84,7 @@ module IntegrationDaemon = struct
     Lwt.return {
       config;
       db_pool;
-      started_at = Unix.time ();
+      started_at = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
       vault_syncs_completed = ref 0;
       events_processed = ref 0;
       errors = ref 0;
@@ -97,45 +93,49 @@ module IntegrationDaemon = struct
   (** Run vault synchronization *)
   let run_vault_sync (state: daemon_state) : unit Lwt.t =
     let ton_config = {
-      Integration.Ton_client.TonClient.network = state.config.ton_network;
+      Ton_client.TonClient.network = state.config.ton_network;
       api_key = state.config.ton_api_key;
       timeout_seconds = 30;
     } in
 
     let sync_config = {
-      VaultSync.ton_config;
+      Vault_sync.VaultSync.ton_config;
       vault_address = state.config.vault_address;
       sync_interval_seconds = state.config.vault_sync_interval_seconds;
       drift_threshold_percent = state.config.capital_drift_threshold_pct;
     } in
 
     (* Start continuous vault sync loop *)
-    VaultSync.start_sync_loop sync_config
+    Vault_sync.VaultSync.start_sync_loop sync_config
 
   (** Run policy event subscription *)
   let run_policy_subscription (state: daemon_state) : unit Lwt.t =
     let ton_config = {
-      Integration.Ton_client.TonClient.network = state.config.ton_network;
+      Ton_client.TonClient.network = state.config.ton_network;
       api_key = state.config.ton_api_key;
       timeout_seconds = 30;
     } in
 
     let subscriber_config = {
-      PolicyEventSubscriber.ton_config;
+      Policy_event_subscriber.PolicyEventSubscriber.ton_config;
       policy_factory_address = state.config.policy_factory_address;
       poll_interval_seconds = state.config.event_poll_interval_seconds;
       db_pool = state.db_pool;
     } in
 
     (* Start continuous event subscription *)
-    PolicyEventSubscriber.start_subscription subscriber_config
+    Policy_event_subscriber.PolicyEventSubscriber.start_subscription subscriber_config
 
   (** Health check loop *)
   let health_check_loop (state: daemon_state) : unit Lwt.t =
     let rec loop () =
       let%lwt () = Lwt_unix.sleep 300.0 in (* Every 5 minutes *)
 
-      let uptime = Unix.time () -. state.started_at in
+      let current_time = Time_float.now ()
+        |> Time_float.to_span_since_epoch
+        |> Time_float.Span.to_sec
+      in
+      let uptime = current_time -. state.started_at in
       let uptime_hours = uptime /. 3600.0 in
 
       let%lwt () = Lwt_io.printlf "\n╔════════════════════════════════════════╗" in
@@ -165,7 +165,7 @@ module IntegrationDaemon = struct
     let%lwt () = Lwt_io.printlf "╚════════════════════════════════════════╝\n" in
     let%lwt () = Lwt_io.printlf "Network: %s"
       (match config.ton_network with
-       | Integration.Ton_client.TonClient.Mainnet -> "Mainnet"
+       | Ton_client.TonClient.Mainnet -> "Mainnet"
        | Testnet -> "Testnet"
        | Custom url -> Printf.sprintf "Custom (%s)" url)
     in
@@ -251,13 +251,13 @@ let () =
 
   (* Build configuration *)
   let ton_network = match String.lowercase !network with
-    | "mainnet" -> Integration.Ton_client.TonClient.Mainnet
-    | "testnet" -> Integration.Ton_client.TonClient.Testnet
+    | "mainnet" -> Ton_client.TonClient.Mainnet
+    | "testnet" -> Ton_client.TonClient.Testnet
     | url -> Custom url
   in
 
   let db_config = {
-    Integration.Database.Database.host = !db_host;
+    Database.Database.host = !db_host;
     port = !db_port;
     database = !db_name;
     user = !db_user;

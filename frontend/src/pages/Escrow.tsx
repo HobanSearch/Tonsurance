@@ -164,10 +164,10 @@ export const Escrow = () => {
 
     escrow.release_conditions.forEach(condition => {
       if (condition.type === 'oracle' && condition.verified) met++;
-      else if (condition.type === 'time_elapsed' && Date.now() >= condition.start_time + condition.seconds * 1000) met++;
+      else if (condition.type === 'time_elapsed' && condition.start_time && condition.seconds && Date.now() >= condition.start_time + condition.seconds * 1000) met++;
       else if (condition.type === 'manual_approval' && condition.approved) met++;
       else if (condition.type === 'chain_event' && condition.occurred) met++;
-      else if (condition.type === 'multisig' && condition.signatures_received.length >= condition.required_signatures) met++;
+      else if (condition.type === 'multisig' && condition.signatures_received && condition.required_signatures && condition.signatures_received.length >= condition.required_signatures) met++;
     });
 
     return { met, total };
@@ -256,12 +256,12 @@ export const Escrow = () => {
     setEscrows(escrows.map(e => {
       if (e.escrow_id === escrowId) {
         const updatedConditions = e.release_conditions.map(c => {
-          if (c.type === 'multisig' && c.signers.includes(userAddress)) {
-            const hasAlreadySigned = c.signatures_received.some(([addr]) => addr === userAddress);
+          if (c.type === 'multisig' && c.signers && c.signers.includes(userAddress)) {
+            const hasAlreadySigned = c.signatures_received && c.signatures_received.some(([addr]) => addr === userAddress);
             if (!hasAlreadySigned) {
               return {
                 ...c,
-                signatures_received: [...c.signatures_received, [userAddress, signature] as [string, string]]
+                signatures_received: [...(c.signatures_received || []), [userAddress, signature] as [string, string]]
               };
             }
           }
@@ -293,7 +293,7 @@ export const Escrow = () => {
   if (selectedEscrow) {
     return (
       <EscrowDetails
-        escrow={selectedEscrow}
+        escrow={selectedEscrow as any}
         userAddress={userAddress || ''}
         onClose={() => setSelectedEscrow(null)}
         onRelease={handleReleaseEscrow}
@@ -467,7 +467,7 @@ export const Escrow = () => {
                           Escrow #{escrow.escrow_id}
                         </div>
                         <div className="text-xs text-text-tertiary font-mono">
-                          {getEscrowTypeLabel(escrow.escrow_type)}
+                          {getEscrowTypeLabel(escrow.escrow_type as EscrowType)}
                         </div>
                       </div>
                     </div>

@@ -49,6 +49,13 @@ module HttpClient = struct
     | Rate_limited
   [@@deriving sexp]
 
+  let show_http_error = function
+    | Timeout -> "Timeout"
+    | Connection_error msg -> Printf.sprintf "Connection_error(%s)" msg
+    | HTTP_error (code, msg) -> Printf.sprintf "HTTP_error(%d, %s)" code msg
+    | Parse_error msg -> Printf.sprintf "Parse_error(%s)" msg
+    | Rate_limited -> "Rate_limited"
+
   (** Default configuration *)
   let default_config url = {
     url;
@@ -224,6 +231,26 @@ module HttpClient = struct
     let config = {
       url;
       method_ = POST;
+      headers;
+      body = Some body;
+      timeout_seconds = timeout;
+      retry_attempts;
+      retry_delays = [1.0; 2.0; 4.0];
+    } in
+    execute_with_retry ~config
+
+  (** Simple PUT request *)
+  let put
+      ?(headers=[])
+      ?(timeout=10.0)
+      ?(retry_attempts=3)
+      ~(body: string)
+      (url: string)
+    : (response, http_error) Result.t Lwt.t =
+
+    let config = {
+      url;
+      method_ = PUT;
       headers;
       body = Some body;
       timeout_seconds = timeout;

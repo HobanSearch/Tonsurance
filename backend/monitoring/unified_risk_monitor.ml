@@ -17,9 +17,10 @@
 *)
 
 open Core
-open Lwt.Syntax
+open Lwt.Infix
 open Types
 open Math
+open Db
 
 module UnifiedRiskMonitor = struct
 
@@ -265,62 +266,128 @@ module UnifiedRiskMonitor = struct
 
   (** Calculate portfolio VaR using Monte Carlo **)
   let calculate_portfolio_var
-      (pool: (Caqti_lwt.connection Caqti_lwt.Pool.t, [> Caqti_error.t]) result)
+      (pool: (((Caqti_lwt.connection, [> Caqti_error.t]) Caqti_lwt_unix.Pool.t), [> Caqti_error.t]) Result.t)
       (collateral_mgr: Pool.Collateral_manager.CollateralManager.t)
-      ~(confidence_level: float)
-    : (Risk_model.risk_assessment_result, [> Caqti_error.t]) result Lwt.t =
+      ~(_confidence_level: float)
+    : (Risk_model.RiskModel.risk_assessment_result, [> Caqti_error.t]) Result.t Lwt.t =
 
-    let vault_state = {
-      total_capital_usd = collateral_mgr.pool.total_capital_usd;
-      btc_float_sats = collateral_mgr.pool.btc_float_sats;
-      btc_float_value_usd = collateral_mgr.pool.btc_cost_basis_usd;
-      usd_reserves = collateral_mgr.pool.usd_reserves;
-      collateral_positions = [];
+    let vault_state : Monte_carlo_enhanced.MonteCarloEnhanced.vault_state = {
       active_policies = collateral_mgr.pool.active_policies;
-      total_coverage_sold = collateral_mgr.pool.total_coverage_sold;
+      total_capital_usd = collateral_mgr.pool.total_capital_usd;
+      btc_float_value_usd = collateral_mgr.pool.btc_cost_basis_usd;
     } in
 
-    Risk_model.calculate_risk_assessment
+    (* Fetch real-time market conditions for risk-adjusted VaR
+       NOTE: This uses default configurations. In production, these should be
+       loaded from environment variables or config service. *)
+    let%lwt market_conditions =
+      try%lwt
+        let cex_config : Cex_liquidation_client.CEXLiquidationClient.client_config = {
+          binance_api_key = Some "";
+          okx_api_key = Some "";
+          bybit_api_key = Some "";
+          deribit_api_key = Some "";
+          aggregation_window_seconds = 3600;
+          rate_limit_per_minute = 60;
+          timeout_seconds = 10.0;
+        } in
+        let bridge_config : Bridge_health_client.BridgeHealthClient.client_config = {
+          defillama_api_key = None;
+          l2beat_api_url = "https://api.l2beat.com/api/v1";
+          custom_rpc_endpoints = [];
+          rate_limit_per_minute = 60;
+          timeout_seconds = 10.0;
+          cache_ttl_seconds = 300;
+        } in
+        let chain_config : Chain_metrics_client.ChainMetricsClient.client_config = {
+          etherscan_api_key = "";
+          arbiscan_api_key = "";
+          basescan_api_key = "";
+          polygonscan_api_key = "";
+          solana_rpc_url = "https://api.mainnet-beta.solana.com";
+          ton_api_url = "https://toncenter.com/api/v2";
+          ton_api_key = None;
+          rate_limit_per_minute = 60;
+          timeout_seconds = 10.0;
+        } in
+
+        (* Fetch market risk multipliers for primary bridge and chain *)
+        let%lwt multipliers = Market_data_risk_integration.MarketDataRiskIntegration.fetch_market_risk_multipliers
+          ~cex_config
+          ~bridge_config
+          ~chain_config
+          ~bridge_id:Wormhole  (* Primary bridge *)
+          ~chain:Ethereum  (* Primary chain *)
+          ~assets:["BTC"; "ETH"]  (* Primary assets *)
+        in
+        Lwt.return multipliers
+      with exn ->
+        (* On error, use conservative defaults (no multipliers) *)
+        let%lwt () = Logs_lwt.warn (fun m ->
+          m "[RiskMonitor] Failed to fetch market conditions: %s. Using defaults."
+            (Exn.to_string exn)
+        ) in
+        let default_multipliers : Market_data_risk_integration.MarketDataRiskIntegration.market_risk_multipliers = {
+          bridge_multiplier = 1.0;
+          chain_multiplier = 1.0;
+          market_stress_multiplier = 1.0;
+          combined_multiplier = 1.0;
+          timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
+          bridge_health_score = None;
+          chain_congestion_score = None;
+          market_stress_level = Normal;
+        } in
+        Lwt.return default_multipliers
+    in
+
+    Risk_model.RiskModel.calculate_risk_assessment
       ~db_pool:pool
       ~vault:vault_state
-      ~market_conditions:{ (* TODO: Pass real market conditions *)
-        bridge_multiplier = 1.0;
-        chain_multiplier = 1.0;
-        market_stress_multiplier = 1.0;
-        combined_multiplier = 1.0;
-        timestamp = 0.0;
-        bridge_health_score = None;
-        chain_congestion_score = None;
-        market_stress_level = Normal;
-      }
+      ~market_conditions
 
   (** Run stress tests **)
   let run_stress_tests
-      (db_pool: (Caqti_lwt.connection Caqti_lwt.Pool.t, [> Caqti_error.t]) result)
+      (db_pool: Connection_pool.ConnectionPool.t)
       (collateral_mgr: Pool.Collateral_manager.CollateralManager.t)
     : ((string * float) list * float) Lwt.t =
 
     let pool = collateral_mgr.pool in
 
-    let vault_state = {
+    let vault_state : Monte_carlo_enhanced.MonteCarloEnhanced.vault_state = {
+      active_policies = pool.active_policies;
       total_capital_usd = pool.total_capital_usd;
-      btc_float_sats = pool.btc_float_sats;
       btc_float_value_usd = Math.usd_to_cents (
         Math.sats_to_btc pool.btc_float_sats *. 50000.0 (* Approximate BTC price *)
       );
-      usd_reserves = pool.usd_reserves;
-      collateral_positions = [];
-      active_policies = pool.active_policies;
-      total_coverage_sold = pool.total_coverage_sold;
     } in
 
-    let%lwt results = MonteCarloEnhanced.run_stress_test_suite db_pool ~vault:vault_state in
+    (* Create a Caqti pool for monte_carlo (legacy API requirement)
+       TODO: Refactor monte_carlo to accept Connection_pool directly *)
+    let db_uri = db_pool.db_uri in
+    let%lwt caqti_pool_result = Connection_pool.ConnectionPool.create_caqti_pool db_uri in
 
-    match results with
-    | Ok stress_results ->
-        Lwt.return (stress_results.scenarios, stress_results.worst_loss)
-    | Error _ ->
-        Lwt.return ([], 0.0) (* TODO: Handle error *)
+    match caqti_pool_result with
+    | Error e ->
+        let%lwt () = Logs_lwt.err (fun m ->
+          m "[RiskMonitor] Failed to create Caqti pool for stress tests: %s"
+            (Caqti_error.show e)
+        ) in
+        Lwt.return ([], 0.0)  (* Return empty on pool creation failure *)
+
+    | Ok caqti_pool ->
+        let%lwt results = Monte_carlo_enhanced.MonteCarloEnhanced.run_stress_test_suite
+          (Ok caqti_pool)
+          ~vault:vault_state
+        in
+
+        match results with
+        | Ok stress_results ->
+            Lwt.return (stress_results.scenarios, stress_results.worst_loss)
+        | Error err ->
+            let%lwt () = Logs_lwt.err (fun m ->
+              m "[RiskMonitor] Stress test failed: %s" (Caqti_error.show err)
+            ) in
+            Lwt.return ([], 0.0)
 
   (** Check risk limits and generate alerts **)
   let check_risk_limits
@@ -333,7 +400,7 @@ module UnifiedRiskMonitor = struct
     let warnings = ref [] in
 
     (* Check LTV *)
-    if snapshot.ltv >= thresholds.ltv_critical then
+    if Float.(snapshot.ltv >= thresholds.ltv_critical) then
       breaches := {
         alert_type = LTV_Breach;
         severity = `Critical;
@@ -341,9 +408,9 @@ module UnifiedRiskMonitor = struct
           (snapshot.ltv *. 100.0) (thresholds.ltv_critical *. 100.0);
         current_value = snapshot.ltv;
         limit_value = thresholds.ltv_critical;
-        alert_timestamp = Unix.time ();
+        alert_timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
       } :: !breaches
-    else if snapshot.ltv >= thresholds.ltv_warning then
+    else if Float.(snapshot.ltv >= thresholds.ltv_warning) then
       warnings := {
         alert_type = LTV_Breach;
         severity = `High;
@@ -351,11 +418,11 @@ module UnifiedRiskMonitor = struct
           (snapshot.ltv *. 100.0) (thresholds.ltv_warning *. 100.0);
         current_value = snapshot.ltv;
         limit_value = thresholds.ltv_warning;
-        alert_timestamp = Unix.time ();
+        alert_timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
       } :: !warnings;
 
     (* Check reserves *)
-    if snapshot.reserve_ratio <= thresholds.reserve_critical then
+    if Float.(snapshot.reserve_ratio <= thresholds.reserve_critical) then
       breaches := {
         alert_type = Reserve_Low;
         severity = `Critical;
@@ -363,9 +430,9 @@ module UnifiedRiskMonitor = struct
           (snapshot.reserve_ratio *. 100.0) (thresholds.reserve_critical *. 100.0);
         current_value = snapshot.reserve_ratio;
         limit_value = thresholds.reserve_critical;
-        alert_timestamp = Unix.time ();
+        alert_timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
       } :: !breaches
-    else if snapshot.reserve_ratio <= thresholds.reserve_warning then
+    else if Float.(snapshot.reserve_ratio <= thresholds.reserve_warning) then
       warnings := {
         alert_type = Reserve_Low;
         severity = `High;
@@ -373,11 +440,11 @@ module UnifiedRiskMonitor = struct
           (snapshot.reserve_ratio *. 100.0) (thresholds.reserve_warning *. 100.0);
         current_value = snapshot.reserve_ratio;
         limit_value = thresholds.reserve_warning;
-        alert_timestamp = Unix.time ();
+        alert_timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
       } :: !warnings;
 
     (* Check concentration *)
-    if snapshot.max_concentration >= thresholds.concentration_critical then
+    if Float.(snapshot.max_concentration >= thresholds.concentration_critical) then
       breaches := {
         alert_type = Concentration_High;
         severity = `Critical;
@@ -385,9 +452,9 @@ module UnifiedRiskMonitor = struct
           (snapshot.max_concentration *. 100.0) (thresholds.concentration_critical *. 100.0);
         current_value = snapshot.max_concentration;
         limit_value = thresholds.concentration_critical;
-        alert_timestamp = Unix.time ();
+        alert_timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
       } :: !breaches
-    else if snapshot.max_concentration >= thresholds.concentration_warning then
+    else if Float.(snapshot.max_concentration >= thresholds.concentration_warning) then
       warnings := {
         alert_type = Concentration_High;
         severity = `Medium;
@@ -395,14 +462,14 @@ module UnifiedRiskMonitor = struct
           (snapshot.max_concentration *. 100.0) (thresholds.concentration_warning *. 100.0);
         current_value = snapshot.max_concentration;
         limit_value = thresholds.concentration_warning;
-        alert_timestamp = Unix.time ();
+        alert_timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
       } :: !warnings;
 
     (!breaches, !warnings)
 
   (** Calculate comprehensive risk snapshot **)
   let calculate_risk_snapshot
-      (db_pool: (Caqti_lwt.connection Caqti_lwt.Pool.t, [> Caqti_error.t]) result)
+      (db_pool: Connection_pool.ConnectionPool.t)
       (collateral_mgr: Pool.Collateral_manager.CollateralManager.t)
       ~(config: monitor_config)
       ~(price_history_opt: (asset * float list) list option)
@@ -410,14 +477,23 @@ module UnifiedRiskMonitor = struct
 
     let pool = collateral_mgr.pool in
 
+    (* Create Caqti pool for VaR calculation (legacy API) *)
+    let%lwt caqti_pool_result = Connection_pool.ConnectionPool.create_caqti_pool db_pool.db_uri in
+
     (* Calculate VaR *)
-    let%lwt var_result = calculate_portfolio_var db_pool collateral_mgr
-      ~confidence_level:0.95
+    let%lwt var_result = calculate_portfolio_var caqti_pool_result collateral_mgr
+      ~_confidence_level:0.95
     in
 
     let (var_95, var_99, cvar_95, expected_loss) = match var_result with
       | Ok res -> (res.var_95, res.var_99, res.cvar_95, res.expected_loss)
-      | Error _ -> (0.0, 0.0, 0.0, 0.0) (* TODO: Handle error *)
+      | Error err ->
+          (* Log critical error - VaR calculation is essential for risk assessment *)
+          Logs.err (fun m ->
+            m "[RiskMonitor] CRITICAL: VaR calculation failed: %s. Using NaN for risk metrics!"
+              (Caqti_error.show err));
+          (* Return NaN to signal invalid data rather than misleading zeros *)
+          (Float.nan, Float.nan, Float.nan, Float.nan)
     in
 
     (* Run stress tests *)
@@ -471,8 +547,18 @@ module UnifiedRiskMonitor = struct
         total_duration /. Float.of_int total_policies /. 86400.0 (* Convert to days *)
     in
 
+    (* Calculate utilization by product type *)
+    let utilization_by_product =
+      List.fold pool.active_policies ~init:[] ~f:(fun acc policy ->
+        let product_name = coverage_type_to_string policy.coverage_type in
+        let coverage_usd = cents_to_usd policy.coverage_amount in
+        let current = List.Assoc.find acc product_name ~equal:String.equal |> Option.value ~default:0.0 in
+        List.Assoc.add acc product_name (current +. coverage_usd) ~equal:String.equal
+      )
+    in
+
     let snapshot = {
-      timestamp = Unix.time ();
+      timestamp = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
       var_95;
       var_99;
       cvar_95;
@@ -481,14 +567,19 @@ module UnifiedRiskMonitor = struct
       stress_test_results = stress_results;
       ltv;
       reserve_ratio;
-      utilization_by_product = []; (* TODO: Group by product type *)
+      utilization_by_product;
       asset_concentrations;
+      chain_concentrations = [];  (* TODO: Implement chain-specific concentrations *)
       max_concentration;
       correlated_exposure;
+      cross_chain_bridge_exposure = 0.0;  (* TODO: Calculate bridge risk exposure *)
+      exposure_by_product = [];  (* TODO: Implement 560-product exposure tracking *)
+      top_10_products = [];  (* TODO: Calculate top products by exposure *)
       correlation_matrix;
       correlation_regime;
       total_policies;
       policies_by_asset;
+      policies_by_chain = [];  (* TODO: Implement chain-specific policy counts *)
       policies_by_product = [];
       avg_policy_duration = avg_duration;
       breach_alerts = [];
@@ -511,7 +602,7 @@ module UnifiedRiskMonitor = struct
 
     (* Adjust for LTV *)
     let ltv_multiplier =
-      if snapshot.ltv > 0.70 then 1.0 +. ((snapshot.ltv -. 0.70) *. 2.0) (* 2x increase per 10% LTV *)
+      if Float.(snapshot.ltv > 0.70) then 1.0 +. ((snapshot.ltv -. 0.70) *. 2.0) (* 2x increase per 10% LTV *)
       else 1.0
     in
 
@@ -522,7 +613,7 @@ module UnifiedRiskMonitor = struct
         |> Option.value ~default:0.0
       in
 
-      if asset_conc > 0.25 then 1.0 +. ((asset_conc -. 0.25) *. 4.0) (* 4x increase per 10% over limit *)
+      if Float.(asset_conc > 0.25) then 1.0 +. ((asset_conc -. 0.25) *. 4.0) (* 4x increase per 10% over limit *)
       else 1.0
     in
 
@@ -535,7 +626,7 @@ module UnifiedRiskMonitor = struct
 
     (* Adjust for reserves *)
     let reserve_multiplier =
-      if snapshot.reserve_ratio < 0.20 then 1.0 +. ((0.20 -. snapshot.reserve_ratio) *. 5.0)
+      if Float.(snapshot.reserve_ratio < 0.20) then 1.0 +. ((0.20 -. snapshot.reserve_ratio) *. 5.0)
       else 1.0
     in
 
@@ -543,7 +634,7 @@ module UnifiedRiskMonitor = struct
 
   (** Main monitoring loop **)
   let monitor_loop
-      ~(db_pool: (Caqti_lwt.connection Caqti_lwt.Pool.t, [> Caqti_error.t]) result)
+      ~(db_pool: Connection_pool.ConnectionPool.t)
       ~(collateral_manager: Pool.Collateral_manager.CollateralManager.t ref)
       ~(config: monitor_config)
       ~(price_history_provider: unit -> (asset * float list) list option Lwt.t)
@@ -552,8 +643,8 @@ module UnifiedRiskMonitor = struct
     let rec loop () =
       let%lwt () =
         try%lwt
-          Lwt_io.printlf "\n[%s] Running risk surveillance..."
-            (Time.to_string (Time.now ())) >>= fun () ->
+          let now_sec = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
+          Lwt_io.printlf "\n[%.0f] Running risk surveillance..." now_sec >>= fun () ->
 
           (* Get price history *)
           let%lwt price_history_opt = price_history_provider () in

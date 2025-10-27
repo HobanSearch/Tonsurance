@@ -65,6 +65,17 @@ module CEXLiquidationClient = struct
     timeout_seconds: float;
   } [@@deriving sexp]
 
+  (** Default configuration *)
+  let default_config : client_config = {
+    binance_api_key = None;
+    bybit_api_key = None;
+    okx_api_key = None;
+    deribit_api_key = None;
+    aggregation_window_seconds = 300; (* 5 minutes *)
+    rate_limit_per_minute = 60;
+    timeout_seconds = 10.0;
+  }
+
   (** Binance liquidation fetcher *)
   module Binance = struct
 

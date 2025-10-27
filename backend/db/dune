@@ -1,7 +1,7 @@
 (library
  (name db)
  (public_name tonsurance.db)
- (modules connection_pool escrow_db transaction_db claims_db risk_db)
+ (modules connection_pool escrow_db transaction_db claims_db risk_db bridge_db hedge_persistence)
  (libraries
    core
    lwt

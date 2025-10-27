@@ -207,7 +207,7 @@ export async function run(provider: NetworkProvider) {
     if (!isMainnet) {
         console.log('Step 6: Seeding tranches with initial capital...');
 
-        const seedCapital = toNano('1000'); // 1000 TON per tranche
+        const seedCapital = toNano('3'); // 3 TON per tranche (18 TON total for 6 tranches)
 
         for (const tranche of TRANCHE_CONFIGS) {
             console.log(`  Depositing ${seedCapital} to ${tranche.symbol}...`);
@@ -255,7 +255,7 @@ export async function run(provider: NetworkProvider) {
         console.log(`      Token: ${registeredToken.toString()}`);
         console.log(`      APY: ${info.apyMin}bp - ${info.apyMax}bp`);
         console.log(`      Allocation: ${info.allocationPercent}%`);
-        console.log(`      Capital: ${info.capital} (${isMainnet ? '0 expected' : '1000 TON expected'})`);
+        console.log(`      Capital: ${info.capital} (${isMainnet ? '0 expected' : '3 TON expected'})`);
 
         if (!registeredToken.equals(tokenAddresses[tranche.id])) {
             throw new Error(`Token address mismatch for ${tranche.symbol}!`);

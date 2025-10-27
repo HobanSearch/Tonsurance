@@ -86,3 +86,104 @@ This document lists the remaining implementation tasks required to get the Tonsu
 - [ ] **Remove Obsolete Contracts**: The contracts in `contracts_old`, as well as `PrimaryVault.fc`, `SecondaryVault.fc`, and `SimplePremiumDistributor.fc`, should be removed to avoid confusion.
 - [ ] **`contracts/hedged/*.fc`**: The hedged coverage contracts should either be fully integrated with the main system or moved to a separate feature branch until they are ready.
 - [ ] **`contracts/token.fc`**: Remove this empty file.
+
+### Phase 4: Cross-Chain Bridge Integration (2025-10-27)
+
+**Status:** ✅ Core infrastructure complete (database, API, WebSocket)
+
+#### Completed
+- [x] **Database Persistence for Bridge Transactions**
+  - **Files:** `backend/db/bridge_db.ml`, `backend/db/bridge_transactions_schema.sql`
+  - **Status:** Schema and OCaml module complete with 10 database functions (mock implementations ready for production)
+  - **Tables:** bridge_transactions, bridge_routes, bridge_health_snapshots, bridge_fees_history
+
+- [x] **REST API Endpoints for Bridge Operations**
+  - **File:** `backend/api/bridge_api.ml`
+  - **Status:** 6 endpoints implemented and building successfully
+  - **Endpoints:**
+    - POST /api/bridge/routes/discover - Find optimal routes
+    - POST /api/bridge/execute - Initiate bridge transfers
+    - GET /api/bridge/status/:id - Transaction status
+    - GET /api/bridge/transactions/:address - User history
+    - GET /api/bridge/health - Provider health monitoring
+    - POST /api/bridge/fees/estimate - Fee estimation
+
+- [x] **WebSocket Real-Time Bridge Updates**
+  - **File:** `backend/api/websocket_v2.ml`
+  - **Status:** Added `bridge_transactions` channel with 5-second polling
+  - **Feature:** Broadcasts transaction status changes to subscribed clients
+
+#### Remaining Phase 4 Tasks
+
+- [ ] **Frontend Bridge UI Integration**
+  - **Directory:** `frontend/src/components/`
+  - **Task:** Create React components for bridge route selection, transaction initiation, and status monitoring
+  - **Integration:** Connect to REST API endpoints and WebSocket channel
+
+- [ ] **Replace Rubic API Stubs with Real Credentials**
+  - **File:** `backend/integration/rubic_bridge_client.ml`
+  - **Task:** Replace mock data with actual Rubic API calls, add API key management via environment variables
+  - **Security:** Store API keys in AWS Secrets Manager or similar
+
+- [ ] **Implement Rate Limiting & Caching for Bridge API**
+  - **Files:** `backend/api/bridge_api.ml`, `backend/integration/redis_client.ml`
+  - **Task:** Add Redis-based caching for route discoveries (5-minute TTL) and rate limiting (10 requests/minute per user)
+
+- [ ] **Production Database Implementation**
+  - **File:** `backend/db/bridge_db.ml`
+  - **Task:** Replace all mock implementations with real Caqti SQL queries, test with PostgreSQL
+
+- [ ] **Bridge Health Monitoring Daemon**
+  - **File:** `backend/daemons/bridge_monitor_daemon.ml`
+  - **Task:** Create standalone daemon to continuously monitor bridge health and update database snapshots
+
+### Backend Infrastructure Review (2025-10-19)
+
+A full review of the OCaml backend (`api/`, `pricing/`, `risk/` directories) was completed. The backend has a solid architectural foundation but is not production-ready due to widespread use of stubs and hardcoded data. The following tasks are required to complete the implementation.
+
+#### Priority 1: Critical (Core Logic & Security)
+
+- [ ] **Implement Dynamic Pricing Model:**
+    - **Files:** `backend/api/api_v2.ml`, `backend/pricing/pricing_engine.ml`
+    - **Task:** All pricing models currently rely on hardcoded values. Replace these with a dynamic pricing engine that sources parameters (base rates, multipliers, adjustments) from a configuration file or database.
+
+- [ ] **Implement Real-Time Risk Factor Sourcing:**
+    - **Files:** `backend/risk/risk_model.ml`, `backend/types/types.ml`
+    - **Task:** The system lacks a mechanism to fetch real-time `stablecoin_risk_factors`. Create the missing `get_risk_factors` function in `risk_model.ml` and implement logic to source this data externally. Remove all hardcoded `risk_factors` structs and defaults. This is critical for all risk-based pricing.
+
+- [ ] **Complete Transactional API & Security:**
+    - **File:** `backend/api/transactional_api.ml`
+    - **Task:** The module is a skeleton. Implement the missing handlers for `file_claim`, `vault_deposit`, and `vault_withdraw`.
+    - **Task:** **CRITICAL:** Replace the mocked quote signing logic with a secure key management and signing solution to fix the security vulnerability.
+
+- [ ] **Implement and Verify Data Integrations:**
+    - **Files:** `backend/integration/*_client.ml`, `backend/risk/market_data_risk_integration.ml`
+    - **Task:** The system relies on external data. Implement and verify the clients for Price Oracles, CEX liquidation data, and bridge/chain health monitors to ensure they fetch real data. The risk simulation also depends on this.
+
+- [ ] **Implement Smart Contract Integration:**
+    - **Files:** `backend/api/api_server.ml`, `backend/api/transactional_api.ml`
+    - **Task:** The logic for deploying and interacting with smart contracts on policy purchase is currently mocked. This needs to be fully implemented.
+
+#### Priority 2: Medium (Robustness & Maintainability)
+
+- [ ] **Populate and Validate Risk Simulation Data:**
+    - **File:** `backend/risk/monte_carlo_enhanced.ml`
+    - **Task:** The Monte Carlo engine is data-dependent. The `stress_scenarios` and `historical_depegs` database tables must be populated with high-quality, realistic data for the risk assessment to be meaningful.
+
+- [ ] **Implement Missing Correlation Modeling:**
+    - **File:** `backend/risk/monte_carlo_enhanced.ml`
+    - **Task:** The documented "multi-asset correlation modeling" is not implemented in the loss calculation logic. This feature should be added to accurately model portfolio risk.
+
+- [ ] **Externalize Hardcoded Configurations:**
+    - **Files:** `backend/risk/market_data_risk_integration.ml`, `backend/pricing/pricing_engine.ml`, `backend/api/api_v2.ml`
+    - **Task:** Move hardcoded values (e.g., risk thresholds, asset pairs to monitor, pricing discounts) into configuration files to allow for dynamic adjustment without requiring code changes.
+
+- [ ] **Consolidate API Versions:**
+    - **Files:** `backend/api/api_server.ml`, `backend/api/api_v2_server.ml`
+    - **Task:** There are two parallel API implementations. Clarify which version is canonical (likely V2) and deprecate/remove the unused legacy code to reduce confusion.
+
+#### Priority 3: Low (Testing & Cleanup)
+
+- [ ] **Enable and Expand Backend Test Coverage:**
+    - **File:** `backend/pricing/pricing_engine.ml`
+    - **Task:** The unit tests in the pricing engine are commented out. Re-enable them and add comprehensive unit and integration tests for all new and completed backend logic.

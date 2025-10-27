@@ -4,7 +4,6 @@
  *)
 
 open Core
-open Lwt.Syntax
 
 (** Conversation state for a user *)
 type conversation = {
@@ -27,8 +26,9 @@ let get_conversation user_id =
   let%bind conv = Hashtbl.find conversations user_id in
 
   (* Check if conversation has timed out *)
-  let age = Unix.time () -. conv.last_updated in
-  if age < conversation_timeout then
+  let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
+  let age = now -. conv.last_updated in
+  if Float.(age < conversation_timeout) then
     Some conv.messages
   else (
     (* Clear expired conversation *)
@@ -55,14 +55,14 @@ let update_conversation user_id user_message assistant_response =
   (* Add new messages (most recent first) *)
   let updated_messages =
     (assistant_msg :: user_msg :: existing_messages)
-    |> List.take ~n:max_history_messages
+    |> (fun lst -> List.take lst max_history_messages)
   in
 
   (* Store updated conversation *)
   let conv = {
     user_id;
     messages = updated_messages;
-    last_updated = Unix.time ();
+    last_updated = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
   } in
   Hashtbl.set conversations ~key:user_id ~data:conv;
   Lwt.return_unit
@@ -75,7 +75,9 @@ let clear_conversation user_id =
 (** Get conversation age in seconds *)
 let get_conversation_age user_id =
   match Hashtbl.find conversations user_id with
-  | Some conv -> Some (Unix.time () -. conv.last_updated)
+  | Some conv ->
+      let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
+      Some (now -. conv.last_updated)
   | None -> None
 
 (** Check if user has active conversation *)
@@ -99,9 +101,9 @@ let get_stats () =
 
 (** Clean up expired conversations (call periodically) *)
 let cleanup_expired () =
-  let now = Unix.time () in
+  let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
   let to_remove = Hashtbl.fold conversations ~init:[] ~f:(fun ~key:user_id ~data:conv acc ->
-    if now -. conv.last_updated > conversation_timeout then
+    if Float.(now -. conv.last_updated > conversation_timeout) then
       user_id :: acc
     else
       acc
@@ -153,7 +155,7 @@ module RedisStore = struct
 
         let updated_messages =
           (assistant_msg :: user_msg :: existing_messages)
-          |> List.take ~n:max_history_messages
+          |> (fun lst -> List.take lst max_history_messages)
         in
 
         let conv = {

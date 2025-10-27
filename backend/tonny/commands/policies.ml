@@ -8,12 +8,25 @@ open Lwt.Syntax
 
 let command_name = "policies"
 
+(** Policy display format returned from database *)
+type policy_display = {
+  policy_id: int64;
+  coverage_type: Types.coverage_type;
+  amount: float;
+  duration_days: int;
+  status: string;
+  expiry_date: string;
+  expiry_timestamp: float;
+  premium: float;
+} [@@deriving sexp]
+
 (** Format coverage type *)
 let format_coverage_type = function
   | Types.Depeg -> "💵 Stablecoin Depeg"
   | Types.Smart_contract -> "⚠️ Smart Contract"
   | Types.Oracle -> "🔮 Oracle Failure"
   | Types.Bridge -> "🌉 Bridge Risk"
+  | Types.CEX_liquidation -> "💱 CEX Liquidation"
 
 (** Format policy status *)
 let format_status = function
@@ -23,9 +36,9 @@ let format_status = function
   | _ -> "❓ Unknown"
 
 (** Format single policy *)
-let format_policy policy =
+let format_policy (policy : policy_display) =
   sprintf
-    {|**Policy #%s**
+    {|**Policy #%Ld**
 Coverage: %s
 Amount: $%.2f
 Duration: %d days
@@ -33,7 +46,7 @@ Status: %s
 Expires: %s
 Premium Paid: $%.2f
 |}
-    policy.id
+    policy.policy_id
     (format_coverage_type policy.coverage_type)
     policy.amount
     policy.duration_days
@@ -43,7 +56,7 @@ Premium Paid: $%.2f
 
 (** Calculate days until expiry *)
 let days_until_expiry expiry_timestamp =
-  let now = Unix.time () in
+  let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
   let diff = expiry_timestamp -. now in
   Int.of_float (diff /. 86400.0)
 
@@ -110,7 +123,7 @@ Claimed: %d
         List.filter_map active ~f:(fun policy ->
           let days_left = days_until_expiry policy.expiry_timestamp in
           if days_left <= 7 then
-            Some (sprintf "⚠️ Policy #%s expires in %d days!" policy.id days_left)
+            Some (sprintf "⚠️ Policy #%Ld expires in %d days!" policy.policy_id days_left)
           else None
         )
       in

@@ -1,8 +1,9 @@
 (library
  (name risk_model)
  (public_name tonsurance.risk_model)
+ (wrapped false)
  (libraries core types math integration monte_carlo_enhanced lwt lwt.unix logs logs.lwt)
- (modules risk_model market_data_risk_integration)
+ (modules market_data_risk_integration risk_model)
  (preprocess (pps lwt_ppx ppx_sexp_conv ppx_deriving_yojson)))
 
 (library

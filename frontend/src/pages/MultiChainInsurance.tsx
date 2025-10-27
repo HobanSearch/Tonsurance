@@ -369,13 +369,11 @@ export const MultiChainInsurance = () => {
       {/* Beneficiary Selection */}
       <TerminalWindow title="BENEFICIARY">
         <BeneficiarySelector
-          mode={beneficiaryMode}
-          onModeChange={setBeneficiaryMode}
-          beneficiaryAddress={beneficiaryAddress}
-          onBeneficiaryChange={setBeneficiaryAddress}
-          giftMessage={giftMessage}
-          onGiftMessageChange={setGiftMessage}
-          userAddress={userAddress}
+          onSelect={(beneficiaryAddress, mode) => {
+            setBeneficiaryMode(mode);
+            setBeneficiaryAddress(beneficiaryAddress);
+          }}
+          initialMode={beneficiaryMode}
         />
       </TerminalWindow>
 

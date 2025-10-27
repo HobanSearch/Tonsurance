@@ -26,16 +26,18 @@ type client_state = {
 (** Server state *)
 type websocket_server_state = {
   mutable clients: client_state list;
-  mutable bridge_states: Bridge_monitor.bridge_health list;
-  mutable last_risk_snapshot: Unified_risk_monitor.UnifiedRiskMonitor.risk_snapshot option;
-  collateral_manager: Collateral_manager.CollateralManager.t ref;
+  mutable bridge_states: Monitoring.Bridge_monitor.bridge_health list;
+  mutable last_risk_snapshot: Monitoring.Unified_risk_monitor.UnifiedRiskMonitor.risk_snapshot option;
+  collateral_manager: Pool.Collateral_manager.CollateralManager.t ref;
+  db_pool: Db.Connection_pool.ConnectionPool.t;  (* Added for risk calculations *)
 }
 
 (** Generate unique client ID *)
 let generate_client_id () =
+  let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
   Printf.sprintf "client_%s_%f"
-    (Digest.string (string_of_float (Unix.time ())) |> Digest.to_hex |> String.prefix 8)
-    (Unix.time ())
+    (Digestif.SHA256.(digest_string (string_of_float now) |> to_hex) |> String.sub ~pos:0 ~len:8)
+    now
 
 (** Parse subscription message *)
 let parse_subscribe_message msg =
@@ -51,7 +53,7 @@ let parse_subscribe_message msg =
 (** Validate channel name *)
 let is_valid_channel channel =
   List.mem ~equal:String.equal
-    ["bridge_health"; "risk_alerts"; "top_products"; "tranche_apy"]
+    ["bridge_health"; "risk_alerts"; "top_products"; "tranche_apy"; "bridge_transactions"]
     channel
 
 (** Broadcast message to all clients subscribed to channel *)
@@ -80,7 +82,7 @@ let handle_client_message state client msg =
       let error_msg = `Assoc [
         ("type", `String "error");
         ("message", `String err);
-        ("timestamp", `Float (Unix.time ()));
+        ("timestamp", `Float (Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec));
       ] in
       Dream.send client.websocket (Yojson.Safe.to_string error_msg)
 
@@ -100,7 +102,7 @@ let handle_client_message state client msg =
         let confirm_msg = `Assoc [
           ("type", `String "subscribed");
           ("channel", `String channel);
-          ("timestamp", `Float (Unix.time ()));
+          ("timestamp", `Float (Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec));
         ] in
         Dream.send client.websocket (Yojson.Safe.to_string confirm_msg)
       ) else (
@@ -113,7 +115,7 @@ let handle_client_message state client msg =
             `String "top_products";
             `String "tranche_apy";
           ]);
-          ("timestamp", `Float (Unix.time ()));
+          ("timestamp", `Float (Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec));
         ] in
         Dream.send client.websocket (Yojson.Safe.to_string error_msg)
       )
@@ -134,7 +136,7 @@ let handle_client_message state client msg =
       let confirm_msg = `Assoc [
         ("type", `String "unsubscribed");
         ("channel", `String channel);
-        ("timestamp", `Float (Unix.time ()));
+        ("timestamp", `Float (Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec));
       ] in
       Dream.send client.websocket (Yojson.Safe.to_string confirm_msg)
 
@@ -142,13 +144,13 @@ let handle_client_message state client msg =
       (* Update last ping time *)
       List.iter state.clients ~f:(fun c ->
         if String.equal c.client_id client.client_id then
-          c.last_ping <- Unix.time ()
+          c.last_ping <- Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec
       );
 
       (* Send pong *)
       let pong_msg = `Assoc [
         ("type", `String "pong");
-        ("timestamp", `Float (Unix.time ()));
+        ("timestamp", `Float (Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec));
       ] in
       Dream.send client.websocket (Yojson.Safe.to_string pong_msg)
 
@@ -156,7 +158,7 @@ let handle_client_message state client msg =
       let error_msg = `Assoc [
         ("type", `String "error");
         ("message", `String (Printf.sprintf "Unknown action: %s" action));
-        ("timestamp", `Float (Unix.time ()));
+        ("timestamp", `Float (Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec));
       ] in
       Dream.send client.websocket (Yojson.Safe.to_string error_msg)
 
@@ -167,8 +169,8 @@ let websocket_handler state websocket =
     client_id;
     websocket;
     subscribed_channels = [];
-    connected_at = Unix.time ();
-    last_ping = Unix.time ();
+    connected_at = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
+    last_ping = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
   } in
 
   (* Add client to state *)
@@ -184,7 +186,7 @@ let websocket_handler state websocket =
       `String "top_products";
       `String "tranche_apy";
     ]);
-    ("timestamp", `Float (Unix.time ()));
+    ("timestamp", `Float (Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec));
   ] in
 
   let* () = Dream.send websocket (Yojson.Safe.to_string welcome_msg) in
@@ -218,7 +220,7 @@ let bridge_health_broadcaster state =
     let* () = Lwt_unix.sleep 60.0 in
 
     (* Monitor all bridges *)
-    let* new_states = Bridge_monitor.monitor_all_bridges ~previous_states:prev_states in
+    let* new_states = Monitoring.Bridge_monitor.monitor_all_bridges ~previous_states:prev_states in
     state.bridge_states <- new_states;
 
     (* Detect changes and broadcast *)
@@ -232,7 +234,7 @@ let bridge_health_broadcaster state =
       | None -> () (* New bridge, skip *)
       | Some (_, prev) ->
           (* Check for health score changes *)
-          if Float.abs (bridge.health_score -. prev.health_score) > 0.05 then (
+          if Float.(abs (bridge.health_score -. prev.health_score) > 0.05) then (
             let msg = `Assoc [
               ("channel", `String "bridge_health");
               ("type", `String "health_change");
@@ -240,7 +242,7 @@ let bridge_health_broadcaster state =
               ("previous_score", `Float prev.health_score);
               ("current_score", `Float bridge.health_score);
               ("exploit_detected", `Bool bridge.exploit_detected);
-              ("timestamp", `Float (Unix.time ()));
+              ("timestamp", `Float (Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec));
             ] in
 
             Lwt.async (fun () -> broadcast_to_channel state "bridge_health" msg)
@@ -248,7 +250,7 @@ let bridge_health_broadcaster state =
 
           (* Broadcast new critical alerts *)
           List.iter bridge.alerts ~f:(fun alert ->
-            if not alert.resolved && Poly.equal alert.severity Bridge_monitor.Critical then (
+            if not alert.resolved && Poly.equal alert.severity Monitoring.Bridge_monitor.Critical then (
               let msg = `Assoc [
                 ("channel", `String "bridge_health");
                 ("type", `String "critical_alert");
@@ -276,22 +278,23 @@ let risk_alerts_broadcaster state =
     let* () = Lwt_unix.sleep 60.0 in
 
     (* Calculate new risk snapshot *)
-    let new_snapshot = Unified_risk_monitor.UnifiedRiskMonitor.calculate_risk_snapshot
+    let%lwt new_snapshot = Monitoring.Unified_risk_monitor.UnifiedRiskMonitor.calculate_risk_snapshot
+      state.db_pool
       !(state.collateral_manager)
-      ~config:Unified_risk_monitor.UnifiedRiskMonitor.default_config
+      ~config:Monitoring.Unified_risk_monitor.UnifiedRiskMonitor.default_config
       ~price_history_opt:None
     in
 
     state.last_risk_snapshot <- Some new_snapshot;
 
     (* Broadcast critical alerts *)
-    List.iter new_snapshot.breach_alerts ~f:(fun alert ->
+    List.iter new_snapshot.breach_alerts ~f:(fun (alert : Monitoring.Unified_risk_monitor.UnifiedRiskMonitor.risk_alert) ->
       (* Check if this is a new alert *)
       let is_new = match prev_snapshot with
         | None -> true
-        | Some prev ->
+        | Some (prev : Monitoring.Unified_risk_monitor.UnifiedRiskMonitor.risk_snapshot) ->
             not (List.exists prev.breach_alerts ~f:(fun prev_alert ->
-              Float.abs (prev_alert.timestamp -. alert.timestamp) < 10.0 &&
+              Float.(abs (prev_alert.alert_timestamp - alert.alert_timestamp) < 10.0) &&
               String.equal prev_alert.message alert.message
             ))
       in
@@ -305,7 +308,7 @@ let risk_alerts_broadcaster state =
         in
 
         let alert_type_str = match alert.alert_type with
-          | Unified_risk_monitor.UnifiedRiskMonitor.LTV_Breach -> "LTV_Breach"
+          | Monitoring.Unified_risk_monitor.UnifiedRiskMonitor.LTV_Breach -> "LTV_Breach"
           | Reserve_Low -> "Reserve_Low"
           | Concentration_High -> "Concentration_High"
           | Correlation_Spike -> "Correlation_Spike"
@@ -321,7 +324,7 @@ let risk_alerts_broadcaster state =
           ("message", `String alert.message);
           ("current_value", `Float alert.current_value);
           ("limit_value", `Float alert.limit_value);
-          ("timestamp", `Float alert.timestamp);
+          ("timestamp", `Float alert.alert_timestamp);
         ] in
 
         Lwt.async (fun () -> broadcast_to_channel state "risk_alerts" msg)
@@ -349,9 +352,7 @@ let top_products_broadcaster state =
           | Some prev ->
               not (List.equal
                 (fun (k1, _, _) (k2, _, _) ->
-                  String.equal k1.coverage_type k2.coverage_type &&
-                  Poly.equal k1.chain k2.chain &&
-                  Poly.equal k1.stablecoin k2.stablecoin
+                  Poly.equal k1 k2
                 )
                 current_top10
                 prev
@@ -373,7 +374,7 @@ let top_products_broadcaster state =
             ("channel", `String "top_products");
             ("type", `String "ranking_update");
             ("products", `List top10_json);
-            ("timestamp", `Float (Unix.time ()));
+            ("timestamp", `Float (Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec));
           ] in
 
           let* () = broadcast_to_channel state "top_products" msg in
@@ -390,11 +391,11 @@ let tranche_apy_broadcaster _state =
     let* () = Lwt_unix.sleep 60.0 in
 
     (* Fetch all tranche utilizations *)
-    let* all_utilizations = Pool.UtilizationTracker.get_all_utilizations () in
+    let* all_utilizations = Pool.Utilization_tracker.UtilizationTracker.get_all_utilizations () in
 
     let tranches_json = List.map all_utilizations ~f:(fun util ->
       `Assoc [
-        ("tranche_id", `String (tranche_to_string util.tranche_id));
+        ("tranche_id", `String util.tranche_id);
         ("apy", `Float (util.current_apy *. 100.0));
         ("utilization", `Float util.utilization_ratio);
         ("last_updated", `Float util.last_updated);
@@ -405,7 +406,7 @@ let tranche_apy_broadcaster _state =
       ("channel", `String "tranche_apy");
       ("type", `String "apy_update");
       ("tranches", `List tranches_json);
-      ("timestamp", `Float (Unix.time ()));
+      ("timestamp", `Float (Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec));
     ] in
 
     let* () = broadcast_to_channel _state "tranche_apy" msg in
@@ -414,16 +415,75 @@ let tranche_apy_broadcaster _state =
 
   loop ()
 
-(** Task 5: Heartbeat/ping disconnected clients *)
+(** Task 5: Monitor bridge transactions and broadcast status updates *)
+let bridge_transactions_broadcaster state =
+  let rec loop prev_transactions =
+    let* () = Lwt_unix.sleep 5.0 in (* Check every 5 seconds *)
+
+    (* Get all pending transactions from database *)
+    (* Note: In production, this should be filtered by user subscriptions *)
+    let* all_pending = Db.Bridge_db.BridgeDb.get_pending_transactions
+      ~pool:state.db_pool
+      ~user_address:"" (* Empty means all users - will be filtered in production *)
+    in
+
+    match all_pending with
+    | Error _ -> loop prev_transactions
+    | Ok transactions ->
+        (* Broadcast updates for transactions with status changes *)
+        List.iter transactions ~f:(fun (tx : Db.Bridge_db.BridgeDb.bridge_transaction) ->
+          let tx_id = Option.value_exn tx.id in
+          let prev_tx_opt = List.Assoc.find prev_transactions tx_id ~equal:Int.equal in
+
+          (* Check if status changed or if it's a new transaction *)
+          let should_broadcast = match prev_tx_opt with
+            | None -> true (* New transaction *)
+            | Some (prev_tx : Db.Bridge_db.BridgeDb.bridge_transaction) ->
+                not (String.equal prev_tx.transaction_status tx.transaction_status)
+          in
+
+          if should_broadcast then (
+            let msg = `Assoc [
+              ("channel", `String "bridge_transactions");
+              ("type", `String "status_update");
+              ("transaction_id", `Int tx_id);
+              ("status", `String tx.transaction_status);
+              ("source_chain", `String tx.source_chain);
+              ("dest_chain", `String tx.dest_chain);
+              ("asset", `String tx.asset);
+              ("source_amount", `Float tx.source_amount);
+              ("bridge_provider", `String tx.bridge_provider);
+              ("source_tx_hash", match tx.source_tx_hash with Some h -> `String h | None -> `Null);
+              ("dest_tx_hash", match tx.dest_tx_hash with Some h -> `String h | None -> `Null);
+              ("failure_reason", match tx.failure_reason with Some r -> `String r | None -> `Null);
+              ("started_at", `Float tx.started_at);
+              ("completed_at", match tx.completed_at with Some t -> `Float t | None -> `Null);
+              ("timestamp", `Float (Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec));
+            ] in
+
+            Lwt.async (fun () -> broadcast_to_channel state "bridge_transactions" msg)
+          )
+        );
+
+        (* Update previous transactions map *)
+        let new_map = List.map transactions ~f:(fun tx ->
+          (Option.value_exn tx.id, tx)
+        ) in
+        loop new_map
+  in
+
+  loop []
+
+(** Task 6: Heartbeat/ping disconnected clients *)
 let heartbeat_task state =
   let rec loop () =
     let* () = Lwt_unix.sleep 30.0 in
 
-    let now = Unix.time () in
+    let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
 
     (* Remove stale clients (no ping in 5 minutes) *)
     let active_clients = List.filter state.clients ~f:(fun client ->
-      (now -. client.last_ping) < 300.0
+      Float.((now - client.last_ping) < 300.0)
     ) in
 
     if List.length active_clients < List.length state.clients then (
@@ -441,12 +501,13 @@ let heartbeat_task state =
  * START WEBSOCKET SERVER
  * ========================================
  *)
-let start_websocket_server ~collateral_manager () =
+let start_websocket_server ~collateral_manager ~db_pool () =
   let state = {
     clients = [];
     bridge_states = [];
     last_risk_snapshot = None;
     collateral_manager;
+    db_pool;
   } in
 
   (* Start broadcasting tasks *)
@@ -454,6 +515,7 @@ let start_websocket_server ~collateral_manager () =
   Lwt.async (fun () -> risk_alerts_broadcaster state);
   Lwt.async (fun () -> top_products_broadcaster state);
   Lwt.async (fun () -> tranche_apy_broadcaster state);
+  Lwt.async (fun () -> bridge_transactions_broadcaster state);
   Lwt.async (fun () -> heartbeat_task state);
 
   Printf.printf "\n╔════════════════════════════════════════╗\n";

@@ -10,7 +10,7 @@
   "scripts": {
     "build": "npm run build:backend && npm run build:contracts && npm run build:services && npm run build:frontend",
     "build:backend": "cd backend && dune build",
-    "build:contracts": "npx blueprint build --all",
+    "build:contracts": "./node_modules/.bin/blueprint build --all",
     "build:services": "cd services && npm run build",
     "build:frontend": "cd frontend && npm run build",
     "test": "jest --testPathIgnorePatterns='/node_modules/' --maxWorkers=1",

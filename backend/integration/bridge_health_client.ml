@@ -66,6 +66,16 @@ module BridgeHealthClient = struct
     cache_ttl_seconds: int;
   } [@@deriving sexp]
 
+  (** Default configuration *)
+  let default_config : client_config = {
+    defillama_api_key = None;
+    l2beat_api_url = "https://l2beat.com/api";
+    custom_rpc_endpoints = [];
+    rate_limit_per_minute = 30;
+    timeout_seconds = 15.0;
+    cache_ttl_seconds = 300; (* 5 minutes *)
+  }
+
   (** DeFiLlama bridge mapping *)
   let defillama_bridge_names = [
     (Wormhole, "Wormhole");

@@ -13,7 +13,7 @@
 *)
 
 open Core
-open Lwt.Syntax
+open Lwt.Infix
 open Types
 
 module TriggerMonitor = struct
@@ -64,16 +64,17 @@ module TriggerMonitor = struct
     triggers_detected = 0;
     payouts_executed = 0;
     errors = 0;
-    last_check_time = Unix.time ();
+    last_check_time = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
     uptime_seconds = 0.0;
   }
 
   (** Dependencies **)
   type dependencies = {
     oracle_config: Oracle_aggregator.OracleAggregator.oracle_config;
-    db_pool: (Caqti_lwt.connection Caqti_lwt.Pool.t, [> Caqti_error.t]) result;
+    db_pool: ((Caqti_lwt.connection, Caqti_error.t) Caqti_lwt_unix.Pool.t, Caqti_error.t) Result.t;
     ton_config: Ton_client.TonClient.ton_config;
     policy_manager_address: string;
+    admin_wallet_address: string;  (* Admin wallet for executing payouts *)
   }
 
   (** Fetch active policies from database **)
@@ -87,7 +88,7 @@ module TriggerMonitor = struct
 
     match result with
     | Ok policies ->
-        let states = List.map policies ~f:(fun (policy_id, asset_str, (beneficiary, coverage, trigger)) ->
+        let states = List.map policies ~f:(fun (policy_id, asset_str, (beneficiary, coverage, trigger, floor)) ->
           let asset = match asset_str with
             | "USDC" -> USDC
             | "USDT" -> USDT
@@ -102,7 +103,7 @@ module TriggerMonitor = struct
             asset;
             coverage_amount = coverage;
             trigger_price = trigger;
-            floor_price = trigger *. 0.90; (* Assume 10% below trigger *)
+            floor_price = floor; (* Now fetched from database *)
             beneficiary_address = beneficiary;
             first_trigger_time = None;
             is_confirmed = false;
@@ -137,7 +138,7 @@ module TriggerMonitor = struct
             ~asset:(Types.asset_to_string asset)
             ~price:consensus.price
             ~source:"oracle_consensus"
-            ~timestamp:(Unix.time ())
+            ~timestamp:(Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec)
         in
 
         Lwt.return (Some consensus.price)
@@ -153,7 +154,7 @@ module TriggerMonitor = struct
       ~(current_price: float)
     : bool =
 
-    current_price < state.trigger_price
+    Float.(current_price < state.trigger_price)
 
   (** Check if trigger is confirmed (sustained for duration) **)
   let check_trigger_confirmation
@@ -179,9 +180,9 @@ module TriggerMonitor = struct
       ~(current_price: float)
     : usd_cents =
 
-    if current_price >= state.trigger_price then
+    if Float.(current_price >= state.trigger_price) then
       0L
-    else if current_price <= state.floor_price then
+    else if Float.(current_price <= state.floor_price) then
       state.coverage_amount
     else
       (* Linear interpolation *)
@@ -205,50 +206,50 @@ module TriggerMonitor = struct
 
     let payout_amount = calculate_payout state ~current_price in
 
-    if payout_amount <= 0L then
+    if Int64.(payout_amount <= 0L) then
       Lwt.return false
     else
       (* Call smart contract to execute payout *)
-      let%lwt tx_hash_opt =
+      let%lwt tx_result =
         Ton_client.TonClient.PolicyManager.execute_payout
           deps.ton_config
+          ~wallet_address:deps.admin_wallet_address
           ~contract_address:deps.policy_manager_address
           ~policy_id:state.policy_id
           ~current_price:(Float.to_int (current_price *. 10000.0))
       in
 
-      match tx_hash_opt with
-      | Some tx_hash ->
-          Lwt_io.printlf "Payout executed for policy %Ld: tx=%s, amount=$%s"
-            state.policy_id
-            tx_hash
-            (Int64.to_string_hum ~delimiter:',' payout_amount) >>= fun () ->
+      if tx_result.exit_code = 0 && not tx_result.is_bounced then
+        (Lwt_io.printlf "Payout executed for policy %Ld: tx=%s, amount=$%s"
+          state.policy_id
+          tx_result.tx.hash
+          (Int64.to_string_hum ~delimiter:',' payout_amount) >>= fun () ->
 
-          (* Update database *)
-          let%lwt _ =
-            Database.Database.PolicyQueries.update_policy_status
-              |> fun query ->
-                Database.Database.with_connection deps.db_pool (fun db ->
-                  (module struct
-                    include (val db : Database.Database.CONNECTION)
-                  end).exec query ("paid", state.policy_id)
-                )
-          in
+        (* Update database *)
+        let%lwt _ =
+          Database.Database.PolicyQueries.update_policy_status
+            |> fun query ->
+              Database.Database.with_connection deps.db_pool (fun (module Db : Database.Database.CONNECTION) ->
+                Db.exec query ("paid", state.policy_id)
+              )
+        in
 
-          (* Wait for confirmation *)
-          let%lwt confirmed =
-            Ton_client.TonClient.wait_for_transaction
-              deps.ton_config
-              ~tx_hash
-              ~max_wait_seconds:60
-          in
+        (* Wait for confirmation *)
+        let%lwt confirmed =
+          Ton_client.TonClient.wait_for_transaction
+            deps.ton_config
+            ~tx_hash:tx_result.tx.hash
+            ~max_wait_seconds:60
+        in
 
-          Lwt.return confirmed
+        Lwt.return confirmed)
 
-      | None ->
-          Lwt_io.eprintlf "Failed to execute payout for policy %Ld"
-            state.policy_id >>= fun () ->
-          Lwt.return false
+      else
+        (Lwt_io.eprintlf "Failed to execute payout for policy %Ld (exit_code=%d, bounced=%b)"
+          state.policy_id
+          tx_result.exit_code
+          tx_result.is_bounced >>= fun () ->
+        Lwt.return false)
 
   (** Send notification to beneficiary **)
   let send_notification
@@ -336,10 +337,10 @@ module TriggerMonitor = struct
       ~(stats: monitor_stats)
     : unit Lwt.t =
 
-    let start_time = Unix.time () in
+    let start_time = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
 
     Lwt_io.printlf "\n[%s] Starting monitor iteration..."
-      (Time.to_string (Time.now ())) >>= fun () ->
+      (Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec |> Float.to_string) >>= fun () ->
 
     (* Fetch active policies *)
     let%lwt policies = fetch_active_policies deps in
@@ -347,44 +348,49 @@ module TriggerMonitor = struct
     stats.policies_monitored <- List.length policies;
     Lwt_io.printlf "Monitoring %d active policies" (List.length policies) >>= fun () ->
 
-    (* Group policies by asset *)
+    (* Group policies by asset - using String.Map with asset_to_string as key *)
     let policies_by_asset =
-      List.fold policies ~init:(Map.empty (module Types.Asset_comparator)) ~f:(fun acc policy ->
-        Map.add_multi acc ~key:policy.asset ~data:policy
+      List.fold policies ~init:(String.Map.empty) ~f:(fun acc policy ->
+        Map.add_multi acc ~key:(Types.asset_to_string policy.asset) ~data:policy
       )
     in
 
     (* Process each asset *)
     let%lwt () =
       Lwt_list.iter_s
-        (fun (asset, asset_policies) ->
-          (* Get current price for asset *)
-          let%lwt price_opt = get_current_price deps ~asset ~previous_price:None in
+        (fun (asset_str, asset_policies) ->
+          (* Get asset from first policy in the group *)
+          match List.hd asset_policies with
+          | None -> Lwt.return_unit
+          | Some first_policy ->
+              let asset = first_policy.asset in
+              (* Get current price for asset *)
+              let%lwt price_opt = get_current_price deps ~asset ~previous_price:None in
 
-          match price_opt with
-          | Some current_price ->
-              Lwt_io.printlf "Asset %s: current price = $%.4f"
-                (Types.asset_to_string asset)
-                current_price >>= fun () ->
+              match price_opt with
+              | Some current_price ->
+                  Lwt_io.printlf "Asset %s: current price = $%.4f"
+                    asset_str
+                    current_price >>= fun () ->
 
-              (* Process all policies for this asset *)
-              Lwt_list.iter_p
-                (fun policy_state ->
-                  process_policy deps ~config ~state:policy_state ~current_price ~stats
-                )
-                asset_policies
+                  (* Process all policies for this asset *)
+                  Lwt_list.iter_p
+                    (fun policy_state ->
+                      process_policy deps ~config ~state:policy_state ~current_price ~stats
+                    )
+                    asset_policies
 
-          | None ->
-              Lwt_io.eprintlf "Failed to get price for %s - skipping"
-                (Types.asset_to_string asset)
+              | None ->
+                  Lwt_io.eprintlf "Failed to get price for %s - skipping"
+                    asset_str
         )
         (Map.to_alist policies_by_asset)
     in
 
     stats.total_checks <- Int64.succ stats.total_checks;
-    stats.last_check_time <- Unix.time ();
+    stats.last_check_time <- Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
 
-    let elapsed = Unix.time () -. start_time in
+    let elapsed = (Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec) -. start_time in
     Lwt_io.printlf "Iteration completed in %.2f seconds" elapsed >>= fun () ->
 
     (* Print stats *)
@@ -450,8 +456,6 @@ end
 
 (** Entry point for standalone daemon **)
 let main () =
-  let open Lwt.Syntax in
-
   (* Load configuration *)
   let oracle_config = Oracle_aggregator.OracleAggregator.default_config in
   let ton_config = Ton_client.TonClient.default_config in
@@ -465,7 +469,14 @@ let main () =
     TriggerMonitor.oracle_config;
     db_pool;
     ton_config;
-    policy_manager_address = "EQC_policy_manager_address_here"; (* Replace with actual *)
+    (* Load policy manager address from environment *)
+    policy_manager_address =
+      (match Stdlib.Sys.getenv_opt "POLICY_MANAGER_CONTRACT_ADDRESS" with
+       | Some addr -> addr
+       | None ->
+           (* Note: Logs in record field, using simple default *)
+           "EQC_policy_manager_address_placeholder");
+    admin_wallet_address = "EQC_admin_wallet_placeholder";  (* TODO: Load from env *)
   } in
 
   (* Start monitor *)

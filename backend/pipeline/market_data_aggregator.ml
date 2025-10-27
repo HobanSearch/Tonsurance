@@ -16,8 +16,8 @@
  *)
 
 open Core
-open Lwt.Syntax
 open Types
+
 
 module MarketDataAggregator = struct
   (** Aggregated market data snapshot *)
@@ -75,6 +75,7 @@ module MarketDataAggregator = struct
     { failures = 0; last_failure_time = None; state = `Closed }
 
   let check_circuit ~breaker ~threshold =
+    let _ = threshold in
     match breaker.state with
     | `Open ->
         (* Check if we should transition to half-open *)
@@ -97,14 +98,7 @@ module MarketDataAggregator = struct
 
   (** Redis cache operations *)
   module RedisCache = struct
-    type redis_client = {
-      host: string;
-      port: int;
-      password: string option;
-    }
-
-    let create_client ~config =
-      { host = config.redis_host; port = config.redis_port; password = config.redis_password }
+    (* Production Redis integration using redis-lwt *)
 
     let cache_key_prefix = "market_data"
 
@@ -123,36 +117,103 @@ module MarketDataAggregator = struct
     let snapshot_key () =
       Printf.sprintf "%s:snapshot:latest" cache_key_prefix
 
-    (* Simplified Redis operations - in production would use redis-lwt library *)
+    (** Get value from Redis *)
     let get_cached ~key : string option Lwt.t =
       try%lwt
-        (* In production: Redis.get key *)
-        let%lwt () = Logs_lwt.debug (fun m -> m "Redis GET: %s" key) in
-        Lwt.return None (* Placeholder *)
-      with _ -> Lwt.return None
+        let%lwt () = Logs_lwt.debug (fun m -> m "[RedisCache] GET: %s" key) in
+        Redis_client.GlobalRedis.get key
+      with exn ->
+        let%lwt () = Logs_lwt.warn (fun m ->
+          m "[RedisCache] GET failed for %s: %s" key (Exn.to_string exn)
+        ) in
+        Lwt.return None
 
+    (** Set value in Redis with TTL *)
     let set_cached ~key ~value ~ttl_seconds : unit Lwt.t =
       try%lwt
-        (* In production: Redis.setex key ttl_seconds value *)
         let%lwt () = Logs_lwt.debug (fun m ->
-          m "Redis SET: %s (TTL: %ds)" key ttl_seconds
+          m "[RedisCache] SET: %s (TTL: %ds)" key ttl_seconds
+        ) in
+        let%lwt result = Redis_client.GlobalRedis.setex key ttl_seconds value in
+        match result with
+        | Ok () -> Lwt.return ()
+        | Error e ->
+            let%lwt () = Logs_lwt.warn (fun m ->
+              m "[RedisCache] SET failed for %s: %s" key e
+            ) in
+            Lwt.return ()
+      with exn ->
+        let%lwt () = Logs_lwt.warn (fun m ->
+          m "[RedisCache] SET exception for %s: %s" key (Exn.to_string exn)
         ) in
         Lwt.return ()
-      with _ -> Lwt.return ()
 
+    (** Get aggregated market data from cache *)
     let get_aggregated_data ~config : aggregated_data option Lwt.t =
+      let _ = config in
       let%lwt cached = get_cached ~key:(snapshot_key ()) in
       match cached with
       | Some json_str ->
           (try
             let json = Yojson.Safe.from_string json_str in
-            Lwt.return (Some (aggregated_data_of_yojson json |> Result.ok_or_failwith))
+            match aggregated_data_of_yojson json with
+            | Ok data ->
+                let%lwt () = Logs_lwt.debug (fun m ->
+                  m "[RedisCache] Cache HIT for aggregated data"
+                ) in
+                Lwt.return (Some data)
+            | Error e ->
+                let%lwt () = Logs_lwt.warn (fun m ->
+                  m "[RedisCache] Failed to deserialize cached data: %s" e
+                ) in
+                Lwt.return None
+           with exn ->
+              let%lwt () = Logs_lwt.warn (fun m ->
+                m "[RedisCache] Exception deserializing data: %s" (Exn.to_string exn)
+              ) in
+              Lwt.return None)
+      | None ->
+          let%lwt () = Logs_lwt.debug (fun m ->
+            m "[RedisCache] Cache MISS for aggregated data"
+          ) in
+          Lwt.return None
+
+    (** Set aggregated market data to cache *)
+    let set_aggregated_data ~config ~data : unit Lwt.t =
+      try%lwt
+        let json = aggregated_data_to_yojson data |> Yojson.Safe.to_string in
+        let%lwt () = set_cached ~key:(snapshot_key ()) ~value:json ~ttl_seconds:config.cache_ttl_seconds in
+        let%lwt () = Logs_lwt.debug (fun m ->
+          m "[RedisCache] Cached aggregated data (TTL: %ds)" config.cache_ttl_seconds
+        ) in
+        Lwt.return ()
+      with exn ->
+        let%lwt () = Logs_lwt.err (fun m ->
+          m "[RedisCache] Failed to cache aggregated data: %s" (Exn.to_string exn)
+        ) in
+        Lwt.return ()
+
+    (** Cache individual stablecoin price *)
+    let cache_stablecoin_price ~ttl_seconds (id: string) (price: float) (confidence: float) : unit Lwt.t =
+      let key = stablecoin_key id in
+      let value = Printf.sprintf "%.6f,%.2f" price confidence in
+      set_cached ~key ~value ~ttl_seconds
+
+    (** Get cached stablecoin price *)
+    let get_stablecoin_price (id: string) : (float * float) option Lwt.t =
+      let%lwt cached = get_cached ~key:(stablecoin_key id) in
+      match cached with
+      | Some value_str ->
+          (try
+            match String.split value_str ~on:',' with
+            | [price_str; conf_str] ->
+                let price = Float.of_string price_str in
+                let confidence = Float.of_string conf_str in
+                Lwt.return (Some (price, confidence))
+            | _ -> Lwt.return None
            with _ -> Lwt.return None)
       | None -> Lwt.return None
 
-    let set_aggregated_data ~config ~data : unit Lwt.t =
-      let json = aggregated_data_to_yojson data |> Yojson.Safe.to_string in
-      set_cached ~key:(snapshot_key ()) ~value:json ~ttl_seconds:config.cache_ttl_seconds
   end
 
   (** Data validation *)
@@ -212,10 +273,16 @@ module MarketDataAggregator = struct
   (** TimescaleDB persistence *)
   module TimescaleDB = struct
 
+    (* FIXME: This entire module is a stub. A production implementation requires connecting
+       to the TimescaleDB instance and replacing the logging statements below with actual
+       database insertion logic, likely using the Caqti library and the main
+       application's database connection pool. *)
+
     let insert_stablecoin_prices
         ~(conn_string: string)
         ~(prices: (string * float * float) list)
       : unit Lwt.t =
+      let _ = conn_string in
 
       try%lwt
         let%lwt () = Logs_lwt.info (fun m ->
@@ -245,6 +312,7 @@ module MarketDataAggregator = struct
         ~(conn_string: string)
         ~(bridges: (string * float * float) list)
       : unit Lwt.t =
+      let _ = conn_string in
 
       try%lwt
         let%lwt () = Logs_lwt.info (fun m ->
@@ -259,6 +327,7 @@ module MarketDataAggregator = struct
         ~(conn_string: string)
         ~(aggregate: liquidation_aggregate)
       : unit Lwt.t =
+      let _ = conn_string in
 
       try%lwt
         let%lwt () = Logs_lwt.info (fun m ->
@@ -274,6 +343,7 @@ module MarketDataAggregator = struct
         ~(conn_string: string)
         ~(metrics: (string * chain_congestion) list)
       : unit Lwt.t =
+      let _ = conn_string in
 
       try%lwt
         let%lwt () = Logs_lwt.info (fun m ->
@@ -313,7 +383,7 @@ module MarketDataAggregator = struct
   (** Aggregate stablecoin prices from ChainlinkClient *)
   let aggregate_stablecoin_prices
       ~(config: aggregator_config)
-      ~(chainlink_config: Integration.Chainlink_client.ChainlinkClient.client_config)
+      ~(chainlink_config: Chainlink_client.ChainlinkClient.client_config)
       ~(circuit_breaker: circuit_state)
     : (string * float * float) list Lwt.t =
 
@@ -323,11 +393,11 @@ module MarketDataAggregator = struct
       try%lwt
         let%lwt () = Logs_lwt.info (fun m -> m "Aggregating stablecoin prices...") in
 
-        let%lwt prices = Integration.Chainlink_client.ChainlinkClient.fetch_all_prices ~config:chainlink_config in
+        let%lwt prices = Chainlink_client.ChainlinkClient.fetch_all_prices ~config:chainlink_config in
 
         (* Convert to simplified format *)
         let result = List.map prices ~f:(fun price_data ->
-          let open Integration.Chainlink_client.ChainlinkClient in
+          let open Chainlink_client.ChainlinkClient in
           (asset_to_string price_data.asset, price_data.price, price_data.confidence)
         ) in
 
@@ -344,7 +414,7 @@ module MarketDataAggregator = struct
   (** Aggregate bridge health from BridgeHealthClient *)
   let aggregate_bridge_health
       ~(config: aggregator_config)
-      ~(bridge_config: Integration.Bridge_health_client.BridgeHealthClient.client_config)
+      ~(bridge_config: Bridge_health_client.BridgeHealthClient.client_config)
       ~(circuit_breaker: circuit_state)
     : (string * float * float) list Lwt.t =
 
@@ -354,11 +424,11 @@ module MarketDataAggregator = struct
       try%lwt
         let%lwt () = Logs_lwt.info (fun m -> m "Aggregating bridge health metrics...") in
 
-        let%lwt metrics = Integration.Bridge_health_client.BridgeHealthClient.fetch_all_bridge_metrics ~config:bridge_config in
+        let%lwt metrics = Bridge_health_client.BridgeHealthClient.fetch_all_bridge_metrics ~config:bridge_config in
 
         (* Convert to simplified format *)
         let result = List.map metrics ~f:(fun m ->
-          let open Integration.Bridge_health_client.BridgeHealthClient in
+          let open Bridge_health_client.BridgeHealthClient in
           let tvl_float = Int64.to_float m.tvl_usd /. 100.0 in
           (bridge_id_to_string m.bridge_id, m.health_score, tvl_float)
         ) in
@@ -376,7 +446,7 @@ module MarketDataAggregator = struct
   (** Aggregate CEX liquidations from CEXLiquidationClient *)
   let aggregate_cex_liquidations
       ~(config: aggregator_config)
-      ~(cex_config: Integration.Cex_liquidation_client.CEXLiquidationClient.client_config)
+      ~(cex_config: Cex_liquidation_client.CEXLiquidationClient.client_config)
       ~(circuit_breaker: circuit_state)
     : liquidation_aggregate Lwt.t =
 
@@ -394,18 +464,18 @@ module MarketDataAggregator = struct
         let%lwt () = Logs_lwt.info (fun m -> m "Aggregating CEX liquidations...") in
 
         let assets = ["BTC"; "ETH"; "SOL"; "TON"] in
-        let%lwt metrics = Integration.Cex_liquidation_client.CEXLiquidationClient.fetch_all_metrics ~config:cex_config ~assets in
+        let%lwt metrics = Cex_liquidation_client.CEXLiquidationClient.fetch_all_metrics ~config:cex_config ~assets in
 
         (* Calculate total liquidations *)
         let total = List.fold metrics ~init:0L ~f:(fun acc m ->
-          let open Integration.Cex_liquidation_client.CEXLiquidationClient in
+          let open Cex_liquidation_client.CEXLiquidationClient in
           Int64.(acc + m.total_liquidated_usd)
         ) in
 
         (* Aggregate by exchange *)
         let by_exchange =
           List.fold metrics ~init:[] ~f:(fun acc m ->
-            let open Integration.Cex_liquidation_client.CEXLiquidationClient in
+            let open Cex_liquidation_client.CEXLiquidationClient in
             let exch_name = exchange_to_string m.exchange in
             match List.Assoc.find acc exch_name ~equal:String.equal with
             | Some existing -> List.Assoc.add acc exch_name Int64.(existing + m.total_liquidated_usd) ~equal:String.equal
@@ -416,14 +486,14 @@ module MarketDataAggregator = struct
         (* Aggregate by asset *)
         let by_asset =
           List.fold metrics ~init:[] ~f:(fun acc m ->
-            let open Integration.Cex_liquidation_client.CEXLiquidationClient in
+            let open Cex_liquidation_client.CEXLiquidationClient in
             match List.Assoc.find acc m.asset ~equal:String.equal with
             | Some existing -> List.Assoc.add acc m.asset Int64.(existing + m.total_liquidated_usd) ~equal:String.equal
             | None -> (m.asset, m.total_liquidated_usd) :: acc
           )
         in
 
-        let stress_level = Integration.Cex_liquidation_client.CEXLiquidationClient.calculate_market_stress metrics in
+        let stress_level = Cex_liquidation_client.CEXLiquidationClient.calculate_market_stress metrics in
 
         record_success circuit_breaker;
         Lwt.return {
@@ -443,7 +513,7 @@ module MarketDataAggregator = struct
   (** Aggregate chain metrics from ChainMetricsClient *)
   let aggregate_chain_metrics
       ~(config: aggregator_config)
-      ~(chain_config: Integration.Chain_metrics_client.ChainMetricsClient.client_config)
+      ~(chain_config: Chain_metrics_client.ChainMetricsClient.client_config)
       ~(circuit_breaker: circuit_state)
     : (string * chain_congestion) list Lwt.t =
 
@@ -453,11 +523,11 @@ module MarketDataAggregator = struct
       try%lwt
         let%lwt () = Logs_lwt.info (fun m -> m "Aggregating chain metrics...") in
 
-        let%lwt metrics = Integration.Chain_metrics_client.ChainMetricsClient.fetch_all_chain_metrics ~config:chain_config in
+        let%lwt metrics = Chain_metrics_client.ChainMetricsClient.fetch_all_chain_metrics ~config:chain_config in
 
         (* Convert to simplified format *)
         let result = List.map metrics ~f:(fun m ->
-          let open Integration.Chain_metrics_client.ChainMetricsClient in
+          let open Chain_metrics_client.ChainMetricsClient in
           let congestion = {
             congestion_score = m.congestion_score;
             gas_price_gwei = m.avg_gas_price_gwei;
@@ -480,10 +550,10 @@ module MarketDataAggregator = struct
   (** Main aggregation function *)
   let aggregate_all_data
       ~(config: aggregator_config)
-      ~(chainlink_config: Integration.Chainlink_client.ChainlinkClient.client_config)
-      ~(bridge_config: Integration.Bridge_health_client.BridgeHealthClient.client_config)
-      ~(cex_config: Integration.Cex_liquidation_client.CEXLiquidationClient.client_config)
-      ~(chain_config: Integration.Chain_metrics_client.ChainMetricsClient.client_config)
+      ~(chainlink_config: Chainlink_client.ChainlinkClient.client_config)
+      ~(bridge_config: Bridge_health_client.BridgeHealthClient.client_config)
+      ~(cex_config: Cex_liquidation_client.CEXLiquidationClient.client_config)
+      ~(chain_config: Chain_metrics_client.ChainMetricsClient.client_config)
       ~(historical_prices: (string * float list) list)
     : aggregated_data Lwt.t =
 
@@ -578,18 +648,20 @@ module MarketDataAggregator = struct
 
   (** Get specific data from cache *)
   let get_from_cache ~config ~key : string option Lwt.t =
+    let _ = config in
     RedisCache.get_cached ~key
 
   let set_cache ~config ~key ~value ~ttl_seconds : unit Lwt.t =
+    let _ = config in
     RedisCache.set_cached ~key ~value ~ttl_seconds
 
   (** Continuous monitoring loop *)
   let start_aggregation_monitor
       ~(config: aggregator_config)
-      ~(chainlink_config: Integration.Chainlink_client.ChainlinkClient.client_config)
-      ~(bridge_config: Integration.Bridge_health_client.BridgeHealthClient.client_config)
-      ~(cex_config: Integration.Cex_liquidation_client.CEXLiquidationClient.client_config)
-      ~(chain_config: Integration.Chain_metrics_client.ChainMetricsClient.client_config)
+      ~(chainlink_config: Chainlink_client.ChainlinkClient.client_config)
+      ~(bridge_config: Bridge_health_client.BridgeHealthClient.client_config)
+      ~(cex_config: Cex_liquidation_client.CEXLiquidationClient.client_config)
+      ~(chain_config: Chain_metrics_client.ChainMetricsClient.client_config)
       ~(update_interval_seconds: float)
       ~(on_data: aggregated_data -> unit Lwt.t)
     : unit Lwt.t =

@@ -12,6 +12,8 @@ import { Home } from './pages/Home';
 import { MultiChainInsurance } from './pages/MultiChainInsurance';
 import { EnterpriseBulk } from './pages/EnterpriseBulk';
 import { Escrow } from './pages/Escrow';
+import { AdminDashboard } from './pages/AdminDashboard';
+import { AdminRoute, useIsAdmin } from './components/AdminRoute';
 
 const manifestUrl = 'https://tonsurance.io/tonconnect-manifest.json';
 
@@ -21,6 +23,7 @@ function Navigation() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [coverageDropdownOpen, setCoverageDropdownOpen] = useState(false);
   const [mobileCoverageOpen, setMobileCoverageOpen] = useState(false);
+  const isAdmin = useIsAdmin();
 
   const isCoveragePage = ['/policy', '/multi-chain', '/enterprise', '/hedged'].includes(location.pathname);
 
@@ -148,6 +151,19 @@ function Navigation() {
             >
               &gt; RISK
             </Link>
+            {isAdmin && (
+              <Link
+                to="/admin"
+                onClick={() => setCoverageDropdownOpen(false)}
+                className={`px-3 py-1 border-2 transition-colors ${
+                  isActive('/admin')
+                    ? 'bg-copper-500 text-cream-50 border-copper-600'
+                    : 'border-cream-400 hover:bg-cream-200 text-text-primary'
+                }`}
+              >
+                &gt; ADMIN
+              </Link>
+            )}
           </div>
 
           {/* Wallet button - always visible */}
@@ -310,6 +326,7 @@ function App() {
               <Route path="/analytics" element={<Analytics />} />
               <Route path="/risk" element={<RiskDashboard />} />
               <Route path="/escrow" element={<Escrow />} />
+              <Route path="/admin" element={<AdminRoute><AdminDashboard /></AdminRoute>} />
             </Routes>
           </main>
         </div>

@@ -292,7 +292,7 @@ let create_alert
 let check_staleness
     ~(config: monitoring_config)
     ~(asset: asset)
-    ~(price_data: Integration.Oracle_aggregator.OracleAggregator.consensus_price)
+    ~(price_data: Oracle_aggregator.OracleAggregator.consensus_price)
   : alert option =
 
   let now_ts = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
@@ -307,7 +307,7 @@ let check_staleness
 (** Check for price divergence *)
 let check_divergence
     ~(config: monitoring_config)
-    ~(price_data: Integration.Oracle_aggregator.OracleAggregator.consensus_price)
+    ~(price_data: Oracle_aggregator.OracleAggregator.consensus_price)
   : alert option =
 
   if price_data.num_sources < 2 then
@@ -329,7 +329,7 @@ let check_divergence
 (** Check for low confidence *)
 let check_confidence
     ~(config: monitoring_config)
-    ~(price_data: Integration.Oracle_aggregator.OracleAggregator.consensus_price)
+    ~(price_data: Oracle_aggregator.OracleAggregator.consensus_price)
   : alert option =
 
   Metrics.update_confidence price_data.asset price_data.confidence;
@@ -345,7 +345,7 @@ let monitor_asset
     ~(asset: asset)
   : alert list Lwt.t =
 
-  let%lwt consensus_opt = Integration.Oracle_aggregator.OracleAggregator.get_consensus_price
+  let%lwt consensus_opt = Oracle_aggregator.OracleAggregator.get_consensus_price
     asset ~previous_price:None
   in
 
@@ -358,7 +358,7 @@ let monitor_asset
       (* Update metrics *)
       List.iter consensus.sources ~f:(fun source ->
         let provider_name = match source.provider with
-          | Integration.Oracle_aggregator.OracleAggregator.Chainlink -> "chainlink"
+          | Oracle_aggregator.OracleAggregator.Chainlink -> "chainlink"
           | Pyth -> "pyth"
           | Binance -> "binance"
           | RedStone -> "redstone"

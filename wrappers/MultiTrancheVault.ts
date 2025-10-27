@@ -21,6 +21,17 @@ export type MultiTrancheVaultConfig = {
 };
 
 export function multiTrancheVaultConfigToCell(config: MultiTrancheVaultConfig): Cell {
+    // Store extended data in separate cell to avoid 1023 bit cell limit
+    const extData = beginCell()
+        .storeBit(config.reentrancyGuard)
+        .storeUint(config.seqNo, 32)
+        .storeUint(config.circuitBreakerWindowStart, 32)
+        .storeCoins(config.circuitBreakerLosses)
+        .storeDict(undefined)  // pendingTxs - empty dict initially
+        .storeDict(undefined)  // trancheLocks - empty dict initially
+        .storeBit(config.testMode)
+        .endCell();
+
     return beginCell()
         .storeAddress(config.ownerAddress)
         .storeCoins(config.totalCapital)
@@ -28,17 +39,11 @@ export function multiTrancheVaultConfigToCell(config: MultiTrancheVaultConfig): 
         .storeCoins(config.accumulatedPremiums)
         .storeCoins(config.accumulatedLosses)
         .storeRef(config.trancheData)
-        .storeDict(config.depositorBalances)
+        .storeDict(undefined)  // depositorBalances - empty dict initially
         .storeBit(config.paused)
         .storeAddress(config.adminAddress)
         .storeAddress(config.claimsProcessorAddress)
-        .storeBit(config.reentrancyGuard)
-        .storeUint(config.seqNo, 32)
-        .storeUint(config.circuitBreakerWindowStart, 32)
-        .storeCoins(config.circuitBreakerLosses)
-        .storeDict(config.pendingTxs)
-        .storeDict(config.trancheLocks)
-        .storeBit(config.testMode)
+        .storeRef(extData)
         .endCell();
 }
 
@@ -221,14 +226,14 @@ export class MultiTrancheVault implements Contract {
         });
     }
 
-    async sendWithdraw(provider: ContractProvider, via: Sender, opts: { value: bigint; trancheId: number; tokenAmount: bigint }) {
+    async sendWithdraw(provider: ContractProvider, via: Sender, opts: { value: bigint; trancheId: number; amount: bigint }) {
         await provider.internal(via, {
             value: opts.value,
             sendMode: SendMode.PAY_GAS_SEPARATELY,
             body: beginCell()
                 .storeUint(0x02, 32) // OP_WITHDRAW
                 .storeUint(opts.trancheId, 8)
-                .storeCoins(opts.tokenAmount)
+                .storeCoins(opts.amount)
                 .endCell(),
         });
     }

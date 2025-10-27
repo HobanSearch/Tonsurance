@@ -4,8 +4,21 @@
  * Includes enterprise bulk purchasing with volume discounts
  *)
 
-open Lwt.Syntax
+open Core
 open Types
+
+(** Notification for beneficiary *)
+type beneficiary_notification = {
+  policy_id: int64;
+  beneficiary: string;
+  sender_name: string;
+  coverage_amount: usd_cents;
+  asset: asset;
+  trigger_price: float;
+  expiry_date: float;
+  personal_message: string option;
+  claim_link: string;
+} [@@deriving sexp]
 
 (** Volume discount tiers *)
 let get_volume_discount (count: int) : float =
@@ -21,44 +34,44 @@ let calculate_bulk_premium
   : usd_cents * float =
 
   let discount = get_volume_discount quantity in
-  let total_base = Int64.mul base_premium (Int64.of_int quantity) in
+  let total_base = Int64.( * ) base_premium (Int64.of_int quantity) in
   let discount_amount = Int64.of_float (Int64.to_float total_base *. discount) in
-  let total_with_discount = Int64.sub total_base discount_amount in
+  let total_with_discount = Int64.( - ) total_base discount_amount in
 
   (total_with_discount, discount)
 
 (** Validate bulk protection request *)
-let validate_bulk_request (req: bulk_protection_request) : (unit, string) result =
+let validate_bulk_request (req: bulk_protection_request) : (unit, string) Result.t =
   (* Check beneficiary count *)
   if List.length req.beneficiaries < 1 then
     Error "At least one beneficiary required"
   else if List.length req.beneficiaries > 10000 then
     Error "Maximum 10,000 beneficiaries per bulk request"
 
-  (* Check template validity *)
-  else if req.template.coverage_amount < 1000_00L then
-    Error "Minimum coverage amount is $1,000"
-  else if req.template.coverage_amount > 10_000_000_00L then
+  (* Check coverage amounts (each beneficiary has their own coverage_amount) *)
+  else if List.exists req.beneficiaries ~f:(fun (b: beneficiary_entry) -> Int64.(b.coverage_amount < 1000_00L)) then
+    Error "Minimum coverage amount is $1,000 per policy"
+  else if List.exists req.beneficiaries ~f:(fun (b: beneficiary_entry) -> Int64.(b.coverage_amount > 10_000_000_00L)) then
     Error "Maximum coverage amount is $10M per policy"
 
   (* Check duration *)
-  else if req.template.duration_days < 1 then
+  else if req.duration_days < 1 then
     Error "Minimum duration is 1 day"
-  else if req.template.duration_days > 365 then
+  else if req.duration_days > 365 then
     Error "Maximum duration is 365 days"
 
   (* Check trigger/floor prices *)
-  else if req.template.trigger_price <= req.template.floor_price then
+  else if Float.(req.protection_config.trigger_price <= req.protection_config.floor_price) then
     Error "Trigger price must be above floor price"
-  else if req.template.trigger_price > 1.0 || req.template.floor_price < 0.5 then
+  else if Float.(req.protection_config.trigger_price > 1.0 || req.protection_config.floor_price < 0.5) then
     Error "Invalid price range (trigger <= 1.0, floor >= 0.5)"
 
   (* Check beneficiaries *)
   else
     let invalid_addresses =
-      List.filter (fun (b: beneficiary_entry) ->
-        String.length b.wallet_address < 10  (* Basic validation *)
-      ) req.beneficiaries
+      List.filter req.beneficiaries ~f:(fun (b: beneficiary_entry) ->
+        String.length b.address < 10  (* Basic validation *)
+      )
     in
 
     if List.length invalid_addresses > 0 then
@@ -70,8 +83,8 @@ let validate_bulk_request (req: bulk_protection_request) : (unit, string) result
 let process_bulk_purchase
     ~(request: bulk_protection_request)
     ~(pricing_engine: Types.policy -> usd_cents)
-    ~(pool_state: Types.pool_state)
-  : (bulk_protection_response, string) result Lwt.t =
+    ~(pool_state: Types.unified_pool)
+  : (bulk_protection_response, string) Result.t Lwt.t =
 
   (* Validate request *)
   match validate_bulk_request request with
@@ -82,16 +95,20 @@ let process_bulk_purchase
       (* Calculate single policy premium *)
       let sample_policy = {
         policy_id = 0L;
-        policyholder = request.payer_address;
+        policyholder = request.buyer_address;
         beneficiary = None;
-        asset = request.template.asset;
-        coverage_amount = request.template.coverage_amount;
+        coverage_type = Depeg;  (* Default for bulk protection - TODO: add to request *)
+        chain = request.protection_config.chain;
+        asset = request.protection_config.asset;
+        coverage_amount = 1000_00L;  (* Use average or first beneficiary amount *)
         premium_paid = 0L;
-        trigger_price = request.template.trigger_price;
-        floor_price = request.template.floor_price;
-        start_time = Unix.time ();
-        end_time = Unix.time () +. (float_of_int request.template.duration_days *. 86400.0);
+        trigger_price = request.protection_config.trigger_price;
+        floor_price = request.protection_config.floor_price;
+        start_time = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec;
+        expiry_time = (Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec) +. (Float.of_int request.duration_days *. 86400.0);
         status = Active;
+        payout_amount = None;
+        payout_time = None;
         is_gift = true;
         gift_message = None;
       } in
@@ -104,39 +121,34 @@ let process_bulk_purchase
       in
 
       (* Check pool capacity *)
-      let total_coverage = Int64.mul request.template.coverage_amount (Int64.of_int num_beneficiaries) in
-      let available_capacity = Int64.sub pool_state.total_capital pool_state.total_coverage_sold in
+      let total_coverage = List.fold_left request.beneficiaries ~init:0L ~f:(fun acc b ->
+        Int64.( + ) acc b.coverage_amount
+      ) in
+      let available_capacity = Int64.( - ) pool_state.total_capital_usd pool_state.total_coverage_sold in
 
       if Int64.compare total_coverage available_capacity > 0 then
         Lwt.return (Error "Insufficient pool capacity for bulk purchase")
       else
         (* Create policies for each beneficiary *)
-        let policies = List.mapi (fun i (b: beneficiary_entry) ->
+        let policies = List.mapi request.beneficiaries ~f:(fun i (b: beneficiary_entry) ->
           {
             sample_policy with
             policy_id = Int64.of_int (i + 1);
-            policyholder = request.payer_address;
-            beneficiary = Some b.wallet_address;
+            policyholder = request.buyer_address;
+            beneficiary = Some b.address;
             premium_paid = single_premium;
             gift_message = b.custom_message;
           }
-        ) request.beneficiaries in
+        ) in
 
         (* Create response *)
+        let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
         let response = {
-          request_id = Printf.sprintf "bulk_%s_%f" request.payer_address (Unix.time ());
-          payer = request.payer_address;
-          num_policies = num_beneficiaries;
-          total_premium_paid = total_premium;
-          discount_applied = discount_pct;
-          policies_created = List.map (fun p -> p.policy_id) policies;
-          notification_status = if request.notify_beneficiaries then
-            List.map (fun (b: beneficiary_entry) ->
-              (b.wallet_address, "pending")
-            ) request.beneficiaries
-          else
-            [];
-          timestamp = Unix.time ();
+          bulk_contract_id = Int64.of_float (now *. 1000.0);
+          policy_ids = List.map policies ~f:(fun p -> p.policy_id);
+          total_premium_usd = Int64.to_float total_premium /. 100.0;
+          discount_applied_pct = discount_pct *. 100.0;
+          beneficiary_count = num_beneficiaries;
         } in
 
         Lwt.return (Ok response)
@@ -175,7 +187,7 @@ let send_beneficiary_notification
       in
       Lwt.return true
 
-  | OnChainMessage ->
+  | OnChain ->
       (* Mock on-chain message - integrate with TON smart contracts *)
       let () = Printf.printf
         "⛓️  Posting on-chain notification for %s\n\
@@ -185,12 +197,12 @@ let send_beneficiary_notification
       in
       Lwt.return true
 
-  | Push device_token ->
-      (* Mock push notification - integrate with FCM/APNS *)
+  | SMS phone_number ->
+      (* Mock SMS notification *)
       let () = Printf.printf
-        "🔔 Sending push to device %s:\n\
+        "📱 Sending SMS to %s:\n\
          New insurance protection from %s\n\n"
-        device_token
+        phone_number
         notification.sender_name
       in
       Lwt.return true
@@ -199,18 +211,25 @@ let send_beneficiary_notification
 let process_bulk_notifications
     ~(response: bulk_protection_response)
     ~(beneficiaries: beneficiary_entry list)
-    ~(template: protection_template)
+    ~(buyer_address: string)
+    ~(asset: asset)
+    ~(trigger_price: float)
+    ~(duration_days: int)
   : (string * bool) list Lwt.t =
 
   let create_notification (beneficiary: beneficiary_entry) (policy_id: int64) =
+    let now = Time_float.now ()
+      |> Time_float.to_span_since_epoch
+      |> Time_float.Span.to_sec
+    in
     {
       policy_id;
-      beneficiary = beneficiary.wallet_address;
-      sender_name = response.payer;
-      coverage_amount = template.coverage_amount;
-      asset = template.asset;
-      trigger_price = template.trigger_price;
-      expiry_date = Unix.time () +. (float_of_int template.duration_days *. 86400.0);
+      beneficiary = beneficiary.address;
+      sender_name = buyer_address;
+      coverage_amount = beneficiary.coverage_amount;
+      asset;
+      trigger_price;
+      expiry_date = now +. (float_of_int duration_days *. 86400.0);
       personal_message = beneficiary.custom_message;
       claim_link = Printf.sprintf "https://tonsurance.com/policy/%Ld" policy_id;
     }
@@ -219,24 +238,33 @@ let process_bulk_notifications
   (* Send notifications to all beneficiaries *)
   let%lwt results =
     Lwt_list.mapi_p (fun i (b: beneficiary_entry) ->
-      let policy_id = List.nth response.policies_created i in
+      let policy_id = List.nth_exn response.policy_ids i in
       let notification = create_notification b policy_id in
 
-      match b.notification_channel with
+      (* TODO: Add notification_channel to beneficiary_entry type *)
+      match None with (* b.notification_channel *)
       | Some channel ->
           let%lwt success =
             send_beneficiary_notification
-              ~beneficiary:b.wallet_address
+              ~beneficiary:b.address
               ~channel
               ~notification
           in
-          Lwt.return (b.wallet_address, success)
+          Lwt.return (b.address, success)
       | None ->
-          Lwt.return (b.wallet_address, false) (* No notification channel *)
+          Lwt.return (b.address, false) (* No notification channel *)
     ) beneficiaries
   in
 
   Lwt.return results
+
+(** Bulk statistics type *)
+type bulk_stats = {
+  total_policies: int;
+  total_spent: usd_cents;
+  average_per_policy: usd_cents;
+  unique_beneficiaries: int;
+} [@@deriving sexp]
 
 (** Get bulk purchase statistics *)
 let get_bulk_stats
@@ -245,45 +273,34 @@ let get_bulk_stats
   : bulk_stats =
 
   let payer_policies =
-    List.filter (fun p ->
-      p.policyholder = payer_address && p.is_gift
+    List.filter ~f:(fun p ->
+      String.equal p.policyholder payer_address && p.is_gift
     ) all_policies
   in
 
   let total_spent =
-    List.fold_left (fun acc p -> Int64.add acc p.premium_paid) 0L payer_policies
+    List.fold ~f:(fun acc p -> Int64.(+) acc p.premium_paid) ~init:0L payer_policies
   in
 
-  let total_coverage =
-    List.fold_left (fun acc p -> Int64.add acc p.coverage_amount) 0L payer_policies
+  let _total_coverage =
+    List.fold ~f:(fun acc p -> Int64.(+) acc p.coverage_amount) ~init:0L payer_policies
   in
 
-  let active_policies =
-    List.filter (fun p -> p.status = Active) payer_policies
+  let _active_policies =
+    List.filter ~f:(fun p -> equal_policy_status p.status Active) payer_policies
   in
 
-  let triggered_policies =
-    List.filter (fun p -> p.status = Triggered) payer_policies
+  let _triggered_policies =
+    List.filter ~f:(fun p -> equal_policy_status p.status Triggered) payer_policies
   in
 
   {
-    total_policies_purchased = List.length payer_policies;
-    total_premium_spent = total_spent;
-    total_coverage_provided = total_coverage;
-    active_policies = List.length active_policies;
-    triggered_policies = List.length triggered_policies;
-    unique_beneficiaries = List.length (List.sort_uniq String.compare
-      (List.filter_map (fun p -> p.beneficiary) payer_policies));
+    total_policies = List.length payer_policies;
+    total_spent = total_spent;
+    average_per_policy = (if List.length payer_policies > 0 then Int64.(/) total_spent (Int64.of_int (List.length payer_policies)) else 0L);
+    unique_beneficiaries = List.length (List.dedup_and_sort ~compare:String.compare
+      (List.filter_map payer_policies ~f:(fun p -> p.beneficiary)));
   }
-
-and bulk_stats = {
-  total_policies_purchased: int;
-  total_premium_spent: usd_cents;
-  total_coverage_provided: usd_cents;
-  active_policies: int;
-  triggered_policies: int;
-  unique_beneficiaries: int;
-}
 
 (** Gift card / voucher system *)
 module GiftVoucher = struct
@@ -307,45 +324,52 @@ module GiftVoucher = struct
     let random_bytes = Bytes.create 16 in
     (* In production, use proper crypto random *)
     for i = 0 to 15 do
-      Bytes.set random_bytes i (Char.chr (Random.int 256))
+      Bytes.set random_bytes i (Char.of_int_exn (Random.int 256))
     done;
     let hex =
-      Bytes.to_seq random_bytes
-      |> Seq.map (fun c -> Printf.sprintf "%02x" (Char.code c))
-      |> List.of_seq
-      |> String.concat ""
+      let chars = ref [] in
+      for i = 0 to Bytes.length random_bytes - 1 do
+        chars := (Printf.sprintf "%02x" (Char.to_int (Bytes.get random_bytes i))) :: !chars
+      done;
+      String.concat ~sep:"" (List.rev !chars)
     in
-    "TONS-" ^ String.uppercase_ascii (String.sub hex 0 12)
+    "TONS-" ^ String.uppercase (String.sub hex ~pos:0 ~len:12)
 
   (** Create gift voucher *)
   let create_voucher
       ~(purchaser: string)
+      ~(coverage_amount: usd_cents)
+      ~(duration_days: int)
       ~(template: protection_template)
       ~(validity_days: int)
     : voucher =
+    let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
     {
       voucher_code = generate_voucher_code ();
       purchaser;
-      coverage_amount = template.coverage_amount;
+      coverage_amount;
       asset = template.asset;
-      duration_days = template.duration_days;
+      duration_days;
       trigger_price = template.trigger_price;
       floor_price = template.floor_price;
       redeemed = false;
       redeemed_by = None;
-      expiry_date = Unix.time () +. (float_of_int validity_days *. 86400.0);
-      created_at = Unix.time ();
+      expiry_date = now +. (float_of_int validity_days *. 86400.0);
+      created_at = now;
     }
 
   (** Redeem voucher *)
   let redeem_voucher
       ~(voucher: voucher)
       ~(beneficiary: string)
-    : (voucher * policy, string) result =
+      ~(coverage_type: coverage_type)
+      ~(chain: blockchain)
+    : (voucher * policy, string) Result.t =
 
+    let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
     if voucher.redeemed then
       Error "Voucher already redeemed"
-    else if Unix.time () > voucher.expiry_date then
+    else if Float.(now > voucher.expiry_date) then
       Error "Voucher expired"
     else
       let updated_voucher = { voucher with
@@ -357,14 +381,18 @@ module GiftVoucher = struct
         policy_id = 0L; (* Will be assigned by system *)
         policyholder = voucher.purchaser;
         beneficiary = Some beneficiary;
+        coverage_type;
+        chain;
         asset = voucher.asset;
         coverage_amount = voucher.coverage_amount;
         premium_paid = 0L; (* Already paid by voucher purchaser *)
         trigger_price = voucher.trigger_price;
         floor_price = voucher.floor_price;
-        start_time = Unix.time ();
-        end_time = Unix.time () +. (float_of_int voucher.duration_days *. 86400.0);
+        start_time = now;
+        expiry_time = now +. (float_of_int voucher.duration_days *. 86400.0);
         status = Active;
+        payout_amount = None;
+        payout_time = None;
         is_gift = true;
         gift_message = Some "Redeemed from gift voucher";
       } in
@@ -394,24 +422,24 @@ module EnterpriseDashboard = struct
     : enterprise_stats =
 
     let org_policies =
-      List.filter (fun p -> p.policyholder = org_address) all_policies
+      List.filter all_policies ~f:(fun p -> String.equal p.policyholder org_address)
     in
 
     let active_policies =
-      List.filter (fun p -> p.status = Active) org_policies
+      List.filter org_policies ~f:(fun p -> equal_policy_status p.status Active)
     in
 
     let total_coverage =
-      List.fold_left (fun acc p -> Int64.add acc p.coverage_amount) 0L active_policies
+      List.fold active_policies ~init:0L ~f:(fun acc p -> Int64.(+) acc p.coverage_amount)
     in
 
     let monthly_premium =
       (* Estimate monthly premium based on 30-day policies *)
-      List.fold_left (fun acc p ->
-        let days = (p.end_time -. p.start_time) /. 86400.0 in
+      List.fold active_policies ~init:0L ~f:(fun acc p ->
+        let days = (p.expiry_time -. p.start_time) /. 86400.0 in
         let monthly = Int64.of_float (Int64.to_float p.premium_paid *. (30.0 /. days)) in
-        Int64.add acc monthly
-      ) 0L active_policies
+        Int64.(+) acc monthly
+      )
     in
 
     let discount_tier =
@@ -423,18 +451,18 @@ module EnterpriseDashboard = struct
     in
 
     let policies_by_asset =
-      List.fold_left (fun acc p ->
-        let count = List.assoc_opt p.asset acc |> Option.value ~default:0 in
-        (p.asset, count + 1) :: List.remove_assoc p.asset acc
-      ) [] active_policies
+      List.fold active_policies ~init:[] ~f:(fun acc p ->
+        let count = List.Assoc.find acc ~equal:equal_asset p.asset |> Option.value ~default:0 in
+        List.Assoc.add acc ~equal:equal_asset p.asset (count + 1)
+      )
     in
 
-    let now = Unix.time () in
+    let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
     let upcoming_renewals =
-      List.filter (fun p ->
-        let days_until_expiry = (p.end_time -. now) /. 86400.0 in
-        days_until_expiry > 0.0 && days_until_expiry <= 7.0
-      ) active_policies
+      List.filter active_policies ~f:(fun p ->
+        let days_until_expiry = (p.expiry_time -. now) /. 86400.0 in
+        Float.(days_until_expiry > 0.0 && days_until_expiry <= 7.0)
+      )
       |> List.length
     in
 

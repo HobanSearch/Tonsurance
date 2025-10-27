@@ -299,11 +299,11 @@ module Database = struct
       Caqti_request.Infix.(->*)
         Caqti_type.unit
         Caqti_type.(t3 int64 string
-          (t3 string int64 float))
+          (t4 string int64 float float))
         {|
           SELECT
             policy_id, asset, beneficiary_address,
-            coverage_amount_cents, trigger_price
+            coverage_amount_cents, trigger_price, floor_price
           FROM policies
           WHERE status = 'active'
             AND expiry_time > NOW()
@@ -517,7 +517,7 @@ module Database = struct
   (** Helper: Get active policies **)
   let get_active_policies
       pool
-    : ((int64 * string * (string * int64 * float)) list, [> Caqti_error.t]) result Lwt.t =
+    : ((int64 * string * (string * int64 * float * float)) list, [> Caqti_error.t]) result Lwt.t =
 
     with_connection pool (fun (module Db : CONNECTION) ->
       Db.collect_list PolicyQueries.get_active_policies ()

@@ -15,9 +15,9 @@ open Types
 module MarketDataRiskIntegration = struct
 
   (* Import market data clients *)
-  module CEXClient = Integration.Cex_liquidation_client.CEXLiquidationClient
-  module BridgeClient = Integration.Bridge_health_client.BridgeHealthClient
-  module ChainClient = Integration.Chain_metrics_client.ChainMetricsClient
+  module CEXClient = Cex_liquidation_client.CEXLiquidationClient
+  module BridgeClient = Bridge_health_client.BridgeHealthClient
+  module ChainClient = Chain_metrics_client.ChainMetricsClient
 
   (** Risk multipliers from market data *)
   type market_risk_multipliers = {

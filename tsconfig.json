@@ -8,5 +8,12 @@
         "forceConsistentCasingInFileNames": true,
         "strict": true,
         "skipLibCheck": true
-    }
+    },
+    "exclude": [
+        "tests/**/*",
+        "test/**/*",
+        "**/node_modules",
+        "**/*.spec.ts",
+        "**/*.test.ts"
+    ]
 }

@@ -62,9 +62,9 @@ export class JettonWallet implements Contract {
                 .storeCoins(opts.amount)
                 .storeAddress(opts.toAddress)
                 .storeAddress(opts.responseAddress || null)
-                .storeDict(null) // custom_payload
+                .storeMaybeRef(null) // custom_payload
                 .storeCoins(opts.forwardAmount || 0n)
-                .storeDict(opts.forwardPayload || null)
+                .storeMaybeRef(opts.forwardPayload)
                 .endCell(),
         });
     }

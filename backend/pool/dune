@@ -2,5 +2,5 @@
  (name pool)
  (public_name tonsurance.pool)
  (modules collateral_manager utilization_tracker float_rebalancer tranche_arbitrage waterfall_simulator)
- (libraries core types math risk_model tranche_pricing integration lwt lwt.unix logs logs.lwt caqti caqti-lwt)
+ (libraries core types math risk_model tranche_pricing integration db lwt lwt.unix logs logs.lwt caqti caqti-lwt.unix)
  (preprocess (pps lwt_ppx ppx_sexp_conv ppx_deriving.show ppx_deriving_yojson)))

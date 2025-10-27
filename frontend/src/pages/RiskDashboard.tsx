@@ -322,11 +322,11 @@ export const RiskDashboard = () => {
           <ResponsiveContainer width="100%" height={300}>
             <PieChart>
               <Pie
-                data={assetConcentration}
+                data={assetConcentration as any}
                 cx="50%"
                 cy="50%"
                 labelLine={false}
-                label={({ stablecoin, percentage }) => `${stablecoin} ${percentage.toFixed(1)}%`}
+                label={({ stablecoin, percentage }: any) => `${stablecoin} ${percentage.toFixed(1)}%`}
                 outerRadius={100}
                 fill="#8884d8"
                 dataKey="exposure_usd"

@@ -322,30 +322,47 @@ module DepegEventIngestion = struct
       ~(start_date: string) (* "2020-01-01" *)
     : int Lwt.t =
 
-    (* Parse start date *)
+    (* Parse start date using Core's Time module for accurate date handling *)
     let start_time =
-      (* Simple date parsing: calculate days since epoch *)
       try
+        (* Parse YYYY-MM-DD format using Core.Time *)
         let parts = String.split start_date ~on:'-' in
         match parts with
-        | [year; month; day] ->
-            let y = Int.of_string year in
-            let m = Int.of_string month in
-            let d = Int.of_string day in
-            (* Calculate approximate Unix timestamp (days since 1970-01-01) *)
-            let days_since_epoch =
-              (y - 1970) * 365 + (y - 1970) / 4 +  (* Years + leap years *)
-              (m - 1) * 30 + d  (* Approximate month/day *)
-            in
-            Float.of_int days_since_epoch *. 86400.0
+        | [year_str; month_str; day_str] ->
+            let year = Int.of_string year_str in
+            let month = Int.of_string month_str in
+            let day = Int.of_string day_str in
+
+            (* Validate date components *)
+            if month < 1 || month > 12 || day < 1 || day > 31 then begin
+              let%lwt () = Logs_lwt.warn (fun m ->
+                m "Invalid date components in %s, using 1 year ago" start_date
+              ) in
+              let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
+              Lwt.return (now -. (365.0 *. 86400.0))
+            end else begin
+              (* Use Core's Date and Time_float modules for accurate conversion *)
+              let date = Core.Date.create_exn ~y:year ~m:(Core.Month.of_int_exn month) ~d:day in
+              let time = Time_float.of_date_ofday ~zone:Time_float.Zone.utc date Time_float.Ofday.start_of_day in
+              let span = Time_float.to_span_since_epoch time in
+              let timestamp = Time_float.Span.to_sec span in
+              Lwt.return timestamp
+            end
         | _ ->
-            (* Default: 1 year ago *)
+            let%lwt () = Logs_lwt.warn (fun m ->
+              m "Invalid date format %s (expected YYYY-MM-DD), using 1 year ago" start_date
+            ) in
             let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
-            now -. (365.0 *. 86400.0)
-      with _ ->
+            Lwt.return (now -. (365.0 *. 86400.0))
+      with exn ->
+        let%lwt () = Logs_lwt.warn (fun m ->
+          m "Failed to parse date %s: %s. Using 1 year ago" start_date (Exn.to_string exn)
+        ) in
         let now = Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec in
-        now -. (365.0 *. 86400.0)
+        Lwt.return (now -. (365.0 *. 86400.0))
     in
+
+    let%lwt start_time = start_time in
 
     let end_time =
       Time_float.now () |> Time_float.to_span_since_epoch |> Time_float.Span.to_sec

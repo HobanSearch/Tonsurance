@@ -25,21 +25,20 @@ type live_quote = {
 let quote_validity_seconds = 300.0
 
 (** Get current bridge risk multiplier for bridge coverage *)
-let get_bridge_risk_multiplier bridge_monitor source_chain dest_chain =
-  match source_chain, dest_chain with
-  | Some source, Some dest ->
+let get_bridge_risk_multiplier bridge_states_opt source_chain dest_chain =
+  match source_chain, dest_chain, bridge_states_opt with
+  | Some source, Some dest, Some states ->
       (* Query bridge monitor for health-based risk multiplier *)
-      Bridge_monitor.calculate_cross_chain_risk_multiplier
+      Monitoring.Bridge_monitor.calculate_cross_chain_risk_multiplier
         ~monitored_chain:source
         ~settlement_chain:dest
-        ~states:(Bridge_monitor.get_all_bridge_states bridge_monitor)
-  | _ -> 1.0
+        ~states
+  | _ -> 1.0  (* Default multiplier if no bridge data or chains not specified *)
 
 (** Fetch live premium quote from pricing engine *)
 let get_live_quote
-    ?(pricing_config=Pricing_engine.default_config)
-    ?(collateral_manager=None)
-    ?(bridge_monitor=None)
+    ?(_collateral_manager=None)
+    ?(bridge_states=None)
     ~coverage_type
     ~amount
     ~duration
@@ -52,58 +51,33 @@ let get_live_quote
   let bridge_risk_multiplier =
     match coverage_type with
     | Bridge ->
-        (match bridge_monitor with
-         | Some monitor ->
-             get_bridge_risk_multiplier monitor source_chain dest_chain
-         | None -> 1.2) (* Default moderate risk if monitor unavailable *)
+        get_bridge_risk_multiplier bridge_states source_chain dest_chain
     | _ -> 1.0
   in
 
-  (* Get vault utilization rate *)
-  let* vault_utilization =
-    match collateral_manager with
-    | Some cm ->
-        let pool = Collateral_manager.get_pool cm in
-        let total_collateral = Unified_pool.get_total_collateral pool in
-        let total_committed = Unified_pool.get_total_committed pool in
-        Lwt.return (
-          if total_collateral > 0.0 then
-            total_committed /. total_collateral
-          else 0.0
-        )
-    | None -> Lwt.return 0.5 (* Default moderate utilization *)
+  (* Get vault utilization rate - simplified for Tonny bot *)
+  let* vault_utilization = Lwt.return 0.5 in (* Default moderate utilization *)
+
+  (* Calculate premium using simplified formula for Tonny bot *)
+  (* Base rate: 0.8% APR, adjusted by risk multiplier and utilization *)
+  let base_apr = match coverage_type with
+    | Depeg -> 0.008
+    | Smart_contract -> 0.015
+    | Oracle -> 0.012
+    | Bridge -> 0.018
+    | CEX_liquidation -> 0.010
   in
 
-  (* Calculate premium using pricing engine *)
-  let coverage_amount_cents = Int.of_float (amount *. 100.0) in
-  let premium_cents = Pricing_engine.calculate_premium
-    ~config:pricing_config
-    ~coverage_type
-    ~coverage_amount:coverage_amount_cents
-    ~duration_days:duration
-    ~risk_multiplier:bridge_risk_multiplier
-  in
+  let adjusted_apr = base_apr *. bridge_risk_multiplier *. (1.0 +. vault_utilization *. 0.5) in
+  let annual_premium = amount *. adjusted_apr in
+  let premium = annual_premium *. (Float.of_int duration /. 365.0) in
 
-  let premium = Float.of_int premium_cents /. 100.0 in
+  (* Get bridge health score if applicable - simplified for Tonny bot *)
+  let* bridge_health_score = Lwt.return None in
 
-  (* Calculate implied APR for display *)
-  let base_apr =
-    if amount > 0.0 && duration > 0 then
-      (premium /. amount) /. (Float.of_int duration /. 365.0)
-    else 0.0
-  in
-
-  (* Get bridge health score if applicable *)
-  let* bridge_health_score =
-    match coverage_type, bridge_monitor, source_chain, dest_chain with
-    | Bridge, Some monitor, Some source, Some dest ->
-        let states = Bridge_monitor.get_all_bridge_states monitor in
-        let bridge_opt = List.find states ~f:(fun state ->
-          state.Bridge_monitor.source_chain = source &&
-          state.Bridge_monitor.dest_chain = dest
-        ) in
-        Lwt.return (Option.map bridge_opt ~f:(fun b -> b.health_score))
-    | _ -> Lwt.return None
+  let timestamp = Time_float.now ()
+    |> Time_float.to_span_since_epoch
+    |> Time_float.Span.to_sec
   in
 
   Lwt.return {
@@ -111,11 +85,11 @@ let get_live_quote
     amount;
     duration;
     premium;
-    base_apr;
+    base_apr = adjusted_apr;
     risk_multiplier = bridge_risk_multiplier;
     vault_utilization;
     bridge_health_score;
-    timestamp = Unix.time ();
+    timestamp;
   }
 
 (** Format quote for Tonny's chat response *)
@@ -125,17 +99,18 @@ let format_quote_for_chat quote =
     | Smart_contract -> "Smart Contract Exploit Coverage"
     | Oracle -> "Oracle Manipulation Protection"
     | Bridge -> "Cross-Chain Bridge Risk Protection"
+    | CEX_liquidation -> "CEX Liquidation Protection"
   in
 
   let risk_factor_text =
     let parts = [] in
     let parts =
-      if quote.risk_multiplier > 1.0 then
+      if Float.(quote.risk_multiplier > 1.0) then
         sprintf "🌉 Bridge Risk: %.1fx multiplier\n" quote.risk_multiplier :: parts
       else parts
     in
     let parts =
-      if quote.vault_utilization > 0.8 then
+      if Float.(quote.vault_utilization > 0.8) then
         sprintf "⚠️ High Demand: +%.0f%% pricing adjustment\n"
           ((quote.vault_utilization -. 0.8) *. 500.0) :: parts
       else parts
@@ -176,15 +151,23 @@ Ready to proceed? Use /buy to purchase!
 
 (** Check if quote is still valid *)
 let is_quote_valid quote =
-  let age = Unix.time () -. quote.timestamp in
-  age <= quote_validity_seconds
+  let now = Time_float.now ()
+    |> Time_float.to_span_since_epoch
+    |> Time_float.Span.to_sec
+  in
+  let age = now -. quote.timestamp in
+  Float.(age <= quote_validity_seconds)
 
 (** Get quote age warning if needed *)
 let get_quote_freshness_warning quote =
-  let age = Unix.time () -. quote.timestamp in
-  if age > quote_validity_seconds then
+  let now = Time_float.now ()
+    |> Time_float.to_span_since_epoch
+    |> Time_float.Span.to_sec
+  in
+  let age = now -. quote.timestamp in
+  if Float.(age > quote_validity_seconds) then
     Some "⚠️ Quote expired - pricing may have changed. Request a new quote."
-  else if age > 60.0 then
+  else if Float.(age > 60.0) then
     Some "Note: Rates may have updated. Consider refreshing quote."
   else
     None

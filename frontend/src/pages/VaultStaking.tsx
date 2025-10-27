@@ -141,46 +141,46 @@ export const VaultStaking = () => {
   }, [selectedVault, selectedCollateral]);
 
   // Fetch vault data from contracts and API
-  useEffect(() => {
-    const fetchVaultData = async () => {
-      setIsFetching(true);
-      try {
-        // In production: Fetch from Agent 5's API
-        // GET /api/v2/tranches/apy
-        // Response: { btc: { apy: 4.2, tvl: 1000000, utilization: 45, available_capacity: 550000 }, ... }
+  const fetchVaultData = async () => {
+    setIsFetching(true);
+    try {
+      // In production: Fetch from Agent 5's API
+      // GET /api/v2/tranches/apy
+      // Response: { btc: { apy: 4.2, tvl: 1000000, utilization: 45, available_capacity: 550000 }, ... }
 
-        // Mock real-time APY data (would come from WebSocket in production)
-        const mockApyData = {
-          btc: { apy: 4.2, tvl: 1_250_000, utilization: 45, availableCapacity: 550_000 },
-          snr: { apy: 6.8, tvl: 950_000, utilization: 52, availableCapacity: 480_000 },
-          mezz: { apy: 9.3, tvl: 720_000, utilization: 60, availableCapacity: 320_000 },
-          jnr: { apy: 12.7, tvl: 580_000, utilization: 68, availableCapacity: 220_000 },
-          jnr_plus: { apy: 16.4, tvl: 430_000, utilization: 78, availableCapacity: 120_000 },
-          eqt: { apy: 20.2, tvl: 320_000, utilization: 92, availableCapacity: 28_000 }
-        };
+      // Mock real-time APY data (would come from WebSocket in production)
+      const mockApyData = {
+        btc: { apy: 4.2, tvl: 1_250_000, utilization: 45, availableCapacity: 550_000 },
+        snr: { apy: 6.8, tvl: 950_000, utilization: 52, availableCapacity: 480_000 },
+        mezz: { apy: 9.3, tvl: 720_000, utilization: 60, availableCapacity: 320_000 },
+        jnr: { apy: 12.7, tvl: 580_000, utilization: 68, availableCapacity: 220_000 },
+        jnr_plus: { apy: 16.4, tvl: 430_000, utilization: 78, availableCapacity: 120_000 },
+        eqt: { apy: 20.2, tvl: 320_000, utilization: 92, availableCapacity: 28_000 }
+      };
 
-        setVaults(prev => ({
-          btc: { ...prev.btc, ...mockApyData.btc },
-          snr: { ...prev.snr, ...mockApyData.snr },
-          mezz: { ...prev.mezz, ...mockApyData.mezz },
-          jnr: { ...prev.jnr, ...mockApyData.jnr },
-          jnr_plus: { ...prev.jnr_plus, ...mockApyData.jnr_plus },
-          eqt: { ...prev.eqt, ...mockApyData.eqt }
-        }));
+      setVaults(prev => ({
+        btc: { ...prev.btc, ...mockApyData.btc },
+        snr: { ...prev.snr, ...mockApyData.snr },
+        mezz: { ...prev.mezz, ...mockApyData.mezz },
+        jnr: { ...prev.jnr, ...mockApyData.jnr },
+        jnr_plus: { ...prev.jnr_plus, ...mockApyData.jnr_plus },
+        eqt: { ...prev.eqt, ...mockApyData.eqt }
+      }));
 
-        // If user connected, fetch user-specific data from contracts
-        if (isConfigured && userAddress) {
-          const userAddr = Address.parse(userAddress);
-          // TODO: Implement contract calls for user balances when deployed
-        }
-
-      } catch (error) {
-        console.error('Error fetching vault data:', error);
-      } finally {
-        setIsFetching(false);
+      // If user connected, fetch user-specific data from contracts
+      if (isConfigured && userAddress) {
+        const userAddr = Address.parse(userAddress);
+        // TODO: Implement contract calls for user balances when deployed
       }
-    };
 
+    } catch (error) {
+      console.error('Error fetching vault data:', error);
+    } finally {
+      setIsFetching(false);
+    }
+  };
+
+  useEffect(() => {
     fetchVaultData();
 
     // Setup WebSocket for real-time APY updates
@@ -237,20 +237,18 @@ export const VaultStaking = () => {
 
       if (action === 'stake') {
         // Deposit to MultiTrancheVault
-        await contracts.multiTrancheVault.sendDeposit(
-          sender,
-          trancheId,
-          amountNano + gasAmount
-        );
+        await contracts.multiTrancheVault.sendDeposit(sender, {
+          value: amountNano + gasAmount,
+          trancheId: trancheId
+        });
         alert(`Successfully deposited ${amount} TON to ${vaults[selectedVault].name}!`);
       } else {
         // Withdraw from MultiTrancheVault
-        await contracts.multiTrancheVault.sendWithdraw(
-          sender,
-          gasAmount,
-          trancheId,
-          amountNano
-        );
+        await contracts.multiTrancheVault.sendWithdraw(sender, {
+          value: gasAmount,
+          trancheId: trancheId,
+          amount: amountNano
+        });
         alert(`Successfully withdrew ${amount} tokens from ${vaults[selectedVault].name}!`);
       }
 
@@ -522,7 +520,7 @@ export const VaultStaking = () => {
                   <div className="output-success">✓ Rewards distributed daily</div>
                   <div className="output-success">✓ No lock-up period</div>
                   <div className="output-success">✓ Automatic compounding</div>
-                  {selectedVault === 'tradfi' && (
+                  {selectedVault === 'tradfi' as any && (
                     <div className="output-error">
                       ⚠ Requires KYC verification
                     </div>

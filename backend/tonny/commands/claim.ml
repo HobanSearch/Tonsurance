@@ -8,6 +8,21 @@ open Lwt.Syntax
 
 let command_name = "claim"
 
+(** Claim information returned from database *)
+type claim_info = {
+  has_claim: bool;
+  claim_status: string;
+  claim_amount: float option;
+  claim_date: string option;
+  payout_tx: string option;
+  coverage_type_name: string;
+  claim_id: string;
+  trigger_description: string;
+  detected_at: string;
+  payout_amount: float option;
+  tx_hash: string option;
+} [@@deriving sexp]
+
 (** Parse policy ID from command *)
 let parse_policy_id text =
   match String.split ~on:' ' text with

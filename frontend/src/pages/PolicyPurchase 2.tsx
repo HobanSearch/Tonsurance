@@ -74,6 +74,8 @@ export const PolicyPurchase = () => {
         // Calculate for first type and apply multiplier
         const premiumWei = await contracts.policyFactory.getCalculatePremium(
           coverageTypeToInt(selectedCoverageTypes[0]),
+          0, // chainId - Default to TON
+          0, // stablecoinId - Default to USDT
           toNano(amount),
           days
         );
@@ -142,6 +144,8 @@ export const PolicyPurchase = () => {
       await contracts.policyFactory.sendCreatePolicy(sender, {
         value: gasAmount + premiumNano,
         coverageType: coverageTypeToInt(selectedCoverageTypes[0]),
+        chainId: 0, // Default to TON chain
+        stablecoinId: 0, // Default to USDT
         coverageAmount: coverageAmountNano,
         duration: parseInt(durationDays),
       });

@@ -1,0 +1,17 @@
+{
+  "base_rates": {
+    "USDC": 0.04,
+    "USDT": 0.06,
+    "DAI": 0.05,
+    "FRAX": 0.08,
+    "BUSD": 0.045
+  },
+  "default_rate": 0.10,
+  "escrow_pricing": {
+    "base_apr": 0.008,
+    "short_duration_discount": 0.8,
+    "medium_duration_discount": 0.9,
+    "volume_discount": 0.9,
+    "both_parties_multiplier": 1.5
+  }
+}
