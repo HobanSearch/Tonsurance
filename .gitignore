@@ -112,3 +112,9 @@ _coverage/
 # Opam
 _opam/
 *.install
+
+# Tonny training data and models (too large for git)
+backend/tonny/training_data/
+backend/tonny/models/
+*.safetensors
+*.bin

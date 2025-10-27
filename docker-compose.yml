@@ -153,6 +153,10 @@ services:
       - "11434:11434"
     environment:
       MODEL_PATH: models/tonny-7b-merged
+    volumes:
+      # Mount the fine-tuned model from host (4GB, not in git)
+      # Upload model to server: backend/tonny/models/tonny-7b-merged/
+      - ./backend/tonny/models:/app/models
     restart: unless-stopped
     networks:
       - tonsurance-network

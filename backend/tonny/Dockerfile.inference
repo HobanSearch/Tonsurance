@@ -28,8 +28,8 @@ RUN pip install --no-cache-dir \
 # Copy model server code
 COPY tonny_inference_server.py ./
 
-# Copy the fine-tuned model
-COPY training_data/models/tonny-7b-merged ./models/tonny-7b-merged
+# Model will be mounted via volume at /app/models/tonny-7b-merged
+# No COPY needed - model is too large for Docker image (4GB)
 
 # Expose Ollama-compatible port
 EXPOSE 11434
