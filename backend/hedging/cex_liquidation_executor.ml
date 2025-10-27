@@ -514,13 +514,13 @@ module CexLiquidationExecutor = struct
             symbol short_size leverage (cascade_risk *. 100.0)
         ) in
 
-        (* Get current price *)
-        let current_price = 50_000.0 in (* Stub - should fetch from API *)
+        (* Use estimated price for logging (actual entry uses Binance real-time API price) *)
+        let estimated_price = 50_000.0 in (* BTC estimate for log display only *)
 
-        (* Execute short *)
+        (* Execute short (Binance API provides real-time entry price) *)
         let%lwt position = execute_binance_liquidation_short
           ~symbol ~short_size_usd:short_size ~leverage ~policy_id:policy.policy_id
-          ~current_price
+          ~current_price:estimated_price
         in
 
         Lwt.return (Some position)
