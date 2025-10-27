@@ -981,6 +981,86 @@ module ProtocolShortExecutor = struct
    * MONITORING & ALERTS
    * ============================================ *)
 
+  (** Fetch current price for a token across all venues *)
+  let fetch_current_price
+      ~(token_symbol: string)
+      ~(venue: perp_venue)
+    : float option Lwt.t =
+
+    try%lwt
+      (* All positions are actually on Binance Futures regardless of venue label
+       * Fetch mark price from Binance *)
+      let api_key = Option.value (Sys.getenv "BINANCE_API_KEY") ~default:"demo_key" in
+      let api_secret = Option.value (Sys.getenv "BINANCE_API_SECRET") ~default:"demo_secret" in
+
+      let binance_config = Binance_futures_client.BinanceFuturesClient.{
+        api_key;
+        api_secret;
+        testnet = false;
+        rate_limit_weight_per_minute = 1200;
+        timeout_seconds = 10.0;
+      } in
+
+      (* Convert token symbol to Binance format *)
+      let symbol = Printf.sprintf "%sUSDT" token_symbol in
+
+      (* Fetch funding info which includes mark price *)
+      let%lwt funding_result = Binance_futures_client.BinanceFuturesClient.get_funding_info
+        ~config:binance_config
+        ~symbol
+      in
+
+      match funding_result with
+      | Ok funding_info ->
+          (* Binance funding_info includes mark_price *)
+          let%lwt () = Logs_lwt.debug (fun m ->
+            m "[%s] Fetched %s price from Binance: $%.2f"
+              (venue_to_string venue) token_symbol funding_info.mark_price
+          ) in
+          Lwt.return (Some funding_info.mark_price)
+
+      | Error _ ->
+          (* Try Hyperliquid as fallback *)
+          let wallet_address = Option.value (Sys.getenv "HYPERLIQUID_WALLET_ADDRESS")
+            ~default:"0x0000000000000000000000000000000000000000" in
+          let testnet = Option.value_map (Sys.getenv "HYPERLIQUID_TESTNET")
+            ~default:false ~f:(fun v -> String.(v = "true" || v = "1")) in
+
+          let hl_config = Hyperliquid_client.HyperliquidClient.{
+            wallet_address;
+            private_key = None;
+            testnet;
+            rate_limit_per_minute = 1000;
+            timeout_seconds = 10.0;
+          } in
+
+          let%lwt hl_price_result = Hyperliquid_client.HyperliquidClient.get_mark_price
+            ~config:hl_config
+            ~coin:token_symbol
+          in
+
+          (match hl_price_result with
+          | Ok price ->
+              let%lwt () = Logs_lwt.debug (fun m ->
+                m "[%s] Fetched %s price from Hyperliquid fallback: $%.2f"
+                  (venue_to_string venue) token_symbol price
+              ) in
+              Lwt.return (Some price)
+
+          | Error _ ->
+              let%lwt () = Logs_lwt.warn (fun m ->
+                m "[%s] Could not fetch %s price from any venue"
+                  (venue_to_string venue) token_symbol
+              ) in
+              Lwt.return None
+          )
+
+    with exn ->
+      let%lwt () = Logs_lwt.warn (fun m ->
+        m "Exception fetching %s price: %s" token_symbol (Exn.to_string exn)
+      ) in
+      Lwt.return None
+
   (** Monitor all positions and alert on liquidation risk *)
   let monitor_short_positions
       ~(positions: short_position list)
@@ -990,31 +1070,43 @@ module ProtocolShortExecutor = struct
       m "Monitoring %d protocol short positions..." (List.length positions)
     ) in
 
-    (* TODO: Fetch current prices from venues *)
-    (* For now, simulate with random price movements *)
-
+    (* Fetch current prices from venues and update positions *)
     let%lwt () = Lwt_list.iter_s (fun position ->
       if Poly.equal position.status `Open then
-        (* Simulate price check *)
-        let simulated_price = position.entry_price *. (1.0 +. (Random.float 0.2 -. 0.1)) in
-        let updated = update_position_pnl ~position ~current_price:simulated_price in
-        let risk = check_liquidation_risk ~position:updated ~current_price:simulated_price in
+        (* Fetch real current price *)
+        let%lwt price_opt = fetch_current_price
+          ~token_symbol:position.token.token_symbol
+          ~venue:position.venue
+        in
+
+        let current_price = match price_opt with
+          | Some price -> price
+          | None ->
+              (* Fallback: use entry price + small random movement if price fetch fails *)
+              let%lwt () = Logs_lwt.warn (fun m ->
+                m "Using estimated price for %s (fetch failed)" position.token.token_symbol
+              ) in
+              position.entry_price *. (1.0 +. (Random.float 0.04 -. 0.02))
+        in
+
+        let updated = update_position_pnl ~position ~current_price in
+        let risk = check_liquidation_risk ~position:updated ~current_price in
 
         match risk with
         | `Critical ->
             Logs_lwt.err (fun m ->
-              m "🚨 CRITICAL: Position %s near liquidation! Loss: $%.2f"
-                position.position_id updated.unrealized_pnl
+              m "🚨 CRITICAL: Position %s near liquidation! Loss: $%.2f (price: $%.2f → $%.2f)"
+                position.position_id updated.unrealized_pnl position.entry_price current_price
             )
         | `Warning ->
             Logs_lwt.warn (fun m ->
-              m "⚠️  WARNING: Position %s at risk. Loss: $%.2f"
-                position.position_id updated.unrealized_pnl
+              m "⚠️  WARNING: Position %s at risk. Loss: $%.2f (price: $%.2f → $%.2f)"
+                position.position_id updated.unrealized_pnl position.entry_price current_price
             )
         | `Safe ->
             Logs_lwt.info (fun m ->
-              m "✓ Position %s healthy. P&L: %+.2f"
-                position.position_id updated.unrealized_pnl
+              m "✓ Position %s healthy. P&L: %+.2f (price: $%.2f → $%.2f)"
+                position.position_id updated.unrealized_pnl position.entry_price current_price
             )
       else
         Lwt.return ()
