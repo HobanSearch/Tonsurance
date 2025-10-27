@@ -57,28 +57,30 @@ let swing_quote_handler _state req =
     let duration_days_str = Dream.query req "duration_days" |> Option.value ~default:"30" in
 
     (* Parse parameters *)
-    let coverage_type = coverage_type_of_string coverage_type_str in
-    let chain = blockchain_of_string chain_str in
-    let stablecoin = asset_of_string stablecoin_str in
     let coverage_amount = Float.of_string coverage_amount_str in
     let duration_days = Int.of_string duration_days_str in
 
-    let%lwt () = Logs_lwt.info (fun m ->
-      m "[HedgingAPI] Swing quote request: %s %s %s $%.2f %dd"
-        coverage_type_str chain_str stablecoin_str coverage_amount duration_days
-    ) in
+    (* Parse enum types (returns Result.t) *)
+    match coverage_type_of_string coverage_type_str,
+          blockchain_of_string chain_str,
+          asset_of_string stablecoin_str with
+    | Ok coverage_type, Ok chain, Ok stablecoin ->
+        let%lwt () = Logs_lwt.info (fun m ->
+          m "[HedgingAPI] Swing quote request: %s %s %s $%.2f %dd"
+            coverage_type_str chain_str stablecoin_str coverage_amount duration_days
+        ) in
 
-    (* 1. Calculate base premium (0.8% APR for hedged insurance) *)
-    let base_apr = 0.008 in (* 0.8% APR *)
-    let base_premium = (coverage_amount *. base_apr *. Float.of_int duration_days) /. 365.0 in
+        (* 1. Calculate base premium (0.8% APR for hedged insurance) *)
+        let base_apr = 0.008 in (* 0.8% APR *)
+        let base_premium = (coverage_amount *. base_apr *. Float.of_int duration_days) /. 365.0 in
 
-    (* 2. Fetch real-time hedge costs from all venues *)
-    let%lwt hedge_breakdown = Hedging.Hedge_cost_fetcher.fetch_hedge_cost
-      ~coverage_type
-      ~chain
-      ~stablecoin
-      ~coverage_amount
-    in
+        (* 2. Fetch real-time hedge costs from all venues *)
+        let%lwt hedge_breakdown = Hedging.Hedge_cost_fetcher.fetch_hedge_cost
+          ~coverage_type
+          ~chain
+          ~stablecoin
+          ~coverage_amount
+        in
 
     (* 3. Calculate protocol margin (5% of total hedge costs) *)
     let protocol_margin = hedge_breakdown.total_hedge_cost *. 0.05 in
@@ -120,8 +122,26 @@ let swing_quote_handler _state req =
         base_premium hedge_breakdown.total_hedge_cost total_premium savings_pct
     ) in
 
-    Dream.json (Yojson.Safe.to_string response)
-    |> Lwt.return
+        Dream.json (Yojson.Safe.to_string response)
+        |> Lwt.return
+
+    | Error coverage_err, _, _ ->
+        Dream.json ~status:`Bad_Request (Yojson.Safe.to_string (`Assoc [
+          ("error", `String ("Invalid coverage_type: " ^ coverage_err))
+        ]))
+        |> Lwt.return
+
+    | _, Error chain_err, _ ->
+        Dream.json ~status:`Bad_Request (Yojson.Safe.to_string (`Assoc [
+          ("error", `String ("Invalid chain: " ^ chain_err))
+        ]))
+        |> Lwt.return
+
+    | _, _, Error stablecoin_err ->
+        Dream.json ~status:`Bad_Request (Yojson.Safe.to_string (`Assoc [
+          ("error", `String ("Invalid stablecoin: " ^ stablecoin_err))
+        ]))
+        |> Lwt.return
 
   with
   | exn ->
