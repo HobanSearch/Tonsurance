@@ -16,6 +16,11 @@ open Types
 open Dream
 open Ppx_yojson_conv_lib.Yojson_conv.Primitives
 
+(** Hedging API state *)
+type hedging_api_state = {
+  mutable collateral_manager: Pool.Collateral_manager.CollateralManager.t ref;
+}
+
 (** ============================================
  * ENDPOINT 1: GET /api/v2/hedging/swing-quote
  * ============================================
