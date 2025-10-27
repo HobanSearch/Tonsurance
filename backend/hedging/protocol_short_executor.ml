@@ -417,9 +417,88 @@ module ProtocolShortExecutor = struct
       m "[GMX] Fetching market data for %s" token_symbol
     ) in
 
-    (* GMX has limited token coverage, mainly BTC, ETH, major alts *)
-    (* For DeFi tokens, use Hyperliquid instead *)
-    Lwt.return None
+    (* GMX V2 on Arbitrum has limited token coverage:
+     * - Primarily supports BTC, ETH, major alts
+     * - Does NOT support DeFi governance tokens (AAVE, LINK, GMX token itself, MKR, etc.)
+     * - Most protocol tokens should use Hyperliquid instead
+     *)
+
+    try%lwt
+      (* Get GMX config from environment *)
+      let rpc_url = Option.value (Sys.getenv "ARBITRUM_RPC_URL")
+        ~default:"https://arb1.arbitrum.io/rpc" in
+      let subgraph_url = Option.value (Sys.getenv "GMX_SUBGRAPH_URL") ~default:"" in
+      let testnet = Option.value_map (Sys.getenv "GMX_TESTNET")
+        ~default:false ~f:(fun v -> String.(v = "true" || v = "1")) in
+
+      let gmx_config = Gmx_v2_client.GmxV2Client.{
+        rpc_url;
+        subgraph_url;
+        wallet_address = None;
+        testnet;
+        rate_limit_per_minute = 300;
+        timeout_seconds = 10.0;
+      } in
+
+      (* Fetch all GMX markets *)
+      let%lwt markets_result = Gmx_v2_client.GmxV2Client.get_markets ~config:gmx_config in
+
+      match markets_result with
+      | Ok markets ->
+          (* GMX market symbols are typically like "BTC/USD", "ETH/USD"
+           * Not individual protocol tokens, so this will return None for DeFi tokens *)
+          let market_opt = List.find markets ~f:(fun m ->
+            String.is_substring m.market_symbol ~substring:token_symbol ||
+            String.equal m.market_symbol (token_symbol ^ "/USD") ||
+            String.equal m.market_symbol (token_symbol ^ "-USD")
+          ) in
+
+          (match market_opt with
+          | Some _gmx_market ->
+              (* Found a matching market (rare for DeFi tokens) *)
+              let%lwt () = Logs_lwt.info (fun m ->
+                m "[GMX] Found market for %s (unusual - GMX rarely supports DeFi tokens)" token_symbol
+              ) in
+
+              (* TODO: Would need to enhance GMX client to fetch real prices from oracles
+               * Currently GMX client returns zeros for price data
+               * For now, return None to fallback to Hyperliquid *)
+              let%lwt () = Logs_lwt.warn (fun m ->
+                m "[GMX] Market found but price data incomplete, using Hyperliquid fallback"
+              ) in
+              Lwt.return None
+
+          | None ->
+              (* Expected: GMX doesn't support this DeFi token *)
+              let%lwt () = Logs_lwt.info (fun m ->
+                m "[GMX] No market for %s (expected - GMX focuses on BTC/ETH)" token_symbol
+              ) in
+              Lwt.return None
+          )
+
+      | Error err ->
+          let error_msg = match err with
+            | API_error (code, msg) -> Printf.sprintf "API %d: %s" code msg
+            | Rate_limited -> "Rate limit exceeded"
+            | Network_error msg -> Printf.sprintf "Network: %s" msg
+            | Parse_error msg -> Printf.sprintf "Parse: %s" msg
+            | Web3_required msg -> Printf.sprintf "Web3 required: %s" msg
+            | Insufficient_liquidity -> "Insufficient liquidity"
+            | Invalid_order msg -> Printf.sprintf "Invalid order: %s" msg
+            | Position_not_found -> "Position not found"
+          in
+
+          let%lwt () = Logs_lwt.warn (fun m ->
+            m "[GMX] API error: %s, using Hyperliquid fallback" error_msg
+          ) in
+          Lwt.return None
+
+    with exn ->
+      let%lwt () = Logs_lwt.info (fun m ->
+        m "[GMX] Exception: %s (expected for DeFi tokens)" (Exn.to_string exn)
+      ) in
+      (* GMX doesn't support DeFi governance tokens - this is expected *)
+      Lwt.return None
 
   (** Select best venue for shorting *)
   let select_best_venue
