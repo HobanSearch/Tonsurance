@@ -466,6 +466,45 @@ module PolymarketClient = struct
     | Error e -> Lwt.return (Error e)
 
   (** ============================================
+      MARKET SEARCH
+      ============================================ *)
+
+  (** Search for markets by keywords *)
+  let search_markets
+      (config: config)
+      ~(query: string)
+      ~(limit: int)
+    : (market_info list, error_type) Result.t Lwt.t =
+
+    let path = Printf.sprintf "/markets?search=%s&limit=%d"
+      (Uri.pct_encode query) limit
+    in
+
+    let%lwt result = get_json config.http_client path in
+
+    match result with
+    | Ok json ->
+        let open Yojson.Safe.Util in
+        (try
+          let markets_json = json |> member "markets" |> to_list in
+          let markets = List.map markets_json ~f:(fun market_json ->
+            {
+              condition_id = market_json |> member "condition_id" |> to_string;
+              question = market_json |> member "question" |> to_string;
+              outcome = market_json |> member "outcome" |> to_string_option |> Option.value ~default:"YES";
+              yes_price = market_json |> member "yes_price" |> to_float_option |> Option.value ~default:0.5;
+              no_price = market_json |> member "no_price" |> to_float_option |> Option.value ~default:0.5;
+              volume_24h = market_json |> member "volume_24h" |> to_float_option |> Option.value ~default:0.0;
+              liquidity = market_json |> member "liquidity" |> to_float_option |> Option.value ~default:0.0;
+            }
+          ) in
+          Lwt.return (Ok markets)
+        with exn ->
+          Lwt.return (Error (ParseError (
+            Printf.sprintf "Failed to parse markets: %s" (Exn.to_string exn)))))
+    | Error e -> Lwt.return (Error e)
+
+  (** ============================================
       UTILITY FUNCTIONS
       ============================================ *)
 
