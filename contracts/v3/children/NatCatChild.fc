@@ -1,0 +1,796 @@
+;; ================================================================
+;; NatCatChild Contract - Natural Catastrophe Insurance
+;; ================================================================
+;;
+;; Purpose: Creates and manages natural catastrophe insurance policies
+;; Features:
+;; - Policy creation with geographic parameters (lat, lon, radius)
+;; - Premium calculation with higher rates (3% for hurricanes, 1.5% for earthquakes)
+;; - Parametric triggers: Category 3+ hurricanes, Magnitude 6.0+ earthquakes
+;; - Oracle integration for NOAA/USGS event data
+;; - PolicyNFT minting with location metadata
+;; - Premium investment via FloatMaster
+;; - Policy registration with MasterFactory
+;;
+;; Flow:
+;; 1. User sends premium with geographic parameters
+;; 2. Policy created and registered with MasterFactory
+;; 3. Oracle monitors events in coverage area
+;; 4. Automatic claim triggering when parametric conditions met
+;; 5. Claim processed via MasterFactory → Vault → User payout
+;;
+;; Target Shard: 0x50 (co-located with TradFiNatCatFactory)
+;; Gas Cost: ~0.20-0.25 TON per policy creation
+;; ================================================================
+
+#include "../libs/security_helpers.fc";
+#include "../libs/factory_helpers.fc";
+#include "../libs/oracle_helpers.fc";
+
+;; ================================================================
+;; STORAGE LAYOUT
+;; ================================================================
+
+global slice parent_factory_address;   ;; TradFiNatCatFactory
+global slice master_factory_address;   ;; MasterFactory
+global int product_type;               ;; = 5 (PRODUCT_TRADFI_NATCAT)
+global int asset_id;                   ;; Catastrophe type (1=Hurricane, 2=Earthquake)
+global slice policy_nft_minter_address;
+global slice float_master_address;     ;; FloatMaster (receives premiums)
+global slice event_oracle_address;     ;; NOAA/USGS oracle
+global cell policy_registry;           ;; Dict<policy_id:uint64, policy_data:cell>
+global int next_policy_id;             ;; Auto-increment policy ID
+global int total_policies_created;
+global int total_coverage_amount;      ;; Sum of all active coverage
+global int paused;
+
+;; Oracle monitoring state
+global int last_event_id;              ;; Last processed catastrophe event ID
+global int last_event_timestamp;       ;; Last event timestamp
+global cell active_policies;           ;; Dict<policy_id:uint64, policy_metadata:cell>
+
+;; ================================================================
+;; PREMIUM CALCULATION
+;; ================================================================
+
+;; Base APR for catastrophe insurance (higher than DeFi)
+const int HURRICANE_APR_BPS = 300;     ;; 3.0% annual (high risk)
+const int EARTHQUAKE_APR_BPS = 150;    ;; 1.5% annual (moderate risk)
+
+;; Parametric trigger thresholds
+const int HURRICANE_MIN_CATEGORY = 3;  ;; Category 3+ (111+ mph winds)
+const int EARTHQUAKE_MIN_MAGNITUDE = 60; ;; Magnitude 6.0+ (stored as magnitude * 10)
+
+;; Geographic parameters (stored in policy)
+;; latitude: int32 (degrees * 1000000, range: -90M to 90M)
+;; longitude: int32 (degrees * 1000000, range: -180M to 180M)
+;; radius_km: uint16 (coverage radius in kilometers, 10-500 recommended)
+
+;; Duration stored in HOURS (not days) for sub-day coverage
+;; duration_hours: uint16 (6 hours minimum to 8760 hours maximum = 365 days)
+;; This enables micro-policies for overnight natural catastrophe bonds
+
+;; ================================================================
+;; OPCODES
+;; ================================================================
+
+const int op::create_policy_from_factory = 0x40;
+const int op::set_policy_nft_minter = 0x41;
+const int op::set_float_master = 0x42;
+const int op::set_event_oracle = 0x43;
+const int op::pause = 0x44;
+const int op::unpause = 0x45;
+const int op::event_update = 0x46;           ;; Oracle relayer pushes event data
+
+;; Downstream opcodes
+const int op::mint_policy_nft = 0x50;
+const int op::register_policy = 0x51;
+const int op::invest_premium = 0x52;
+const int op::process_claim = 0x53;
+
+;; ================================================================
+;; ERROR CODES
+;; ================================================================
+
+const int err::unauthorized = 401;
+const int err::paused = 402;
+const int err::invalid_params = 403;
+const int err::nft_minter_not_set = 404;
+const int err::vault_not_set = 405;
+const int err::oracle_not_set = 406;
+const int err::insufficient_premium = 407;
+
+;; ================================================================
+;; EVENT TYPES
+;; ================================================================
+
+const int EVENT_POLICY_CREATED = 0x01;
+const int EVENT_CATASTROPHE_DETECTED = 0x02;
+const int EVENT_POLICY_TRIGGERED = 0x03;
+const int EVENT_DOWNSTREAM_FAILED = 0x04;
+const int EVENT_NFT_MINTER_SET = 0x05;
+const int EVENT_FLOAT_MASTER_SET = 0x06;
+const int EVENT_ORACLE_SET = 0x07;
+const int EVENT_CHILD_PAUSED = 0x08;
+const int EVENT_CHILD_UNPAUSED = 0x09;
+const int EVENT_EVENT_UPDATED = 0x0A;
+
+;; ================================================================
+;; STORAGE FUNCTIONS
+;; ================================================================
+
+() load_data() impure inline {
+  slice ds = get_data().begin_parse();
+
+  parent_factory_address = ds~load_msg_addr();
+  master_factory_address = ds~load_msg_addr();
+  product_type = ds~load_uint(8);
+  asset_id = ds~load_uint(16);
+
+  ;; Load addresses from first reference
+  slice addr_ref1 = ds~load_ref().begin_parse();
+  policy_nft_minter_address = addr_ref1~load_msg_addr();
+  float_master_address = addr_ref1~load_msg_addr();
+  event_oracle_address = addr_ref1~load_msg_addr();
+
+  policy_registry = ds~load_dict();
+  next_policy_id = ds~load_uint(64);
+  total_policies_created = ds~load_uint(64);
+  total_coverage_amount = ds~load_coins();
+  paused = ds~load_uint(1);
+
+  ;; Oracle monitoring state
+  last_event_id = ds~load_uint(32);
+  last_event_timestamp = ds~load_uint(32);
+  active_policies = ds~load_dict();
+}
+
+() save_data() impure inline {
+  ;; Build address reference
+  var addr_ref1 = begin_cell()
+    .store_slice(policy_nft_minter_address)
+    .store_slice(float_master_address)
+    .store_slice(event_oracle_address)
+    .end_cell();
+
+  set_data(
+    begin_cell()
+      .store_slice(parent_factory_address)
+      .store_slice(master_factory_address)
+      .store_uint(product_type, 8)
+      .store_uint(asset_id, 16)
+      .store_ref(addr_ref1)
+      .store_dict(policy_registry)
+      .store_uint(next_policy_id, 64)
+      .store_uint(total_policies_created, 64)
+      .store_coins(total_coverage_amount)
+      .store_uint(paused, 1)
+      ;; Oracle monitoring state
+      .store_uint(last_event_id, 32)
+      .store_uint(last_event_timestamp, 32)
+      .store_dict(active_policies)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; FORWARD DECLARATIONS
+;; ================================================================
+
+() send_to_nft_minter(int policy_id, slice user_addr, int coverage_amount, int expiry_timestamp, int latitude, int longitude, int radius_km) impure inline;
+() send_premium_to_float(int premium_amount, int policy_id, int duration_hours) impure inline;
+() send_register_policy_to_master_factory(int policy_id, slice user_addr, int coverage_amount, int expiry_timestamp) impure inline;
+() trigger_matching_policies(int event_latitude, int event_longitude, int event_severity) impure;
+() send_claim_to_master_factory(int policy_id, slice user_addr, int coverage_amount, int event_id, int event_severity) impure inline;
+() handle_bounce(slice in_msg) impure;
+
+;; ================================================================
+;; PREMIUM CALCULATION
+;; ================================================================
+
+;; Calculate premium for catastrophe coverage
+;; Formula: coverage_amount × APR × (duration_hours / 8760)
+;; Note: 8760 hours = 365 days (annual premium basis)
+int calculate_premium(int coverage_amount, int duration_hours, int catastrophe_type) inline {
+  int apr_bps = HURRICANE_APR_BPS;
+  if (catastrophe_type == 2) {
+    apr_bps = EARTHQUAKE_APR_BPS;
+  }
+
+  ;; Premium = coverage × (APR / 10000) × (hours / 8760)
+  ;; 8760 = 365 days × 24 hours
+  return muldiv(coverage_amount * apr_bps * duration_hours, 1, 10000 * 8760);
+}
+
+;; ================================================================
+;; GEOGRAPHIC DISTANCE CALCULATION
+;; ================================================================
+
+;; Simplified distance check (Haversine approximation for small distances)
+;; Returns 1 if event is within policy radius, 0 otherwise
+int is_within_radius(
+  int policy_lat,      ;; degrees * 1000000
+  int policy_lon,      ;; degrees * 1000000
+  int policy_radius,   ;; km
+  int event_lat,       ;; degrees * 1000000
+  int event_lon        ;; degrees * 1000000
+) inline {
+  ;; Simple rectangular approximation (good enough for small distances)
+  ;; 1 degree ≈ 111 km at equator
+  int lat_diff = abs(policy_lat - event_lat);   ;; microdegrees
+  int lon_diff = abs(policy_lon - event_lon);   ;; microdegrees
+
+  ;; Convert to km (rough approximation)
+  ;; distance_km ≈ sqrt(lat_diff² + lon_diff²) * 111 / 1000000
+  ;; For simplicity, use Manhattan distance
+  int approx_distance_km = (lat_diff + lon_diff) / 9000; ;; ~111km per degree
+
+  return approx_distance_km <= policy_radius;
+}
+
+;; ================================================================
+;; POLICY CREATION
+;; ================================================================
+
+() create_natcat_policy(
+  slice user_addr,
+  int coverage_amount,
+  int duration_hours,
+  int latitude,          ;; degrees * 1000000
+  int longitude,         ;; degrees * 1000000
+  int radius_km,         ;; coverage radius
+  int user_premium_sent
+) impure {
+  ;; Validate parameters
+  throw_unless(err::invalid_params, coverage_amount > 0);
+  throw_unless(err::invalid_params, duration_hours >= 6);    ;; Minimum 6 hours (overnight coverage)
+  throw_unless(err::invalid_params, duration_hours <= 8760); ;; Maximum 8760 hours (365 days)
+  throw_unless(err::invalid_params, radius_km > 0);
+  throw_unless(err::invalid_params, radius_km <= 5000);    ;; Max 5000 km radius
+  throw_unless(err::invalid_params, abs(latitude) <= 90000000);    ;; Valid latitude range
+  throw_unless(err::invalid_params, abs(longitude) <= 180000000);  ;; Valid longitude range
+
+  ;; Validate integrations configured
+  throw_if(err::nft_minter_not_set, is_valid_address(policy_nft_minter_address) == false);
+  throw_if(err::vault_not_set, is_valid_address(float_master_address) == false);
+  throw_if(err::oracle_not_set, is_valid_address(event_oracle_address) == false);
+
+  ;; Calculate required premium (higher rates for catastrophe insurance)
+  int required_premium = calculate_premium(coverage_amount, duration_hours, asset_id);
+
+  ;; Validate user sent enough premium (allow 1% buffer for gas)
+  int min_premium = required_premium - (required_premium / 100);
+  throw_unless(err::insufficient_premium, user_premium_sent >= min_premium);
+
+  ;; Generate policy ID
+  int policy_id = next_policy_id;
+  next_policy_id += 1;
+
+  ;; Calculate expiry (hours to seconds: hours * 3600)
+  int expiry_timestamp = now() + (duration_hours * 3600);
+
+  ;; Store policy data
+  var policy_data = begin_cell()
+    .store_slice(user_addr)
+    .store_uint(asset_id, 16)
+    .store_coins(coverage_amount)
+    .store_uint(duration_hours, 16)   ;; Duration in HOURS
+    .store_coins(required_premium)
+    .store_uint(now(), 32)           ;; Created at
+    .store_uint(expiry_timestamp, 32) ;; Expires at
+    .store_uint(0, 1)                 ;; Not claimed
+    .store_int(latitude, 32)          ;; Geographic parameters
+    .store_int(longitude, 32)
+    .store_uint(radius_km, 16)
+    .end_cell();
+
+  slice policy_slice = policy_data.begin_parse();
+  policy_registry~udict_set(64, policy_id, policy_slice);
+
+  ;; Update analytics
+  total_policies_created += 1;
+  total_coverage_amount += coverage_amount;
+
+  ;; Send 3 parallel messages: NFT mint, Float investment, MasterFactory registration
+  send_to_nft_minter(policy_id, user_addr, coverage_amount, expiry_timestamp, latitude, longitude, radius_km);
+  send_premium_to_float(required_premium, policy_id, duration_hours);
+  send_register_policy_to_master_factory(policy_id, user_addr, coverage_amount, expiry_timestamp);
+
+  ;; Register policy for oracle monitoring (active until claimed or expired)
+  slice active_policy_slice = begin_cell()
+    .store_slice(user_addr)
+    .store_coins(coverage_amount)
+    .store_uint(expiry_timestamp, 32)
+    .store_int(latitude, 32)
+    .store_int(longitude, 32)
+    .store_uint(radius_km, 16)
+    .end_cell()
+    .begin_parse();
+  active_policies~udict_set(64, policy_id, active_policy_slice);
+
+  ;; Emit event
+  var event_data = begin_cell()
+    .store_uint(policy_id, 64)
+    .store_slice(user_addr)
+    .store_uint(asset_id, 16)
+    .store_coins(coverage_amount)
+    .store_uint(duration_hours, 16)  ;; Duration in hours
+    .store_coins(required_premium)
+    .store_int(latitude, 32)
+    .store_int(longitude, 32)
+    .store_uint(radius_km, 16)
+    .store_uint(now(), 32)
+    .end_cell();
+
+  emit_log_event(EVENT_POLICY_CREATED, event_data);
+}
+
+;; ================================================================
+;; ORACLE EVENT PROCESSING
+;; ================================================================
+
+;; Handle catastrophe event update and trigger matching policies
+() handle_event_update(
+  int event_id,
+  int event_latitude,
+  int event_longitude,
+  int event_severity,    ;; Hurricane: category (3-5), Earthquake: magnitude * 10 (60-100)
+  int event_timestamp
+) impure {
+  ;; Validate event is newer than last processed
+  throw_unless(err::oracle_stale_price, event_id > last_event_id);
+
+  ;; Update stored oracle state
+  last_event_id = event_id;
+  last_event_timestamp = event_timestamp;
+
+  ;; Check if event meets trigger threshold
+  int meets_threshold = 0;
+  if (asset_id == 1) {
+    ;; Hurricane: Category 3+ required
+    meets_threshold = event_severity >= HURRICANE_MIN_CATEGORY;
+  }
+  if (asset_id == 2) {
+    ;; Earthquake: Magnitude 6.0+ required
+    meets_threshold = event_severity >= EARTHQUAKE_MIN_MAGNITUDE;
+  }
+
+  if (meets_threshold) {
+    ;; Emit catastrophe detected event
+    emit_log_event(EVENT_CATASTROPHE_DETECTED, begin_cell()
+      .store_uint(event_id, 32)
+      .store_int(event_latitude, 32)
+      .store_int(event_longitude, 32)
+      .store_uint(event_severity, 16)
+      .store_uint(event_timestamp, 32)
+      .store_uint(asset_id, 16)
+      .end_cell());
+
+    ;; Trigger all policies within affected area
+    trigger_matching_policies(event_latitude, event_longitude, event_severity);
+  }
+}
+
+;; Trigger payouts for policies in affected area
+() trigger_matching_policies(int event_latitude, int event_longitude, int event_severity) impure {
+  ;; Iterate through active policies and check geographic match
+  ;; Use non-destructive iteration to avoid gas issues
+  int policy_id = -1;
+  int found = 1;
+
+  do {
+    (policy_id, slice policy_data, found) = active_policies.udict_get_next?(64, policy_id);
+
+    if (found) {
+      slice user_addr = policy_data~load_msg_addr();
+      int coverage_amount = policy_data~load_coins();
+      int expiry_timestamp = policy_data~load_uint(32);
+      int policy_lat = policy_data~load_int(32);
+      int policy_lon = policy_data~load_int(32);
+      int policy_radius = policy_data~load_uint(16);
+
+      ;; Check if event is within policy coverage area
+      int within_radius = is_within_radius(
+        policy_lat,
+        policy_lon,
+        policy_radius,
+        event_latitude,
+        event_longitude
+      );
+
+      if (within_radius) {
+        ;; Policy triggered - send claim to MasterFactory
+        send_claim_to_master_factory(policy_id, user_addr, coverage_amount, last_event_id, event_severity);
+
+        ;; Remove from active policies (claimed)
+        active_policies~udict_delete?(64, policy_id);
+
+        emit_log_event(EVENT_POLICY_TRIGGERED, begin_cell()
+          .store_uint(policy_id, 64)
+          .store_slice(user_addr)
+          .store_uint(last_event_id, 32)
+          .store_uint(event_severity, 16)
+          .store_coins(coverage_amount)
+          .end_cell());
+      }
+      ;; Policies not within radius remain in active_policies (no action needed)
+    }
+  } until (~ found);
+}
+
+;; Send claim processing request to MasterFactory
+() send_claim_to_master_factory(
+  int policy_id,
+  slice user_addr,
+  int coverage_amount,
+  int event_id,
+  int event_severity
+) impure inline {
+  var claim_msg = begin_cell()
+    .store_uint(policy_id, 64)
+    .store_uint(product_type, 8)     ;; PRODUCT_TRADFI_NATCAT
+    .store_uint(asset_id, 16)         ;; Hurricane/Earthquake
+    .store_slice(user_addr)
+    .store_coins(coverage_amount)
+    .store_uint(event_id, 32)         ;; Catastrophe event ID
+    .store_uint(event_severity, 16)   ;; Category/Magnitude
+    .store_uint(last_event_timestamp, 32)
+    .end_cell();
+
+  send_internal_msg(
+    master_factory_address,
+    50000000, ;; 0.05 TON gas for claim processing
+    op::process_claim,
+    claim_msg
+  );
+}
+
+;; ================================================================
+;; DOWNSTREAM INTEGRATIONS
+;; ================================================================
+
+;; Mint PolicyNFT with geographic metadata
+() send_to_nft_minter(
+  int policy_id,
+  slice user_addr,
+  int coverage_amount,
+  int expiry_timestamp,
+  int latitude,
+  int longitude,
+  int radius_km
+) impure inline {
+  var nft_metadata = begin_cell()
+    .store_uint(policy_id, 64)
+    .store_uint(product_type, 8)     ;; TRADFI_NATCAT
+    .store_uint(asset_id, 16)        ;; Hurricane/Earthquake
+    .store_slice(user_addr)
+    .store_coins(coverage_amount)
+    .store_uint(expiry_timestamp, 32)
+    .store_int(latitude, 32)         ;; Geographic coverage
+    .store_int(longitude, 32)
+    .store_uint(radius_km, 16)
+    .end_cell();
+
+  send_internal_msg(
+    policy_nft_minter_address,
+    50000000, ;; 0.05 TON
+    op::mint_policy_nft,
+    nft_metadata
+  );
+}
+
+;; Send premium to FloatMaster for investment
+() send_premium_to_float(
+  int premium_amount,
+  int policy_id,
+  int duration_hours
+) impure inline {
+  var premium_data = begin_cell()
+    .store_uint(policy_id, 64)
+    .store_uint(product_type, 8)     ;; PRODUCT_TRADFI_NATCAT
+    .store_uint(asset_id, 16)         ;; Hurricane/Earthquake
+    .store_coins(premium_amount)
+    .store_uint(duration_hours, 16)   ;; Duration in hours
+    .end_cell();
+
+  send_internal_msg(
+    float_master_address,
+    premium_amount + 10000000, ;; Premium + 0.01 TON gas
+    op::invest_premium,
+    premium_data
+  );
+}
+
+;; Register policy with MasterFactory
+() send_register_policy_to_master_factory(
+  int policy_id,
+  slice user_addr,
+  int coverage_amount,
+  int expiry_timestamp
+) impure inline {
+  var policy_registration = begin_cell()
+    .store_uint(policy_id, 64)
+    .store_uint(product_type, 8)     ;; PRODUCT_TRADFI_NATCAT
+    .store_uint(asset_id, 16)         ;; Hurricane/Earthquake
+    .store_slice(user_addr)
+    .store_coins(coverage_amount)
+    .store_uint(expiry_timestamp, 32)
+    .store_slice(my_address())        ;; Child contract address
+    .end_cell();
+
+  send_internal_msg(
+    master_factory_address,
+    20000000, ;; 0.02 TON gas
+    op::register_policy,
+    policy_registration
+  );
+}
+
+;; ================================================================
+;; INTERNAL MESSAGE HANDLER
+;; ================================================================
+
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  if (in_msg_body.slice_empty?()) {
+    return (); ;; Accept funds
+  }
+
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+  slice sender = cs~load_msg_addr();
+
+  ;; Check if bounced
+  if (flags & 1) {
+    handle_bounce(in_msg_body);
+    return ();
+  }
+
+  load_data();
+
+  int op = in_msg_body~load_uint(32);
+
+  if (op == op::create_policy_from_factory) {
+    ;; Policy creation from parent factory
+    require_not_paused(paused);
+
+    ;; Validate sender is parent factory
+    throw_unless(err::unauthorized, equal_slice_bits(sender, parent_factory_address));
+
+    ;; Parse policy params
+    slice user_addr = in_msg_body~load_msg_addr();
+    cell params = in_msg_body~load_ref();
+    slice params_slice = params.begin_parse();
+
+    int coverage_amount = params_slice~load_coins();
+    int duration_hours = params_slice~load_uint(16);  ;; Duration in hours
+    int latitude = params_slice~load_int(32);
+    int longitude = params_slice~load_int(32);
+    int radius_km = params_slice~load_uint(16);
+
+    ;; Create policy
+    create_natcat_policy(user_addr, coverage_amount, duration_hours, latitude, longitude, radius_km, msg_value);
+
+    save_data();
+    return ();
+  }
+
+  if (op == op::set_policy_nft_minter) {
+    ;; Set NFT minter address (admin only)
+    throw_unless(err::unauthorized, equal_slice_bits(sender, master_factory_address));
+
+    slice new_minter = in_msg_body~load_msg_addr();
+    policy_nft_minter_address = new_minter;
+
+    save_data();
+
+    emit_log_simple(EVENT_NFT_MINTER_SET, 1);
+    return ();
+  }
+
+  if (op == op::set_float_master) {
+    throw_unless(err::unauthorized, equal_slice_bits(sender, master_factory_address));
+
+    slice new_float = in_msg_body~load_msg_addr();
+    float_master_address = new_float;
+
+    save_data();
+
+    emit_log_simple(EVENT_FLOAT_MASTER_SET, 1);
+    return ();
+  }
+
+  if (op == op::set_event_oracle) {
+    throw_unless(err::unauthorized, equal_slice_bits(sender, master_factory_address));
+
+    slice new_oracle = in_msg_body~load_msg_addr();
+    event_oracle_address = new_oracle;
+
+    save_data();
+
+    emit_log_simple(EVENT_ORACLE_SET, 1);
+    return ();
+  }
+
+  if (op == op::pause) {
+    throw_unless(err::unauthorized, equal_slice_bits(sender, parent_factory_address));
+
+    paused = 1;
+    save_data();
+
+    emit_log_simple(EVENT_CHILD_PAUSED, 1);
+    return ();
+  }
+
+  if (op == op::unpause) {
+    throw_unless(err::unauthorized, equal_slice_bits(sender, parent_factory_address));
+
+    paused = 0;
+    save_data();
+
+    emit_log_simple(EVENT_CHILD_UNPAUSED, 1);
+    return ();
+  }
+
+  if (op == op::event_update) {
+    ;; Catastrophe event update from oracle
+    ;; For now, accept any event update (add whitelist/signature verification in production)
+
+    int event_id = in_msg_body~load_uint(32);
+    int event_latitude = in_msg_body~load_int(32);
+    int event_longitude = in_msg_body~load_int(32);
+    int event_severity = in_msg_body~load_uint(16);
+    int event_timestamp = in_msg_body~load_uint(32);
+
+    ;; Handle event and trigger matching policies
+    handle_event_update(event_id, event_latitude, event_longitude, event_severity, event_timestamp);
+
+    save_data();
+
+    emit_log_event(EVENT_EVENT_UPDATED, begin_cell()
+      .store_uint(event_id, 32)
+      .store_int(event_latitude, 32)
+      .store_int(event_longitude, 32)
+      .store_uint(event_severity, 16)
+      .store_uint(event_timestamp, 32)
+      .store_uint(asset_id, 16)
+      .end_cell());
+
+    return ();
+  }
+
+  throw(0xFFFF);
+}
+
+;; ================================================================
+;; BOUNCED MESSAGE HANDLER
+;; ================================================================
+
+() handle_bounce(slice in_msg) impure {
+  load_data();
+
+  (int op, int error_code, cell payload) = parse_bounced_message(in_msg);
+
+  if ((op == op::mint_policy_nft) | (op == op::invest_premium) | (op == op::register_policy)) {
+    ;; Downstream integration failed
+    var event_data = begin_cell()
+      .store_uint(op, 32)
+      .store_uint(error_code, 32)
+      .store_uint(now(), 32)
+      .end_cell();
+
+    emit_log_event(EVENT_DOWNSTREAM_FAILED, event_data);
+  }
+
+  save_data();
+}
+
+;; ================================================================
+;; GET METHODS
+;; ================================================================
+
+slice get_parent_factory() method_id {
+  load_data();
+  return parent_factory_address;
+}
+
+slice get_master_factory() method_id {
+  load_data();
+  return master_factory_address;
+}
+
+int get_product_type() method_id {
+  load_data();
+  return product_type;
+}
+
+int get_asset_id() method_id {
+  load_data();
+  return asset_id;
+}
+
+slice get_policy_nft_minter() method_id {
+  load_data();
+  return policy_nft_minter_address;
+}
+
+slice get_float_master() method_id {
+  load_data();
+  return float_master_address;
+}
+
+slice get_event_oracle() method_id {
+  load_data();
+  return event_oracle_address;
+}
+
+int get_next_policy_id() method_id {
+  load_data();
+  return next_policy_id;
+}
+
+int get_total_policies() method_id {
+  load_data();
+  return total_policies_created;
+}
+
+int get_total_coverage() method_id {
+  load_data();
+  return total_coverage_amount;
+}
+
+int get_paused() method_id {
+  load_data();
+  return paused;
+}
+
+;; Get policy details by ID
+(slice, int, int, int, int, int, int, int, int, int, int) get_policy(int policy_id) method_id {
+  load_data();
+
+  (slice policy_data, int found) = udict_get?(policy_registry, 64, policy_id);
+
+  if (found == 0) {
+    return (begin_cell().end_cell().begin_parse(), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+  }
+
+  slice user_addr = policy_data~load_msg_addr();
+  int asset = policy_data~load_uint(16);
+  int coverage = policy_data~load_coins();
+  int duration = policy_data~load_uint(16);
+  int premium = policy_data~load_coins();
+  int created_at = policy_data~load_uint(32);
+  int expires_at = policy_data~load_uint(32);
+  int claimed = policy_data~load_uint(1);
+  int latitude = policy_data~load_int(32);
+  int longitude = policy_data~load_int(32);
+  int radius_km = policy_data~load_uint(16);
+
+  return (user_addr, asset, coverage, duration, premium, created_at, expires_at, claimed, latitude, longitude, radius_km);
+}
+
+;; Calculate premium quote (off-chain query)
+;; duration_hours: Policy duration in hours (6-8760)
+int get_premium_quote(int coverage_amount, int duration_hours) method_id {
+  load_data();
+  return calculate_premium(coverage_amount, duration_hours, asset_id);
+}
+
+;; Get trigger thresholds
+(int, int) get_trigger_thresholds() method_id {
+  load_data();
+  if (asset_id == 1) {
+    return (HURRICANE_MIN_CATEGORY, 0); ;; Category 3+
+  }
+  if (asset_id == 2) {
+    return (EARTHQUAKE_MIN_MAGNITUDE, 0); ;; Magnitude 6.0+
+  }
+  return (0, 0);
+}
+
+int get_version() method_id {
+  return 3;
+}
+
+;; ================================================================
+;; END OF NATCATCHILD CONTRACT
+;; ================================================================

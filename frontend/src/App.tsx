@@ -3,6 +3,7 @@ import { BrowserRouter as Router, Routes, Route, Link, useLocation } from 'react
 import { useState, useEffect } from 'react';
 import { WalletConnect } from './components/WalletConnect';
 import { PolicyPurchase } from './pages/PolicyPurchase';
+import { TradFiInsurance } from './pages/TradFiInsurance';
 import { VaultStaking } from './pages/VaultStaking';
 import { Claims } from './pages/Claims';
 import { HedgedInsurance } from './pages/HedgedInsurance';
@@ -15,7 +16,7 @@ import { Escrow } from './pages/Escrow';
 import { AdminDashboard } from './pages/AdminDashboard';
 import { AdminRoute, useIsAdmin } from './components/AdminRoute';
 
-const manifestUrl = 'https://tonsurance.io/tonconnect-manifest.json';
+const manifestUrl = import.meta.env.VITE_TON_CONNECT_MANIFEST_URL || 'http://localhost:5174/tonconnect-manifest.json';
 
 function Navigation() {
   const location = useLocation();
@@ -25,7 +26,7 @@ function Navigation() {
   const [mobileCoverageOpen, setMobileCoverageOpen] = useState(false);
   const isAdmin = useIsAdmin();
 
-  const isCoveragePage = ['/policy', '/multi-chain', '/enterprise', '/hedged'].includes(location.pathname);
+  const isCoveragePage = ['/policy', '/tradfi', '/multi-chain', '/enterprise', '/hedged'].includes(location.pathname);
 
   return (
     <nav className="bg-cream-300 border-b-3 border-cream-400">
@@ -57,8 +58,36 @@ function Navigation() {
 
               {coverageDropdownOpen && (
                 <div
-                  className="absolute top-full left-0 mt-1 w-48 bg-cream-300 border-2 border-cream-400 shadow-lg z-50"
+                  className="absolute top-full left-0 mt-1 w-56 bg-cream-300 border-2 border-cream-400 shadow-lg z-50"
                 >
+                  <div className="px-3 py-1 bg-cream-400 font-bold text-xs text-text-secondary">
+                    HACKATHON DEMO
+                  </div>
+                  <Link
+                    to="/policy"
+                    onClick={() => setCoverageDropdownOpen(false)}
+                    className={`block px-3 py-2 border-b-2 border-cream-400 transition-colors ${
+                      isActive('/policy')
+                        ? 'bg-copper-500 text-cream-50'
+                        : 'hover:bg-cream-200 text-text-primary'
+                    }`}
+                  >
+                    &gt; DeFi (Depeg Insurance)
+                  </Link>
+                  <Link
+                    to="/tradfi"
+                    onClick={() => setCoverageDropdownOpen(false)}
+                    className={`block px-3 py-2 border-b-2 border-cream-400 transition-colors ${
+                      isActive('/tradfi')
+                        ? 'bg-copper-500 text-cream-50'
+                        : 'hover:bg-cream-200 text-text-primary'
+                    }`}
+                  >
+                    &gt; TradFi (Catastrophe) 🌪️
+                  </Link>
+                  <div className="px-3 py-1 bg-cream-400 font-bold text-xs text-text-secondary mt-2">
+                    COMING SOON
+                  </div>
                   <Link
                     to="/multi-chain"
                     onClick={() => setCoverageDropdownOpen(false)}
@@ -197,14 +226,26 @@ function Navigation() {
                     : 'border-cream-400 hover:bg-cream-200 text-text-primary'
                 }`}
               >
-                &gt; BUY_COVERAGE
+                &gt; DeFi (Depeg Insurance)
+              </Link>
+
+              <Link
+                to="/tradfi"
+                onClick={() => setMobileMenuOpen(false)}
+                className={`block px-3 py-2 border-2 transition-colors text-sm font-mono ${
+                  isActive('/tradfi')
+                    ? 'bg-copper-500 text-cream-50 border-copper-600'
+                    : 'border-cream-400 hover:bg-cream-200 text-text-primary'
+                }`}
+              >
+                &gt; TradFi (Catastrophe) 🌪️
               </Link>
 
               <button
                 onClick={() => setMobileCoverageOpen(!mobileCoverageOpen)}
                 className="w-full text-left px-3 py-2 text-xs font-mono text-text-secondary hover:text-copper-500 transition-colors"
               >
-                {mobileCoverageOpen ? '▴' : '▾'} More Coverage Options
+                {mobileCoverageOpen ? '▴' : '▾'} More Coverage Options (Coming Soon)
               </button>
 
               {mobileCoverageOpen && (
@@ -318,6 +359,7 @@ function App() {
             <Routes>
               <Route path="/" element={<Home />} />
               <Route path="/policy" element={<PolicyPurchase />} />
+              <Route path="/tradfi" element={<TradFiInsurance />} />
               <Route path="/multi-chain" element={<MultiChainInsurance />} />
               <Route path="/enterprise" element={<EnterpriseBulk />} />
               <Route path="/hedged" element={<HedgedInsurance />} />

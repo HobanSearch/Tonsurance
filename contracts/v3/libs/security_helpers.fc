@@ -1,0 +1,555 @@
+;; ================================================================
+;; Security Helpers Library for Tonsurance V3
+;; ================================================================
+;;
+;; This library provides reusable security functions for:
+;; - Bounced message handling and error code parsing
+;; - Gas management and buffer reservation
+;; - Rate limiting (5 tx/min per address)
+;; - Nonce-based replay protection
+;; - Early signature validation (~1k gas)
+;; - Event emission for monitoring
+;;
+;; Usage: #include "security_helpers.fc" in your contract
+;; ================================================================
+
+#include "stdlib.fc";
+
+;; ================================================================
+;; CONSTANTS
+;; ================================================================
+
+;; Error codes
+const int ERROR_SIGNATURE_INVALID = 35;
+const int ERROR_RATE_LIMIT = 36;
+const int ERROR_INVALID_NONCE = 37;
+const int ERROR_INSUFFICIENT_GAS = 38;
+const int ERROR_BOUNCE_PREFIX = 400;
+const int ERROR_REENTRANCY = 409;
+
+;; Rate limiting
+const int RATE_LIMIT_WINDOW = 60; ;; 60 seconds (1 minute)
+const int RATE_LIMIT_MAX = 5; ;; 5 transactions per minute
+
+;; Gas reservations
+const int GAS_BUFFER_AMOUNT = 50000000; ;; 0.05 TON for bounce messages
+const int MIN_MSG_VALUE = 10000000; ;; 0.01 TON minimum for operations
+
+;; Bounce message prefix
+const int BOUNCE_PREFIX = 0xFFFFFFFF;
+
+;; Message modes
+const int SEND_MODE_REGULAR = 0;
+const int SEND_MODE_PAY_FEE_SEPARATELY = 1;
+const int SEND_MODE_IGNORE_ERRORS = 2;
+const int SEND_MODE_CARRY_ALL_REMAINING = 128;
+
+;; ================================================================
+;; BOUNCED MESSAGE HANDLING
+;; ================================================================
+
+;; Parse bounced message and extract error details
+;; Returns: (operation, error_code, payload)
+(int, int, cell) parse_bounced_message(slice in_msg) impure inline {
+  int bounce_prefix = in_msg~load_uint(32);
+  throw_unless(ERROR_BOUNCE_PREFIX, bounce_prefix == BOUNCE_PREFIX);
+
+  int op = in_msg~load_uint(32);
+  int error_code = 0;
+  cell payload = begin_cell().end_cell();
+
+  ;; Try to extract error code and payload (may fail if message too small)
+  if (slice_bits(in_msg) >= 32) {
+    error_code = in_msg~load_uint(32);
+  }
+
+  if (slice_refs(in_msg) > 0) {
+    payload = in_msg~load_ref();
+  }
+
+  return (op, error_code, payload);
+}
+
+;; Check if message is bounced (renamed to avoid stdlib conflict)
+int is_message_bounced(slice in_msg) inline {
+  if (slice_bits(in_msg) < 32) {
+    return false;
+  }
+
+  int prefix = in_msg.preload_uint(32);
+  return prefix == BOUNCE_PREFIX;
+}
+
+;; Extract user address from bounced payload
+slice extract_user_address(cell payload) inline {
+  slice payload_slice = payload.begin_parse();
+
+  if (slice_bits(payload_slice) < 267) { ;; Minimum for address (3 + 8 + 256)
+    return null();
+  }
+
+  return payload_slice~load_msg_addr();
+}
+
+;; Extract amount from bounced payload
+int extract_amount(cell payload) inline {
+  slice payload_slice = payload.begin_parse();
+
+  ;; Skip address (267 bits)
+  if (slice_bits(payload_slice) < 267 + 120) { ;; Address + VarUInteger 16
+    return 0;
+  }
+
+  payload_slice~skip_bits(267);
+  return payload_slice~load_coins();
+}
+
+;; ================================================================
+;; GAS MANAGEMENT
+;; ================================================================
+
+;; Validate minimum message value
+() validate_gas_buffer(int msg_value) impure inline {
+  throw_unless(ERROR_INSUFFICIENT_GAS, msg_value >= MIN_MSG_VALUE);
+}
+
+;; Reserve gas buffer for bounce messages
+;; Reserves 0.05 TON from incoming message value
+() reserve_gas_buffer() impure inline {
+  raw_reserve(GAS_BUFFER_AMOUNT, 0); ;; Reserve exactly 0.05 TON
+}
+
+;; Reserve gas buffer with custom amount
+() reserve_gas_buffer_custom(int amount) impure inline {
+  raw_reserve(amount, 0);
+}
+
+;; Calculate remaining gas after reservation
+int get_remaining_balance() inline {
+  return get_balance().pair_first() - GAS_BUFFER_AMOUNT;
+}
+
+;; ================================================================
+;; RATE LIMITING
+;; ================================================================
+
+;; Rate limit check for address (5 tx/min)
+;; Dict: rate_limits<addr_hash:uint256, (last_ts:uint32, count:uint8)>
+;; Returns: true if allowed, false if rate limited
+int rate_limit_check(slice user_addr, cell rate_limits) impure inline {
+  int addr_hash = slice_hash(user_addr);
+  (slice data, int found) = udict_get?(rate_limits, 256, addr_hash);
+
+  if (found == 0) {
+    ;; First transaction from this address
+    rate_limits~udict_set(256, addr_hash,
+      begin_cell()
+        .store_uint(now(), 32)
+        .store_uint(1, 8)
+        .end_cell()
+        .begin_parse()
+    );
+    return true;
+  }
+
+  int last_ts = data~load_uint(32);
+  int count = data~load_uint(8);
+  int time_elapsed = now() - last_ts;
+
+  if (time_elapsed > RATE_LIMIT_WINDOW) {
+    ;; Window expired, reset count
+    rate_limits~udict_set(256, addr_hash,
+      begin_cell()
+        .store_uint(now(), 32)
+        .store_uint(1, 8)
+        .end_cell()
+        .begin_parse()
+    );
+    return true;
+  }
+
+  if (count >= RATE_LIMIT_MAX) {
+    ;; Rate limit exceeded
+    return false;
+  }
+
+  ;; Increment count within window
+  rate_limits~udict_set(256, addr_hash,
+    begin_cell()
+      .store_uint(last_ts, 32)
+      .store_uint(count + 1, 8)
+      .end_cell()
+      .begin_parse()
+  );
+  return true;
+}
+
+;; Rate limit check with custom limits
+int rate_limit_check_custom(
+  slice user_addr,
+  cell rate_limits,
+  int window_seconds,
+  int max_count
+) impure inline {
+  int addr_hash = slice_hash(user_addr);
+  (slice data, int found) = udict_get?(rate_limits, 256, addr_hash);
+
+  if (found == 0) {
+    rate_limits~udict_set(256, addr_hash,
+      begin_cell()
+        .store_uint(now(), 32)
+        .store_uint(1, 8)
+        .end_cell()
+        .begin_parse()
+    );
+    return true;
+  }
+
+  int last_ts = data~load_uint(32);
+  int count = data~load_uint(8);
+  int time_elapsed = now() - last_ts;
+
+  if (time_elapsed > window_seconds) {
+    rate_limits~udict_set(256, addr_hash,
+      begin_cell()
+        .store_uint(now(), 32)
+        .store_uint(1, 8)
+        .end_cell()
+        .begin_parse()
+    );
+    return true;
+  }
+
+  if (count >= max_count) {
+    return false;
+  }
+
+  rate_limits~udict_set(256, addr_hash,
+    begin_cell()
+      .store_uint(last_ts, 32)
+      .store_uint(count + 1, 8)
+      .end_cell()
+      .begin_parse()
+  );
+  return true;
+}
+
+;; ================================================================
+;; NONCE VALIDATION (Replay Protection)
+;; ================================================================
+
+;; Validate sequential nonce (must increment by 1)
+;; Dict: user_nonces<addr_hash:uint256, last_nonce:uint64>
+;; Returns: true if valid, false if invalid
+int validate_nonce(slice user_addr, int nonce, cell user_nonces) impure inline {
+  int addr_hash = slice_hash(user_addr);
+  (slice data, int found) = udict_get?(user_nonces, 256, addr_hash);
+
+  if (found == 0) {
+    ;; First transaction, expect nonce = 1
+    if (nonce != 1) {
+      return false;
+    }
+    user_nonces~udict_set(256, addr_hash,
+      begin_cell().store_uint(1, 64).end_cell().begin_parse()
+    );
+    return true;
+  }
+
+  int last_nonce = data~load_uint(64);
+
+  ;; Nonce must increment by exactly 1
+  if (nonce != last_nonce + 1) {
+    return false;
+  }
+
+  user_nonces~udict_set(256, addr_hash,
+    begin_cell().store_uint(nonce, 64).end_cell().begin_parse()
+  );
+  return true;
+}
+
+;; Get next expected nonce for address
+int get_next_nonce(slice user_addr, cell user_nonces) inline {
+  int addr_hash = slice_hash(user_addr);
+  (slice data, int found) = udict_get?(user_nonces, 256, addr_hash);
+
+  if (found == 0) {
+    return 1; ;; First nonce
+  }
+
+  int last_nonce = data~load_uint(64);
+  return last_nonce + 1;
+}
+
+;; ================================================================
+;; SIGNATURE VALIDATION
+;; ================================================================
+
+;; Early signature validation (~1k gas)
+;; Validates signature before any storage operations
+int validate_signature_early(
+  int msg_hash,
+  slice signature,
+  int public_key
+) inline {
+  return check_signature(msg_hash, signature, public_key);
+}
+
+;; Validate signature from cell
+int validate_signature_from_cell(
+  cell message,
+  slice signature,
+  int public_key
+) inline {
+  int msg_hash = cell_hash(message);
+  return check_signature(msg_hash, signature, public_key);
+}
+
+;; ================================================================
+;; EVENT EMISSION (Monitoring)
+;; ================================================================
+
+;; Emit structured log event for off-chain monitoring
+;; Event format: (event_name:slice, event_data:cell)
+() emit_log_event(int event_type, cell event_data) impure inline {
+  ;; Send to null address with 0 value (creates transaction for indexing)
+  var msg = begin_cell()
+    .store_uint(0x18, 6) ;; Internal message, no bounce
+    .store_slice("Ef8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADAU"a) ;; Null address
+    .store_coins(0) ;; No value
+    .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1) ;; Default message flags
+    .store_uint(event_type, 32)
+    .store_ref(event_data)
+    .end_cell();
+
+  send_raw_message(msg, SEND_MODE_IGNORE_ERRORS);
+}
+
+;; Emit simple event with integer type
+() emit_log_simple(int event_type, int value) impure inline {
+  var event_data = begin_cell()
+    .store_uint(value, 32)
+    .store_uint(now(), 32) ;; Timestamp
+    .end_cell();
+
+  emit_log_event(event_type, event_data);
+}
+
+;; Emit error event with code and context
+() emit_error_event(
+  int event_type,
+  int error_code,
+  slice context
+) impure inline {
+  var event_data = begin_cell()
+    .store_uint(error_code, 32)
+    .store_slice(context)
+    .store_uint(now(), 32)
+    .end_cell();
+
+  emit_log_event(event_type, event_data);
+}
+
+;; ================================================================
+;; MESSAGE SENDING HELPERS
+;; ================================================================
+
+;; Send simple internal message with amount
+() send_simple_message(
+  slice dest_addr,
+  int amount
+) impure inline {
+  var msg = begin_cell()
+    .store_uint(0x18, 6) ;; Internal message, bounce
+    .store_slice(dest_addr)
+    .store_coins(amount)
+    .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1) ;; Default flags
+    .end_cell();
+
+  send_raw_message(msg, SEND_MODE_PAY_FEE_SEPARATELY);
+}
+
+;; Send internal message with operation and body
+() send_internal_msg(
+  slice dest_addr,
+  int amount,
+  int op,
+  cell body
+) impure inline {
+  var msg = begin_cell()
+    .store_uint(0x18, 6) ;; Internal message, bounce
+    .store_slice(dest_addr)
+    .store_coins(amount)
+    .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+    .store_uint(op, 32)
+    .store_ref(body)
+    .end_cell();
+
+  send_raw_message(msg, SEND_MODE_PAY_FEE_SEPARATELY);
+}
+
+;; Send internal message with operation and inline data
+() send_internal_msg_inline(
+  slice dest_addr,
+  int amount,
+  int op,
+  builder inline_data
+) impure inline {
+  var msg = begin_cell()
+    .store_uint(0x18, 6)
+    .store_slice(dest_addr)
+    .store_coins(amount)
+    .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+    .store_uint(op, 32)
+    .store_builder(inline_data)
+    .end_cell();
+
+  send_raw_message(msg, SEND_MODE_PAY_FEE_SEPARATELY);
+}
+
+;; Send message with custom mode
+() send_message_custom_mode(
+  slice dest_addr,
+  int amount,
+  int op,
+  cell body,
+  int send_mode
+) impure inline {
+  var msg = begin_cell()
+    .store_uint(0x18, 6)
+    .store_slice(dest_addr)
+    .store_coins(amount)
+    .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+    .store_uint(op, 32)
+    .store_ref(body)
+    .end_cell();
+
+  send_raw_message(msg, send_mode);
+}
+
+;; ================================================================
+;; REENTRANCY PROTECTION
+;; ================================================================
+
+;; Check reentrancy guard
+() check_reentrancy_guard(int guard) impure inline {
+  throw_if(ERROR_REENTRANCY, guard == 1);
+}
+
+;; Set reentrancy lock
+int lock_reentrancy() inline {
+  return 1;
+}
+
+;; Release reentrancy lock
+int unlock_reentrancy() inline {
+  return 0;
+}
+
+;; ================================================================
+;; ADDRESS VALIDATION
+;; ================================================================
+
+;; Check if address is valid (non-null)
+int is_valid_address(slice addr) inline {
+  return addr.slice_bits() == 267; ;; addr_std has 267 bits (3 + 8 + 256)
+}
+
+;; Check if two addresses are equal
+int equal_addresses(slice addr1, slice addr2) inline {
+  return equal_slice_bits(addr1, addr2);
+}
+
+;; ================================================================
+;; AMOUNT VALIDATION
+;; ================================================================
+
+;; Validate amount is positive
+() validate_positive_amount(int amount) impure inline {
+  throw_unless(401, amount > 0);
+}
+
+;; Validate amount is within range
+() validate_amount_range(int amount, int min_amount, int max_amount) impure inline {
+  throw_unless(402, amount >= min_amount);
+  throw_unless(403, amount <= max_amount);
+}
+
+;; ================================================================
+;; TIME HELPERS
+;; ================================================================
+
+;; Check if timestamp is expired
+int is_expired(int expiry_timestamp) inline {
+  return now() > expiry_timestamp;
+}
+
+;; Check if timestamp is fresh (within N seconds)
+int is_fresh(int timestamp, int max_age_seconds) inline {
+  return (now() - timestamp) <= max_age_seconds;
+}
+
+;; Calculate expiry timestamp (now + duration)
+int calculate_expiry(int duration_seconds) inline {
+  return now() + duration_seconds;
+}
+
+;; ================================================================
+;; DICTIONARY HELPERS
+;; ================================================================
+
+;; Safely get value from dictionary (returns default if not found)
+int dict_get_or_default(cell dict, int key, int key_len, int default_value) inline {
+  (slice data, int found) = udict_get?(dict, key_len, key);
+  if (found == 0) {
+    return default_value;
+  }
+  return data~load_uint(64);
+}
+
+;; Check if key exists in dictionary
+int dict_contains(cell dict, int key, int key_len) inline {
+  (_, int found) = udict_get?(dict, key_len, key);
+  return found;
+}
+
+;; ================================================================
+;; ADMIN HELPERS
+;; ================================================================
+
+;; Validate admin sender
+() require_admin(slice sender, slice admin_address) impure inline {
+  throw_unless(401, equal_slice_bits(sender, admin_address));
+}
+
+;; Validate contract not paused
+() require_not_paused(int paused) impure inline {
+  throw_if(402, paused == 1);
+}
+
+;; ================================================================
+;; MATH HELPERS
+;; ================================================================
+
+;; Safe division (throws if divisor is zero)
+int safe_div(int a, int b) inline {
+  throw_if(404, b == 0);
+  return a / b;
+}
+
+;; Calculate percentage (a * percentage / 100)
+int calculate_percentage(int amount, int percentage) inline {
+  return muldiv(amount, percentage, 100);
+}
+
+;; Calculate with basis points (a * bps / 10000)
+int calculate_bps(int amount, int bps) inline {
+  return muldiv(amount, bps, 10000);
+}
+
+;; abs, min, max are defined in stdlib.fc as assembler built-ins
+
+;; ================================================================
+;; END OF SECURITY HELPERS LIBRARY
+;; ================================================================

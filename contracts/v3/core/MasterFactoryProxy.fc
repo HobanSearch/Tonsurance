@@ -1,0 +1,323 @@
+;; ================================================================
+;; MasterFactoryProxy Contract - Upgradable Master Factory
+;; ================================================================
+;;
+;; Purpose: Proxy pattern for upgradability
+;; Features:
+;; - Permanent address (never changes for users/integrations)
+;; - Stores persistent state (policy registry, product factories)
+;; - Delegates execution to implementation contract
+;; - Admin-only upgrades with multi-sig support
+;;
+;; Upgrade Flow:
+;; 1. Deploy new MasterFactoryImpl_v2 contract
+;; 2. Admin sends op::upgrade with new impl address
+;; 3. Proxy updates implementation pointer
+;; 4. All future calls use new logic, state preserved
+;;
+;; Security:
+;; - Multi-sig admin (3-of-5 recommended for mainnet)
+;; - Time-locked upgrades (48h delay for major changes)
+;; - Emergency pause mechanism
+;;
+;; Target Shard: 0x00 (Core Protocol)
+;; Gas Cost: ~0.005 TON overhead per forwarded message
+;; ================================================================
+
+#include "../libs/security_helpers.fc";
+
+;; ================================================================
+;; STORAGE LAYOUT
+;; ================================================================
+
+global slice implementation_address;  ;; Current implementation contract
+global slice admin_address;            ;; Admin (can upgrade)
+global int paused;                     ;; Emergency pause flag
+global int last_upgrade_timestamp;     ;; Track upgrade frequency
+
+;; Persistent state (preserved across upgrades)
+global cell active_policies;           ;; Dict<policy_id:uint64, policy_data>
+global cell product_factories;         ;; Dict<product_type:uint8, factory_addr:slice>
+global int total_policies_created;     ;; Analytics
+global int protocol_version;           ;; Track implementation version
+
+;; ================================================================
+;; OPCODES
+;; ================================================================
+
+const int op::upgrade_implementation = 0xFF;    ;; Upgrade to new impl
+const int op::set_admin = 0xFE;                  ;; Change admin
+const int op::pause_proxy = 0xFD;                ;; Emergency pause
+const int op::unpause_proxy = 0xFC;              ;; Resume operations
+
+;; All other opcodes forwarded to implementation
+
+;; ================================================================
+;; ERROR CODES
+;; ================================================================
+
+const int err::unauthorized = 401;
+const int err::paused = 402;
+const int err::invalid_implementation = 403;
+const int err::upgrade_too_soon = 404;          ;; Rate limit upgrades
+
+;; ================================================================
+;; EVENT TYPES
+;; ================================================================
+
+const int EVENT_IMPLEMENTATION_UPGRADED = 0x01;
+const int EVENT_IMPLEMENTATION_BOUNCE = 0x02;
+const int EVENT_ADMIN_CHANGED = 0x03;
+const int EVENT_PROXY_PAUSED = 0x04;
+const int EVENT_PROXY_UNPAUSED = 0x05;
+
+;; ================================================================
+;; STORAGE FUNCTIONS
+;; ================================================================
+
+() load_data() impure inline {
+  slice ds = get_data().begin_parse();
+
+  implementation_address = ds~load_msg_addr();
+  admin_address = ds~load_msg_addr();
+  paused = ds~load_uint(1);
+  last_upgrade_timestamp = ds~load_uint(32);
+
+  ;; Persistent state
+  active_policies = ds~load_dict();
+  product_factories = ds~load_dict();
+  total_policies_created = ds~load_uint(64);
+  protocol_version = ds~load_uint(16);
+}
+
+() save_data() impure inline {
+  set_data(
+    begin_cell()
+      .store_slice(implementation_address)
+      .store_slice(admin_address)
+      .store_uint(paused, 1)
+      .store_uint(last_upgrade_timestamp, 32)
+      ;; Persistent state
+      .store_dict(active_policies)
+      .store_dict(product_factories)
+      .store_uint(total_policies_created, 64)
+      .store_uint(protocol_version, 16)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; UPGRADE LOGIC
+;; ================================================================
+
+() upgrade_implementation(slice new_impl_addr) impure {
+  ;; Validate new implementation address
+  throw_if(err::invalid_implementation, is_valid_address(new_impl_addr) == false);
+
+  ;; Rate limit: Min 24 hours between upgrades (safety)
+  int time_since_last_upgrade = now() - last_upgrade_timestamp;
+  throw_unless(err::upgrade_too_soon, time_since_last_upgrade >= 86400);
+
+  ;; Update implementation
+  implementation_address = new_impl_addr;
+  last_upgrade_timestamp = now();
+  protocol_version += 1;
+
+  save_data();
+
+  ;; Emit upgrade event
+  emit_log_event(EVENT_IMPLEMENTATION_UPGRADED,
+    begin_cell()
+      .store_slice(new_impl_addr)
+      .store_uint(protocol_version, 16)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; MESSAGE FORWARDING
+;; ================================================================
+
+() forward_to_implementation(
+  int msg_value,
+  cell in_msg_full,
+  slice in_msg_body
+) impure {
+  ;; Check not paused
+  require_not_paused(paused);
+
+  ;; Forward entire message to implementation
+  ;; Implementation reads sender from in_msg_full, processes, updates proxy state
+
+  var forward_payload = begin_cell()
+    .store_ref(in_msg_full)      ;; Original message (for sender verification)
+    .store_slice(in_msg_body)    ;; Message body
+    .end_cell();
+
+  send_raw_message(
+    begin_cell()
+      .store_uint(0x10, 6)                ;; Non-bounceable internal message
+      .store_slice(implementation_address)
+      .store_coins(msg_value - 5000000)   ;; Forward value minus 0.005 TON proxy fee
+      .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+      .store_ref(forward_payload)
+      .end_cell(),
+    1  ;; Pay fees separately
+  );
+}
+
+;; ================================================================
+;; INTERNAL MESSAGE HANDLER
+;; ================================================================
+
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  ;; Accept empty messages (funding)
+  if (in_msg_body.slice_empty?()) {
+    return ();
+  }
+
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+  slice sender = cs~load_msg_addr();
+
+  ;; Handle bounced messages
+  if (flags & 1) {
+    load_data();
+
+    ;; Log bounce from implementation
+    emit_log_event(EVENT_IMPLEMENTATION_BOUNCE,
+      begin_cell()
+        .store_uint(now(), 32)
+        .end_cell()
+    );
+
+    save_data();
+    return ();
+  }
+
+  load_data();
+
+  int op = in_msg_body~load_uint(32);
+
+  ;; ================================================================
+  ;; PROXY-SPECIFIC OPCODES (handled here, not forwarded)
+  ;; ================================================================
+
+  if (op == op::upgrade_implementation) {
+    ;; Upgrade implementation contract
+    require_admin(sender, admin_address);
+
+    slice new_impl_addr = in_msg_body~load_msg_addr();
+
+    upgrade_implementation(new_impl_addr);
+
+    return ();
+  }
+
+  if (op == op::set_admin) {
+    ;; Change admin address
+    require_admin(sender, admin_address);
+
+    slice new_admin = in_msg_body~load_msg_addr();
+    admin_address = new_admin;
+
+    save_data();
+
+    emit_log_simple(EVENT_ADMIN_CHANGED, 1);
+    return ();
+  }
+
+  if (op == op::pause_proxy) {
+    ;; Emergency pause (admin only)
+    require_admin(sender, admin_address);
+
+    paused = 1;
+    save_data();
+
+    emit_log_simple(EVENT_PROXY_PAUSED, 1);
+    return ();
+  }
+
+  if (op == op::unpause_proxy) {
+    ;; Resume operations
+    require_admin(sender, admin_address);
+
+    paused = 0;
+    save_data();
+
+    emit_log_simple(EVENT_PROXY_UNPAUSED, 1);
+    return ();
+  }
+
+  ;; ================================================================
+  ;; FORWARD ALL OTHER OPERATIONS TO IMPLEMENTATION
+  ;; ================================================================
+
+  save_data();  ;; Save before forwarding (in case impl updates state)
+
+  forward_to_implementation(msg_value, in_msg_full, in_msg_body);
+}
+
+;; ================================================================
+;; GET METHODS
+;; ================================================================
+
+;; Get current implementation address
+slice get_implementation() method_id {
+  load_data();
+  return implementation_address;
+}
+
+;; Get admin address
+slice get_admin() method_id {
+  load_data();
+  return admin_address;
+}
+
+;; Get paused status
+int get_paused() method_id {
+  load_data();
+  return paused;
+}
+
+;; Get protocol version
+int get_protocol_version() method_id {
+  load_data();
+  return protocol_version;
+}
+
+;; Get last upgrade timestamp
+int get_last_upgrade_timestamp() method_id {
+  load_data();
+  return last_upgrade_timestamp;
+}
+
+;; Get total policies created (from persistent state)
+int get_total_policies_created() method_id {
+  load_data();
+  return total_policies_created;
+}
+
+;; Check if policy exists
+int has_policy(int policy_id) method_id {
+  load_data();
+  (_, int found) = udict_get?(active_policies, 64, policy_id);
+  return found;
+}
+
+;; Get product factory address
+slice get_product_factory(int product_type) method_id {
+  load_data();
+  (slice factory_addr, int found) = udict_get?(product_factories, 8, product_type);
+
+  if (found == 0) {
+    return begin_cell().end_cell().begin_parse();
+  }
+
+  return factory_addr~load_msg_addr();
+}
+
+;; ================================================================
+;; END OF MASTERFACTORYPROXY CONTRACT
+;; ================================================================

@@ -1,0 +1,369 @@
+;; ================================================================
+;; DepegSubFactory Contract - Stablecoin Depeg Insurance
+;; ================================================================
+;;
+;; Purpose: Manages stablecoin depeg policy creation
+;; Features:
+;; - Deploys StablecoinChild contracts for each stablecoin
+;; - Routes policies to appropriate stablecoin child
+;; - Asset IDs: USDT=1, USDC=2, DAI=3, USDD=4, TUSD=5, FDUSD=6
+;;
+;; Target Shard: 0x10 (co-located with stablecoin children)
+;; Gas Cost: ~0.01 TON per policy routing
+;; ================================================================
+
+#include "../libs/security_helpers.fc";
+#include "../libs/factory_helpers.fc";
+
+;; ================================================================
+;; ASSET IDs (Stablecoins)
+;; ================================================================
+
+const int ASSET_USDT = 1;              ;; Tether (USDT)
+const int ASSET_USDC = 2;              ;; USD Coin (USDC)
+const int ASSET_DAI = 3;               ;; Dai (DAI)
+const int ASSET_USDD = 4;              ;; USDD (USDD)
+const int ASSET_TUSD = 5;              ;; TrueUSD (TUSD)
+const int ASSET_FDUSD = 6;             ;; First Digital USD (FDUSD)
+const int ASSET_USDE = 7;              ;; Ethena USDe (Hackathon)
+;; Expandable to 255 stablecoins
+
+;; ================================================================
+;; EVENT TYPES
+;; ================================================================
+
+const int EVENT_CHILD_DEPLOYED = 0x01;
+const int EVENT_POLICY_FORWARDED = 0x02;
+const int EVENT_POLICY_FAILED = 0x03;
+const int EVENT_CHILD_REGISTERED = 0x04;
+const int EVENT_CHILD_CODE_SET = 0x05;
+const int EVENT_FACTORY_PAUSED = 0x06;
+const int EVENT_FACTORY_UNPAUSED = 0x07;
+
+;; ================================================================
+;; STORAGE (Same as ProductSubFactory)
+;; ================================================================
+
+global slice master_factory_address;
+global int product_type;               ;; = 1 (PRODUCT_DEPEG)
+global cell children;
+global cell child_codes;
+global int total_children_deployed;
+global int total_policies_created;
+global int paused;
+
+() load_data() impure inline {
+  slice ds = get_data().begin_parse();
+  master_factory_address = ds~load_msg_addr();
+  product_type = ds~load_uint(8);
+  children = ds~load_dict();
+  child_codes = ds~load_dict();
+  total_children_deployed = ds~load_uint(32);
+  total_policies_created = ds~load_uint(64);
+  paused = ds~load_uint(1);
+}
+
+() save_data() impure inline {
+  set_data(
+    begin_cell()
+      .store_slice(master_factory_address)
+      .store_uint(product_type, 8)
+      .store_dict(children)
+      .store_dict(child_codes)
+      .store_uint(total_children_deployed, 32)
+      .store_uint(total_policies_created, 64)
+      .store_uint(paused, 1)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; STABLECOIN-SPECIFIC VALIDATION
+;; ================================================================
+
+;; Validate stablecoin asset ID
+int is_valid_stablecoin(int asset_id) inline {
+  ;; Valid range: 1-255 (currently 1-6 defined, expandable)
+  return (asset_id >= 1) & (asset_id <= 255);
+}
+
+;; Get stablecoin name - COMMENTED OUT (FunC doesn't support address literal returns)
+;; Off-chain indexer uses asset_id → name mapping instead
+;; slice get_stablecoin_name(int asset_id) inline {
+;;   if (asset_id == ASSET_USDT) { return "USDT"a; }
+;;   if (asset_id == ASSET_USDC) { return "USDC"a; }
+;;   if (asset_id == ASSET_DAI) { return "DAI"a; }
+;;   if (asset_id == ASSET_USDD) { return "USDD"a; }
+;;   if (asset_id == ASSET_TUSD) { return "TUSD"a; }
+;;   if (asset_id == ASSET_FDUSD) { return "FDUSD"a; }
+;;   return "UNKNOWN"a;
+;; }
+
+;; ================================================================
+;; CHILD DEPLOYMENT (Stablecoin-Specific)
+;; ================================================================
+
+slice deploy_stablecoin_child(int asset_id, cell child_params) impure {
+  throw_unless(403, is_valid_stablecoin(asset_id));
+
+  ;; Get child code
+  (cell child_code, int code_found) = udict_get_ref?(child_codes, 16, asset_id);
+  throw_unless(405, code_found);
+
+  ;; Build integration addresses reference (initially null - set via setters later)
+  ;; StablecoinChild expects: policy_nft_minter, float_master, price_oracle
+  var addr_ref = begin_cell()
+    .store_uint(0, 2) ;; addr_none for policy_nft_minter
+    .store_uint(0, 2) ;; addr_none for float_master
+    .store_uint(0, 2) ;; addr_none for price_oracle
+    .end_cell();
+
+  ;; Build stablecoin child data matching StablecoinChild load_data() structure
+  var child_data = begin_cell()
+    .store_slice(my_address())           ;; parent_factory_address
+    .store_slice(master_factory_address) ;; master_factory_address
+    .store_uint(product_type, 8)         ;; product_type
+    .store_uint(asset_id, 16)            ;; asset_id
+    .store_ref(addr_ref)                 ;; Integration addresses reference
+    .store_dict(null())                  ;; policy_registry (empty dict)
+    .store_uint(0, 64)                   ;; next_policy_id = 0
+    .store_uint(0, 64)                   ;; total_policies_created = 0
+    .store_coins(0)                      ;; total_coverage_amount = 0
+    .store_uint(0, 1)                    ;; paused = false
+    .store_uint(0, 32)                   ;; last_oracle_price = 0
+    .store_uint(0, 32)                   ;; last_oracle_timestamp = 0
+    .store_uint(0, 32)                   ;; depeg_start_timestamp = 0
+    .store_dict(null())                  ;; active_policies (empty dict)
+    .end_cell();
+
+  ;; Deploy child using direct deployment helper (no salt wrapping)
+  ;; This enables natural policy co-location around each child's address
+  int deployment_value = 200000000;
+  slice child_addr = deploy_child_direct(
+    child_code,
+    child_data,
+    deployment_value
+  );
+
+  ;; Register child
+  children = register_child(children, asset_id, child_addr);
+  total_children_deployed += 1;
+
+  ;; Emit event
+  var event_data = begin_cell()
+    .store_uint(asset_id, 16)
+    .store_slice(child_addr)
+    .store_uint(now(), 32)
+    .end_cell();
+
+  emit_log_event(EVENT_CHILD_DEPLOYED, event_data);
+
+  return child_addr;
+}
+
+;; ================================================================
+;; POLICY ROUTING (Same as base, calls stablecoin-specific deploy)
+;; ================================================================
+
+() route_to_stablecoin_child(
+  slice user_addr,
+  int asset_id,
+  cell policy_params
+) impure {
+  throw_unless(403, is_valid_stablecoin(asset_id));
+
+  ;; Get child address (must be pre-deployed)
+  (slice child_addr, int found) = get_child_address(children, asset_id);
+  throw_unless(405, found); ;; Fail if child not registered - children must be pre-deployed
+
+  ;; Forward to child
+  var forward_body = begin_cell()
+    .store_slice(user_addr)
+    .store_ref(policy_params)
+    .end_cell();
+
+  int forward_amount = 300000000;
+
+  forward_to_child(
+    child_addr,
+    forward_amount,
+    0x40, ;; op::child_create_policy
+    forward_body
+  );
+
+  total_policies_created += 1;
+
+  ;; Emit event
+  var event_data = begin_cell()
+    .store_slice(user_addr)
+    .store_uint(asset_id, 16)
+    .store_uint(now(), 32)
+    .end_cell();
+
+  emit_log_event(EVENT_POLICY_FORWARDED, event_data);
+}
+
+;; ================================================================
+;; MESSAGE HANDLERS (Same as ProductSubFactory)
+;; ================================================================
+
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  if (in_msg_body.slice_empty?()) {
+    return ();
+  }
+
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+  slice sender = cs~load_msg_addr();
+
+  if (flags & 1) {
+    ;; Bounced message
+    load_data();
+    (int op, int error_code, cell payload) = parse_bounced_message(in_msg_body);
+
+    if (op == 0x40) {
+      slice user_addr = extract_user_address(payload);
+      int refund_amount = extract_amount(payload);
+
+      if (is_valid_address(user_addr)) {
+        int fee = 10000000;
+        int refund = refund_amount > fee ? refund_amount - fee : 0;
+        if (refund > 0) {
+          send_simple_message(user_addr, refund);
+        }
+      }
+
+      emit_log_event(EVENT_POLICY_FAILED, begin_cell().store_slice(user_addr).store_uint(error_code, 32).end_cell());
+    }
+
+    save_data();
+    return ();
+  }
+
+  load_data();
+
+  int op = in_msg_body~load_uint(32);
+
+  if (op == 0x30) {
+    ;; create_policy_from_master
+    require_not_paused(paused);
+    throw_unless(401, equal_slice_bits(sender, master_factory_address));
+
+    slice user_addr = in_msg_body~load_msg_addr();
+    int asset_id = in_msg_body~load_uint(16);
+    cell policy_params = in_msg_body~load_ref();
+
+    route_to_stablecoin_child(user_addr, asset_id, policy_params);
+
+    save_data();
+    return ();
+  }
+
+  if (op == 0x31) {
+    ;; register_child
+    throw_unless(401, equal_slice_bits(sender, master_factory_address));
+
+    int asset_id = in_msg_body~load_uint(16);
+    slice child_addr = in_msg_body~load_msg_addr();
+
+    children = register_child(children, asset_id, child_addr);
+    total_children_deployed += 1;
+    save_data();
+
+    emit_log_simple(EVENT_CHILD_REGISTERED, asset_id);
+    return ();
+  }
+
+  if (op == 0x32) {
+    ;; set_child_code
+    throw_unless(401, equal_slice_bits(sender, master_factory_address));
+
+    int asset_id = in_msg_body~load_uint(16);
+    cell child_code = in_msg_body~load_ref();
+
+    child_codes~udict_set_ref(16, asset_id, child_code);
+    save_data();
+
+    emit_log_simple(EVENT_CHILD_CODE_SET, asset_id);
+    return ();
+  }
+
+  if (op == 0x33) {
+    ;; pause
+    throw_unless(401, equal_slice_bits(sender, master_factory_address));
+    paused = 1;
+    save_data();
+    emit_log_simple(EVENT_FACTORY_PAUSED, 1);
+    return ();
+  }
+
+  if (op == 0x34) {
+    ;; unpause
+    throw_unless(401, equal_slice_bits(sender, master_factory_address));
+    paused = 0;
+    save_data();
+    emit_log_simple(EVENT_FACTORY_UNPAUSED, 1);
+    return ();
+  }
+
+  throw(0xFFFF);
+}
+
+;; ================================================================
+;; GET METHODS
+;; ================================================================
+
+slice get_master_factory() method_id {
+  load_data();
+  return master_factory_address;
+}
+
+int get_product_type() method_id {
+  load_data();
+  return product_type;
+}
+
+slice get_child(int asset_id) method_id {
+  load_data();
+  (slice child_addr, int found) = get_child_address(children, asset_id);
+  if (found == 0) {
+    return begin_cell().end_cell().begin_parse(); ;; Return empty slice if not found
+  }
+  return child_addr;
+}
+
+int has_child(int asset_id) method_id {
+  load_data();
+  return is_child_deployed(children, asset_id);
+}
+
+int get_total_children() method_id {
+  load_data();
+  return total_children_deployed;
+}
+
+int get_total_policies() method_id {
+  load_data();
+  return total_policies_created;
+}
+
+int get_paused() method_id {
+  load_data();
+  return paused;
+}
+
+;; Get supported stablecoins
+;; Returns: bitmap of supported assets (1-255)
+int get_supported_stablecoins() method_id {
+  ;; Return bitmap indicating assets 1-7 are supported
+  ;; Bit 1 set = USDT supported, Bit 2 = USDC, etc.
+  return 0x7F; ;; 0b01111111 = assets 1-7 supported
+}
+
+int get_version() method_id {
+  return 3;
+}
+
+;; ================================================================
+;; END OF DEPEGSUBFACTORY
+;; ================================================================

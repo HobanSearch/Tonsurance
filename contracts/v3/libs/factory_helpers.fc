@@ -1,0 +1,566 @@
+;; ================================================================
+;; Factory Helpers Library for Tonsurance V3
+;; ================================================================
+;;
+;; This library provides shard-aware contract deployment functions:
+;; - Salt-based address generation (target specific shard prefixes)
+;; - StateInit construction and address computation
+;; - Child contract deployment with bounce handling
+;; - Shard verification utilities
+;;
+;; Target shard prefixes:
+;; - 0x00: Core protocol (GasWallet, MasterFactory, etc.)
+;; - 0x10: Depeg products (DepegSubFactory, stablecoin children)
+;; - 0x20: Bridge products
+;; - 0x30: Oracle products
+;; - 0x40: Contract products
+;; - 0xF0: Vault system
+;;
+;; Usage: #include "factory_helpers.fc" in factory contracts
+;; ================================================================
+
+#include "stdlib.fc";
+
+;; ================================================================
+;; CONSTANTS
+;; ================================================================
+
+;; Deployment parameters
+const int MAX_SALT_ITERATIONS = 10000; ;; Maximum salts to try
+const int DEPLOYMENT_VALUE_MIN = 100000000; ;; 0.1 TON minimum for deployment
+const int DEPLOYMENT_GAS = 50000000; ;; 0.05 TON gas buffer
+
+;; Error codes
+const int err::salt_not_found = 500;
+const int err::invalid_state_init = 501;
+const int err::deployment_failed = 502;
+const int err::wrong_shard = 503;
+
+;; Message modes
+const int SEND_MODE_REGULAR = 0;
+const int SEND_MODE_PAY_FEE_SEPARATELY = 1;
+const int SEND_MODE_BOUNCE = 64;
+
+;; ================================================================
+;; STATE INIT CONSTRUCTION
+;; ================================================================
+
+;; Build StateInit cell from code and data
+;; StateInit TLB: split_depth:(Maybe (## 5)) special:(Maybe TickTock)
+;;                code:(Maybe ^Cell) data:(Maybe ^Cell) library:(Maybe ^Cell)
+cell build_state_init(cell code, cell data) inline {
+  return begin_cell()
+    .store_uint(0, 2) ;; No split_depth
+    .store_uint(0, 1) ;; No special
+    .store_uint(1, 1) ;; Code present
+    .store_uint(1, 1) ;; Data present
+    .store_uint(0, 1) ;; No library
+    .store_ref(code)
+    .store_ref(data)
+    .end_cell();
+}
+
+;; Build StateInit with salt (for shard targeting)
+;; Salt is appended to data cell for address variation
+cell build_state_init_with_salt(cell code, cell base_data, int salt) inline {
+  var salted_data = begin_cell()
+    .store_ref(base_data)
+    .store_uint(salt, 64) ;; 64-bit salt
+    .end_cell();
+
+  return build_state_init(code, salted_data);
+}
+
+;; ================================================================
+;; ADDRESS COMPUTATION
+;; ================================================================
+
+;; Compute contract address from StateInit
+;; Address = (0, hash(StateInit))
+;; Returns: address as slice
+slice compute_address_from_state_init(cell state_init) inline {
+  int state_init_hash = cell_hash(state_init);
+
+  ;; addr_std$10 anycast:(Maybe Anycast) workchain_id:int8 address:bits256
+  return begin_cell()
+    .store_uint(4, 3) ;; addr_std$10 + no anycast (0)
+    .store_uint(0, 8) ;; Workchain 0 (basechain)
+    .store_uint(state_init_hash, 256)
+    .end_cell()
+    .begin_parse();
+}
+
+;; Extract address prefix (first byte of address hash)
+;; Used for shard targeting
+int get_address_prefix(slice addr) inline {
+  ;; Skip first 3 bits (addr_std$10 + anycast flag)
+  ;; Skip next 8 bits (workchain_id)
+  ;; Read first 8 bits of address (prefix)
+  slice addr_copy = addr;
+  addr_copy~skip_bits(3 + 8); ;; Skip to address
+  return addr_copy~load_uint(8); ;; First byte of address
+}
+
+;; ================================================================
+;; SHARD-TARGETED DEPLOYMENT
+;; ================================================================
+
+;; Find salt that produces address with target prefix
+;; Returns: (salt, address) or throws if not found after MAX_SALT_ITERATIONS
+(int, slice) find_salt_for_shard(
+  cell code,
+  cell base_data,
+  int target_prefix
+) {
+  int salt = 0;
+
+  repeat (MAX_SALT_ITERATIONS) {
+    ;; Build StateInit with current salt
+    cell state_init = build_state_init_with_salt(code, base_data, salt);
+
+    ;; Compute address
+    slice addr = compute_address_from_state_init(state_init);
+
+    ;; Check prefix
+    int prefix = get_address_prefix(addr);
+
+    if (prefix == target_prefix) {
+      ;; Found matching salt!
+      return (salt, addr);
+    }
+
+    salt += 1;
+  }
+
+  ;; Failed to find salt after MAX_SALT_ITERATIONS
+  throw(err::salt_not_found);
+  return (0, begin_cell().end_cell().begin_parse()); ;; Unreachable, but needed for type checking
+}
+
+;; Deploy child contract to target shard
+;; Returns: deployed contract address
+slice deploy_child_with_shard_target(
+  cell code,
+  cell base_data,
+  int target_prefix,
+  int deployment_value
+) impure {
+  ;; Validate deployment value
+  throw_unless(err::deployment_failed, deployment_value >= DEPLOYMENT_VALUE_MIN);
+
+  ;; Find salt for target shard
+  (int salt, slice target_addr) = find_salt_for_shard(code, base_data, target_prefix);
+
+  ;; Build StateInit with found salt
+  cell salted_data = begin_cell()
+    .store_ref(base_data)
+    .store_uint(salt, 64)
+    .end_cell();
+
+  cell state_init = build_state_init(code, salted_data);
+
+  ;; Send deployment message
+  var msg = begin_cell()
+    .store_uint(0x18, 6) ;; Internal message, bounce
+    .store_slice(target_addr)
+    .store_coins(deployment_value)
+    .store_uint(4 + 2 + 1, 1 + 4 + 4 + 64 + 32 + 1 + 1) ;; state_init in message
+    .store_ref(state_init)
+    .store_uint(0, 1) ;; No message body (empty body)
+    .end_cell();
+
+  send_raw_message(msg, SEND_MODE_PAY_FEE_SEPARATELY);
+
+  return target_addr;
+}
+
+;; Deploy child contract to same shard as parent
+;; Uses parent contract's address prefix as target
+slice deploy_child_same_shard(
+  cell code,
+  cell base_data,
+  int deployment_value
+) impure {
+  ;; Get parent (this contract) address
+  slice parent_addr = my_address();
+  int parent_prefix = get_address_prefix(parent_addr);
+
+  ;; Deploy to same shard as parent
+  return deploy_child_with_shard_target(
+    code,
+    base_data,
+    parent_prefix,
+    deployment_value
+  );
+}
+
+;; ================================================================
+;; DIRECT DEPLOYMENT (No Salt Wrapping)
+;; ================================================================
+
+;; Deploy child contract directly without salt wrapping
+;; Use this when child contracts expect unwrapped data structure
+;; Note: Children will deploy to deterministic addresses based on their StateInit
+;; This enables natural policy co-location (policies cluster around their parent child)
+;; TODO: Post-hackathon optimization - add shard targeting if cross-child batching needed
+;; Returns: deployed contract address
+slice deploy_child_direct(
+  cell code,
+  cell data,
+  int deployment_value
+) impure {
+  ;; Validate deployment value
+  throw_unless(err::deployment_failed, deployment_value >= DEPLOYMENT_VALUE_MIN);
+
+  ;; Build StateInit
+  cell state_init = begin_cell()
+    .store_uint(0, 2) ;; No split_depth
+    .store_uint(0, 1) ;; No special
+    .store_uint(1, 1) ;; Code present
+    .store_uint(1, 1) ;; Data present
+    .store_uint(0, 1) ;; No library
+    .store_ref(code)
+    .store_ref(data)
+    .end_cell();
+
+  ;; Compute address from StateInit
+  int state_init_hash = cell_hash(state_init);
+  slice target_addr = begin_cell()
+    .store_uint(4, 3)  ;; addr_std$10 + no anycast
+    .store_uint(0, 8)  ;; Workchain 0
+    .store_uint(state_init_hash, 256)
+    .end_cell()
+    .begin_parse();
+
+  ;; Build deployment message
+  ;; Format per TON docs: 0x18 + addr + coins + packed_zeros + init_flags + state_init + body
+  var msg = begin_cell()
+    .store_uint(0x18, 6)       ;; Internal message, bounce enabled
+    .store_slice(target_addr)  ;; Destination address
+    .store_coins(deployment_value)  ;; Value to send
+    .store_uint(0, 1 + 4 + 4 + 64 + 32)  ;; Extra-currency + IHR fee + fwd fee + created_lt + created_at (all zeros)
+    .store_uint(1, 1)          ;; Init present = true
+    .store_uint(1, 1)          ;; Init as reference = true
+    .store_ref(state_init)     ;; StateInit reference
+    .store_uint(0, 1)          ;; Body inline (not reference)
+    ;; Empty body
+    .end_cell();
+
+  send_raw_message(msg, SEND_MODE_PAY_FEE_SEPARATELY);
+
+  return target_addr;
+}
+
+;; ================================================================
+;; DEPLOYMENT WITH INITIALIZATION
+;; ================================================================
+
+;; Deploy child contract with initialization message
+;; Sends StateInit + initialization op in same message
+slice deploy_child_with_init(
+  cell code,
+  cell base_data,
+  int target_prefix,
+  int deployment_value,
+  int init_op,
+  cell init_body
+) impure {
+  ;; Find salt for target shard
+  (int salt, slice target_addr) = find_salt_for_shard(code, base_data, target_prefix);
+
+  ;; Build StateInit with found salt
+  cell salted_data = begin_cell()
+    .store_ref(base_data)
+    .store_uint(salt, 64)
+    .end_cell();
+
+  cell state_init = build_state_init(code, salted_data);
+
+  ;; Build message body (init operation)
+  var body = begin_cell()
+    .store_uint(init_op, 32)
+    .store_ref(init_body)
+    .end_cell();
+
+  ;; Send deployment message with body
+  var msg = begin_cell()
+    .store_uint(0x18, 6)
+    .store_slice(target_addr)
+    .store_coins(deployment_value)
+    .store_uint(4 + 2 + 0, 1 + 4 + 4 + 64 + 32 + 1 + 1) ;; state_init + body
+    .store_ref(state_init)
+    .store_ref(body)
+    .end_cell();
+
+  send_raw_message(msg, SEND_MODE_PAY_FEE_SEPARATELY);
+
+  return target_addr;
+}
+
+;; ================================================================
+;; VERIFICATION HELPERS
+;; ================================================================
+
+;; Verify deployed contract is in target shard
+;; Returns: 1 if correct, 0 if wrong shard
+int verify_shard_placement(slice contract_addr, int expected_prefix) inline {
+  int actual_prefix = get_address_prefix(contract_addr);
+  return actual_prefix == expected_prefix;
+}
+
+;; Verify contract is deployed (has code)
+;; Returns: 1 if deployed, 0 if not
+int is_contract_deployed(slice contract_addr) inline {
+  ;; Note: This function can't directly check on-chain state in FunC
+  ;; Actual verification should be done via get_method calls from off-chain
+  ;; This is a placeholder for documentation
+  return true;
+}
+
+;; ================================================================
+;; REGISTRY HELPERS
+;; ================================================================
+
+;; Register deployed child in parent's registry
+;; Dict: children<child_id:uint16, child_addr:slice>
+;; Returns: updated children cell (FunC passes cells by value, not reference)
+cell register_child(cell children, int child_id, slice child_addr) inline {
+  ;; Store child address in registry
+  children~udict_set(16, child_id,
+    begin_cell()
+      .store_slice(child_addr)
+      .end_cell()
+      .begin_parse()
+  );
+  return children;
+}
+
+;; Get child address from registry
+;; Returns: (child_addr, found)
+(slice, int) get_child_address(cell children, int child_id) inline {
+  (slice data, int found) = udict_get?(children, 16, child_id);
+
+  if (found == 0) {
+    return (begin_cell().end_cell().begin_parse(), 0);
+  }
+
+  slice child_addr = data~load_msg_addr();
+  return (child_addr, 1);
+}
+
+;; Check if child is already deployed
+int is_child_deployed(cell children, int child_id) inline {
+  (_, int found) = udict_get?(children, 16, child_id);
+  return found;
+}
+
+;; ================================================================
+;; PRODUCT ROUTING HELPERS
+;; ================================================================
+
+;; Get target shard prefix for product type
+;; Product types: 1=Depeg, 2=Bridge, 3=Oracle, 4=Contract
+int get_product_shard_prefix(int product_type) inline {
+  if (product_type == 1) {
+    return 0x10; ;; Depeg → Shard 0x10
+  }
+  if (product_type == 2) {
+    return 0x20; ;; Bridge → Shard 0x20
+  }
+  if (product_type == 3) {
+    return 0x30; ;; Oracle → Shard 0x30
+  }
+  if (product_type == 4) {
+    return 0x40; ;; Contract → Shard 0x40
+  }
+
+  ;; Unknown product type, use 0xF0 (general)
+  return 0xF0;
+}
+
+;; Get expected deployment gas for product type
+;; Larger contracts (e.g., vault) need more gas
+int get_deployment_gas(int product_type) inline {
+  if (product_type == 1) {
+    return 200000000; ;; 0.2 TON (Depeg sub-factory)
+  }
+  if (product_type == 2) {
+    return 200000000; ;; 0.2 TON (Bridge sub-factory)
+  }
+  if (product_type == 3) {
+    return 200000000; ;; 0.2 TON (Oracle sub-factory)
+  }
+  if (product_type == 4) {
+    return 200000000; ;; 0.2 TON (Contract sub-factory)
+  }
+
+  ;; Vault or large contract
+  return 1000000000; ;; 1.0 TON
+}
+
+;; ================================================================
+;; MESSAGE FORWARDING HELPERS
+;; ================================================================
+
+;; Forward message to child contract (for policy creation)
+() forward_to_child(
+  slice child_addr,
+  int forward_amount,
+  int op,
+  cell forward_body
+) impure inline {
+  var msg = begin_cell()
+    .store_uint(0x18, 6) ;; Internal message, bounce
+    .store_slice(child_addr)
+    .store_coins(forward_amount)
+    .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+    .store_uint(op, 32)
+    .store_ref(forward_body)
+    .end_cell();
+
+  send_raw_message(msg, SEND_MODE_PAY_FEE_SEPARATELY);
+}
+
+;; Forward message with remaining balance (carry all)
+() forward_with_remaining_balance(
+  slice child_addr,
+  int op,
+  cell forward_body
+) impure inline {
+  var msg = begin_cell()
+    .store_uint(0x18, 6)
+    .store_slice(child_addr)
+    .store_coins(0) ;; Will be filled with remaining balance
+    .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+    .store_uint(op, 32)
+    .store_ref(forward_body)
+    .end_cell();
+
+  send_raw_message(msg, 128); ;; SEND_MODE_CARRY_ALL_REMAINING
+}
+
+;; ================================================================
+;; ANALYTICS HELPERS
+;; ================================================================
+
+;; Calculate expected salt search time (probabilistic)
+;; For target prefix 0xXX, expected iterations = 256 (1/256 probability per salt)
+;; Returns: estimated iterations (average case)
+int estimate_salt_iterations(int target_prefix) inline {
+  ;; For 8-bit prefix, expected ~256 iterations
+  ;; In practice, 50% chance within 177 iterations, 99% within 1177 iterations
+  return 256;
+}
+
+;; Calculate deployment cost estimate
+;; Returns: total cost (deployment value + gas + salt search cost)
+int estimate_deployment_cost(
+  int deployment_value,
+  int target_prefix
+) inline {
+  int salt_search_cost = 2000000; ;; ~0.002 TON (estimated gas for salt iteration)
+  int message_cost = 5000000; ;; ~0.005 TON (cross-shard message)
+
+  return deployment_value + salt_search_cost + message_cost;
+}
+
+;; ================================================================
+;; BATCH DEPLOYMENT HELPERS
+;; ================================================================
+
+;; Deploy multiple children in batch (same shard)
+;; Returns: number successfully deployed
+int deploy_children_batch(
+  cell code,
+  cell base_data_template,
+  int target_prefix,
+  int count,
+  int deployment_value_each
+) impure {
+  int deployed = 0;
+
+  repeat (count) {
+    ;; Modify base_data for each child (add index)
+    cell child_data = begin_cell()
+      .store_ref(base_data_template)
+      .store_uint(deployed, 16) ;; Child index
+      .end_cell();
+
+    ;; Deploy child
+    slice child_addr = deploy_child_with_shard_target(
+      code,
+      child_data,
+      target_prefix,
+      deployment_value_each
+    );
+
+    deployed += 1;
+  }
+
+  return deployed;
+}
+
+;; ================================================================
+;; ERROR HANDLING HELPERS
+;; ================================================================
+
+;; Build error message for deployment failure
+cell build_deployment_error(
+  int child_id,
+  int error_code,
+  slice user_addr
+) inline {
+  return begin_cell()
+    .store_uint(child_id, 16)
+    .store_uint(error_code, 32)
+    .store_slice(user_addr)
+    .store_uint(now(), 32)
+    .end_cell();
+}
+
+;; Handle deployment bounce (child deployment failed)
+() handle_deployment_bounce(
+  slice in_msg,
+  slice user_addr,
+  int refund_amount
+) impure inline {
+  ;; Refund user (subtract fee)
+  int fee = 10000000; ;; 0.01 TON fee
+  int refund = refund_amount > fee ? refund_amount - fee : 0;
+
+  if (refund > 0) {
+    var refund_msg = begin_cell()
+      .store_uint(0x18, 6)
+      .store_slice(user_addr)
+      .store_coins(refund)
+      .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+      .end_cell();
+
+    send_raw_message(refund_msg, SEND_MODE_PAY_FEE_SEPARATELY);
+  }
+}
+
+;; ================================================================
+;; UTILITY FUNCTIONS
+;; ================================================================
+
+;; Convert address slice to hash for dictionary keys
+int address_to_hash(slice addr) inline {
+  return slice_hash(addr);
+}
+
+;; Check if address is in same shard as contract
+int is_same_shard(slice addr1, slice addr2) inline {
+  int prefix1 = get_address_prefix(addr1);
+  int prefix2 = get_address_prefix(addr2);
+  return prefix1 == prefix2;
+}
+
+;; Get current contract's shard prefix
+int get_my_shard_prefix() inline {
+  return get_address_prefix(my_address());
+}
+
+;; ================================================================
+;; END OF FACTORY HELPERS LIBRARY
+;; ================================================================

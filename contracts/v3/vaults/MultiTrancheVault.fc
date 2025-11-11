@@ -1,0 +1,1385 @@
+;; ================================================================
+;; MultiTrancheVault Contract - 6-Tier Waterfall Vault System
+;; ================================================================
+;;
+;; Purpose: Multi-tranche LP capital vault with waterfall loss absorption
+;; Features:
+;; - 6 tranches: BTC (15%), SNR (20%), MEZZ (25%), JNR (20%), JNR+ (15%), EQT (5%)
+;; - NAV-based deposit/withdraw with LP token minting
+;; - Waterfall loss absorption (EQT → JNR+ → JNR → MEZZ → SNR → BTC)
+;; - Circuit breaker (10% max loss per 24h)
+;; - 2PC token mint/burn with bounce recovery
+;; - Reentrancy protection
+;;
+;; Target Shard: 0xF0 (isolated from policy contracts, high message volume)
+;; Gas Cost: ~0.15 TON deposit, ~0.20 TON withdraw
+;;
+;; ⚠️ REFACTOR AREAS (awaiting Float specs):
+;; - Premium distribution (should receive from Float, not direct)
+;; - Bonding curves (currently simple NAV, need user specs)
+;; - Base returns per tranche (need formulas)
+;; - EQT 25% cap mechanism (excess → protocol capital for buybacks)
+;; ================================================================
+
+#include "../libs/security_helpers.fc";
+
+;; ================================================================
+;; CONSTANTS
+;; ================================================================
+
+const int DECIMALS = 1000000000;          ;; 9 decimal places
+const int MIN_DEPOSIT = 100000000;        ;; 0.1 TON minimum
+
+;; Tranche IDs
+const int TRANCHE_BTC = 1;    ;; Bitcoin (15% allocation, lowest risk)
+const int TRANCHE_SNR = 2;    ;; Senior (20%)
+const int TRANCHE_MEZZ = 3;   ;; Mezzanine (25%)
+const int TRANCHE_JNR = 4;    ;; Junior (20%)
+const int TRANCHE_JNR_PLUS = 5;  ;; Junior+ (15%)
+const int TRANCHE_EQT = 6;    ;; Equity (5%, highest risk)
+
+;; Bonding Curve Types
+const int CURVE_FLAT = 1;            ;; BTC: NAV = 1.0 + 0.04*t
+const int CURVE_LOGARITHMIC = 2;     ;; SNR: NAV = 1.0 + 0.08*log(1+t)
+const int CURVE_LINEAR = 3;          ;; MEZZ: NAV = 1.0 + 0.10*t
+const int CURVE_SIGMOID = 4;         ;; JNR: NAV = 1.0 + 0.30/(1+e^(-5*(t-0.5)))
+const int CURVE_QUADRATIC = 5;       ;; JNR+: NAV = 1.0 + 0.21*t^2
+const int CURVE_CAPPED_EXPONENTIAL = 6;  ;; EQT: NAV = min(1.25, 1.0+0.15*(e^t-1))
+
+;; Operation codes
+const int op::deposit = 0x01;
+const int op::withdraw = 0x02;
+const int op::distribute_premiums = 0x03;  ;; DEPRECATED: Will be removed in Float integration
+const int op::absorb_loss = 0x04;
+const int op::claim_yield = 0x05;
+const int op::accrue_daily_yield = 0x06;   ;; NEW: Continuous yield distribution from Float
+const int op::set_master_factory = 0x10;
+const int op::set_claims_processor = 0x11;
+const int op::set_tranche_token = 0x12;
+const int op::set_float_manager = 0x17;    ;; NEW: Set FloatMaster address
+const int op::pause = 0x13;
+const int op::unpause = 0x14;
+const int op::mint_confirmation = 0x15;
+const int op::burn_confirmation = 0x16;
+const int op::withdraw_for_claim = 0x60;    ;; NEW: Withdraw from MasterFactory for claim payout
+
+;; Jetton operation codes
+const int op::mint_tokens = 21;
+const int op::burn_tokens = 0x595f07bc;
+
+;; Error codes
+const int err::unauthorized = 401;
+const int err::paused = 402;
+const int err::invalid_amount = 403;
+const int err::invalid_tranche = 404;
+const int err::reentrancy = 405;
+const int err::insufficient_balance = 406;
+const int err::token_not_set = 407;
+const int err::lockup_active = 408;
+const int err::tranche_locked = 409;
+const int err::circuit_breaker = 410;
+const int err::insolvency = 411;
+
+;; Event types
+const int EVENT_VAULT_DEPOSIT = 0x01;
+const int EVENT_VAULT_WITHDRAW = 0x02;
+const int EVENT_PREMIUM_DISTRIBUTED = 0x03;
+const int EVENT_EQT_CAP_REACHED = 0x04;
+const int EVENT_DAILY_YIELD_ACCRUED = 0x05;
+const int EVENT_LOSS_ABSORBED = 0x06;
+const int EVENT_DEPOSIT_ROLLBACK = 0x07;
+const int EVENT_WITHDRAW_ROLLBACK = 0x08;
+const int EVENT_CLAIM_PAID = 0x09;
+const int EVENT_MASTER_FACTORY_SET = 0x0A;
+const int EVENT_CLAIMS_PROCESSOR_SET = 0x0B;
+const int EVENT_FLOAT_MANAGER_SET = 0x0C;
+const int EVENT_TRANCHE_TOKEN_SET = 0x0D;
+const int EVENT_VAULT_PAUSED = 0x0E;
+const int EVENT_VAULT_UNPAUSED = 0x0F;
+
+;; ================================================================
+;; STORAGE LAYOUT
+;; ================================================================
+
+global slice master_factory_address;      ;; Admin authority
+global slice claims_processor_address;    ;; Can absorb losses (ParametricEscrow)
+global slice float_manager_address;       ;; FloatMaster contract (sends daily yield)
+global int total_capital;                 ;; Sum across all tranches
+global int total_coverage_sold;           ;; Total active policy coverage
+global int accumulated_premiums;          ;; Lifetime premiums received
+global int accumulated_losses;            ;; Lifetime losses absorbed
+global int protocol_earned_capital;       ;; EQT 25% cap overflow (for buybacks)
+global int paused;
+global int reentrancy_guard;
+global int seq_no;                        ;; Transaction sequence number
+global int circuit_breaker_window_start;  ;; 24h circuit breaker window
+global int circuit_breaker_losses;        ;; Losses in current window
+global cell tranche_data;                 ;; Dict<tranche_id:uint8, tranche:cell>
+global cell tranche_deposit_times;        ;; Dict<tranche_id:uint8, first_deposit_timestamp:uint32>
+global cell depositor_balances;           ;; Dict<user_hash:uint256, balance:cell>
+global cell pending_txs;                  ;; Dict<tx_id:uint64, tx_state:cell>
+global cell tranche_locks;                ;; Dict<tranche_id:uint8, lock:cell>
+global int test_mode;                     ;; Skip token minting in tests
+
+;; ================================================================
+;; STORAGE FUNCTIONS
+;; ================================================================
+
+() load_data() impure inline {
+  slice ds = get_data().begin_parse();
+
+  master_factory_address = ds~load_msg_addr();
+  claims_processor_address = ds~load_msg_addr();
+  float_manager_address = ds~load_msg_addr();
+  total_capital = ds~load_coins();
+  total_coverage_sold = ds~load_coins();
+  accumulated_premiums = ds~load_coins();
+  accumulated_losses = ds~load_coins();
+  protocol_earned_capital = ds~load_coins();
+  tranche_data = ds~load_ref();
+  depositor_balances = ds~load_dict();
+  paused = ds~load_uint(1);
+
+  ;; Extended data (separate cell to avoid 1023-bit limit)
+  slice ext = ds~load_ref().begin_parse();
+  reentrancy_guard = ext~load_uint(1);
+  seq_no = ext~load_uint(32);
+  circuit_breaker_window_start = ext~load_uint(32);
+  circuit_breaker_losses = ext~load_coins();
+  tranche_deposit_times = ext~load_dict();
+  pending_txs = ext~load_dict();
+  tranche_locks = ext~load_dict();
+  test_mode = ext~load_uint(1);
+}
+
+() save_data() impure inline {
+  cell ext_data = begin_cell()
+    .store_uint(reentrancy_guard, 1)
+    .store_uint(seq_no, 32)
+    .store_uint(circuit_breaker_window_start, 32)
+    .store_coins(circuit_breaker_losses)
+    .store_dict(tranche_deposit_times)
+    .store_dict(pending_txs)
+    .store_dict(tranche_locks)
+    .store_uint(test_mode, 1)
+    .end_cell();
+
+  set_data(
+    begin_cell()
+      .store_slice(master_factory_address)
+      .store_slice(claims_processor_address)
+      .store_slice(float_manager_address)
+      .store_coins(total_capital)
+      .store_coins(total_coverage_sold)
+      .store_coins(accumulated_premiums)
+      .store_coins(accumulated_losses)
+      .store_coins(protocol_earned_capital)
+      .store_ref(tranche_data)
+      .store_dict(depositor_balances)
+      .store_uint(paused, 1)
+      .store_ref(ext_data)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; TRANCHE DATA HELPERS
+;; ================================================================
+
+;; Tranche data structure:
+;; - capital: int (coins)
+;; - apy_min: int (basis points, e.g., 500 = 5%)
+;; - apy_max: int (basis points)
+;; - curve_type: int (1=linear, 2=exponential, etc.) ⚠️ REFACTOR: bonding curve specs
+;; - allocation_percent: int (percent, sum = 100%)
+;; - accumulated_yield: int (coins)
+;; - token_address: slice (LP token jetton master)
+;; - total_tokens: int (coins, total LP tokens minted)
+
+(int, int, int, int, int, int, slice, int) load_tranche(int tranche_id) inline {
+  (cell tranche_cell, int found) = udict_get_ref?(tranche_data, 8, tranche_id);
+  throw_unless(err::invalid_tranche, found);
+
+  slice ts = tranche_cell.begin_parse();
+  int capital = ts~load_coins();
+  int apy_min = ts~load_uint(16);
+  int apy_max = ts~load_uint(16);
+  int curve_type = ts~load_uint(8);
+  int allocation_percent = ts~load_uint(8);
+  int accumulated_yield = ts~load_coins();
+  slice token_address = ts~load_msg_addr();
+  int total_tokens = ts~load_coins();
+
+  return (capital, apy_min, apy_max, curve_type, allocation_percent, accumulated_yield, token_address, total_tokens);
+}
+
+() save_tranche(
+  int tranche_id,
+  int capital,
+  int apy_min,
+  int apy_max,
+  int curve_type,
+  int allocation_percent,
+  int accumulated_yield,
+  slice token_address,
+  int total_tokens
+) impure inline {
+  cell tranche_cell = begin_cell()
+    .store_coins(capital)
+    .store_uint(apy_min, 16)
+    .store_uint(apy_max, 16)
+    .store_uint(curve_type, 8)
+    .store_uint(allocation_percent, 8)
+    .store_coins(accumulated_yield)
+    .store_slice(token_address)
+    .store_coins(total_tokens)
+    .end_cell();
+
+  tranche_data~udict_set_ref(8, tranche_id, tranche_cell);
+}
+
+;; ================================================================
+;; ACCESS CONTROL & GUARDS
+;; ================================================================
+
+() check_master_factory(slice sender) impure inline {
+  throw_unless(err::unauthorized, equal_slice_bits(sender, master_factory_address));
+}
+
+() check_claims_processor(slice sender) impure inline {
+  throw_unless(err::unauthorized, equal_slice_bits(sender, claims_processor_address));
+}
+
+() validate_tranche_id(int tranche_id) impure inline {
+  throw_unless(err::invalid_tranche, (tranche_id >= TRANCHE_BTC) & (tranche_id <= TRANCHE_EQT));
+}
+
+;; ================================================================
+;; BONDING CURVE CALCULATIONS
+;; ================================================================
+
+;; Calculate yield multiplier based on time elapsed and curve type
+;; Input: t_years (fixed-point, DECIMALS=1e9), curve_type
+;; Output: multiplier (fixed-point, DECIMALS=1e9)
+;;
+;; All curves start at 4% (midpoint of BTC senior tranche)
+;; t_years = (now - first_deposit) / 31536000 seconds
+
+;; CURVE_FLAT: BTC (Super Senior)
+;; NAV = 1.0 + 0.04 * t
+;; Target: 4% APY flat
+int calculate_flat_multiplier(int t_years) inline {
+  return DECIMALS + muldiv(40000000, t_years, DECIMALS);  ;; 0.04 = 40000000 in fixed-point
+}
+
+;; CURVE_LOGARITHMIC: SNR (Senior)
+;; NAV = 1.0 + 0.08 * log(1 + t)
+;; Target: 4-8% APY (early commitment incentive)
+int calculate_logarithmic_multiplier(int t_years) inline {
+  ;; Approximate log(1+t) using Taylor series: t - t²/2 + t³/3 - t⁴/4
+  ;; For small t, log(1+t) ≈ t - t²/2
+  int t = t_years;
+  int t_squared = muldiv(t, t, DECIMALS);
+  int log_term = t - (t_squared / 2);
+  return DECIMALS + muldiv(80000000, log_term, DECIMALS);  ;; 0.08 = 80000000
+}
+
+;; CURVE_LINEAR: MEZZ (Mezzanine)
+;; NAV = 1.0 + 0.10 * t
+;; Target: 10% APY linear
+int calculate_linear_multiplier(int t_years) inline {
+  return DECIMALS + muldiv(100000000, t_years, DECIMALS);  ;; 0.10 = 100000000
+}
+
+;; CURVE_SIGMOID: JNR (Junior)
+;; NAV = 1.0 + 0.30 / (1 + e^(-5*(t-0.5)))
+;; Target: 8-25% APY (steep growth after 6 months)
+int calculate_sigmoid_multiplier(int t_years) inline {
+  ;; Simplified sigmoid approximation
+  ;; At t=0: ~0.02, at t=0.5: ~0.15, at t=1: ~0.30
+  int t_minus_half = t_years - (DECIMALS / 2);  ;; t - 0.5
+  int exp_term = muldiv(t_minus_half, 5 * DECIMALS, DECIMALS);  ;; -5*(t-0.5)
+
+  ;; Approximate 1/(1+e^x) using rational function
+  ;; For simplicity: if t < 0.5, use 0.05, if t=0.5 use 0.15, if t>0.5 use 0.30
+  int sigmoid_value = 50000000;  ;; Default 0.05
+  if (t_years >= (DECIMALS / 2)) {
+    if (t_years >= DECIMALS) {
+      sigmoid_value = 300000000;  ;; 0.30 at t=1
+    } else {
+      sigmoid_value = 150000000;  ;; 0.15 at t=0.5
+    }
+  }
+
+  return DECIMALS + sigmoid_value;
+}
+
+;; CURVE_QUADRATIC: JNR+ (Junior Plus)
+;; NAV = 1.0 + 0.21 * t²
+;; Target: 10-20% APY (accelerating growth)
+int calculate_quadratic_multiplier(int t_years) inline {
+  int t_squared = muldiv(t_years, t_years, DECIMALS);
+  return DECIMALS + muldiv(210000000, t_squared, DECIMALS);  ;; 0.21 = 210000000
+}
+
+;; CURVE_CAPPED_EXPONENTIAL: EQT (Equity)
+;; NAV = min(1.25, 1.0 + 0.15 * (e^t - 1))
+;; Target: 15-25% APY, hard capped at 25% (NAV=1.25)
+int calculate_capped_exponential_multiplier(int t_years) inline {
+  ;; Approximate e^t using Taylor series: 1 + t + t²/2 + t³/6
+  int t = t_years;
+  int t_squared = muldiv(t, t, DECIMALS);
+  int t_cubed = muldiv(t_squared, t, DECIMALS);
+  int exp_t = DECIMALS + t + (t_squared / 2) + (t_cubed / 6);
+
+  ;; e^t - 1
+  int exp_minus_one = exp_t - DECIMALS;
+
+  ;; 0.15 * (e^t - 1)
+  int growth = muldiv(150000000, exp_minus_one, DECIMALS);
+
+  ;; 1.0 + growth
+  int nav = DECIMALS + growth;
+
+  ;; Cap at 1.25 (1250000000)
+  if (nav > 1250000000) {
+    return 1250000000;  ;; 25% cap
+  }
+
+  return nav;
+}
+
+;; Main NAV calculation with bonding curves
+int calculate_tranche_nav(int tranche_id) inline {
+  var (capital, apy_min, apy_max, curve_type, allocation_percent, accumulated_yield, token_address, total_tokens) = load_tranche(tranche_id);
+
+  if (total_tokens == 0) {
+    return DECIMALS;  ;; NAV = 1.0 if no tokens exist
+  }
+
+  ;; Get time elapsed since first deposit
+  (slice deposit_time_data, int time_found) = udict_get?(tranche_deposit_times, 8, tranche_id);
+  int t_years = 0;
+
+  if (time_found) {
+    int first_deposit_time = deposit_time_data~load_uint(32);
+    int elapsed_seconds = now() - first_deposit_time;
+    ;; Convert to years (fixed-point): seconds / 31536000 * DECIMALS
+    t_years = muldiv(elapsed_seconds, DECIMALS, 31536000);
+  }
+
+  ;; Calculate yield multiplier based on curve type
+  int yield_multiplier = DECIMALS;
+
+  if (curve_type == CURVE_FLAT) {
+    yield_multiplier = calculate_flat_multiplier(t_years);
+  }
+  if (curve_type == CURVE_LOGARITHMIC) {
+    yield_multiplier = calculate_logarithmic_multiplier(t_years);
+  }
+  if (curve_type == CURVE_LINEAR) {
+    yield_multiplier = calculate_linear_multiplier(t_years);
+  }
+  if (curve_type == CURVE_SIGMOID) {
+    yield_multiplier = calculate_sigmoid_multiplier(t_years);
+  }
+  if (curve_type == CURVE_QUADRATIC) {
+    yield_multiplier = calculate_quadratic_multiplier(t_years);
+  }
+  if (curve_type == CURVE_CAPPED_EXPONENTIAL) {
+    yield_multiplier = calculate_capped_exponential_multiplier(t_years);
+  }
+
+  ;; NAV = (capital * yield_multiplier + accumulated_yield) / total_tokens
+  int capital_with_curve = muldiv(capital, yield_multiplier, DECIMALS);
+  return muldiv(capital_with_curve + accumulated_yield, DECIMALS, total_tokens);
+}
+
+;; ================================================================
+;; TRANCHE LOCKING (prevent concurrent modifications)
+;; ================================================================
+
+(int, cell) acquire_tranche_lock(cell locks, int tranche_id, int current_seq, int timeout) inline {
+  (slice lock_data, int found) = udict_get?(locks, 8, tranche_id);
+
+  if (found) {
+    int lock_seq = lock_data~load_uint(32);
+    int lock_time = lock_data~load_uint(32);
+
+    ;; Check if lock expired
+    if (now() - lock_time > timeout) {
+      ;; Lock expired, acquire new lock
+      locks~udict_set(8, tranche_id,
+        begin_cell()
+          .store_uint(current_seq, 32)
+          .store_uint(now(), 32)
+          .end_cell()
+          .begin_parse()
+      );
+      return (true, locks);
+    }
+
+    return (false, locks);  ;; Lock still active
+  }
+
+  ;; No existing lock, acquire
+  locks~udict_set(8, tranche_id,
+    begin_cell()
+      .store_uint(current_seq, 32)
+      .store_uint(now(), 32)
+      .end_cell()
+      .begin_parse()
+  );
+  return (true, locks);
+}
+
+cell release_tranche_lock(cell locks, int tranche_id, int expected_seq) inline {
+  (slice lock_data, int found) = udict_get?(locks, 8, tranche_id);
+
+  if (found) {
+    int lock_seq = lock_data~load_uint(32);
+    if (lock_seq == expected_seq) {
+      locks~udict_delete?(8, tranche_id);
+    }
+  }
+
+  return locks;
+}
+
+;; ================================================================
+;; DEPOSIT LOGIC
+;; ================================================================
+
+() deposit(slice depositor, int tranche_id, int amount) impure {
+  validate_tranche_id(tranche_id);
+  throw_unless(err::invalid_amount, amount >= MIN_DEPOSIT);
+
+  ;; Acquire tranche lock
+  var (lock_acquired, updated_locks) = acquire_tranche_lock(tranche_locks, tranche_id, seq_no, 60);
+  throw_unless(err::tranche_locked, lock_acquired);
+  tranche_locks = updated_locks;
+
+  var (capital, apy_min, apy_max, curve_type, allocation_percent, accumulated_yield, token_address, total_tokens) = load_tranche(tranche_id);
+
+  ;; In test mode, allow deposits without token contracts
+  if (test_mode == 0) {
+    throw_unless(err::token_not_set, is_valid_address(token_address));
+  }
+
+  ;; Track first deposit time for bonding curve calculation
+  (slice existing_time, int time_found) = udict_get?(tranche_deposit_times, 8, tranche_id);
+  if (time_found == 0) {
+    tranche_deposit_times~udict_set(8, tranche_id,
+      begin_cell()
+        .store_uint(now(), 32)
+        .end_cell()
+        .begin_parse()
+    );
+  }
+
+  ;; Calculate NAV using bonding curves
+  int nav = calculate_tranche_nav(tranche_id);
+  int tokens = muldiv(amount, DECIMALS, nav);
+
+  ;; Update tranche state
+  capital += amount;
+  total_capital += amount;
+  total_tokens += tokens;
+  save_tranche(tranche_id, capital, apy_min, apy_max, curve_type, allocation_percent, accumulated_yield, token_address, total_tokens);
+
+  int current_seq = seq_no;
+
+  ;; In test mode, skip async token minting
+  if (test_mode) {
+    ;; Directly update depositor balance
+    cell balance_cell = begin_cell()
+      .store_uint(tranche_id, 8)
+      .store_coins(tokens)
+      .store_uint(0, 32)  ;; No lockup
+      .end_cell();
+    depositor_balances~udict_set_ref(267, slice_hash(depositor), balance_cell);
+  } else {
+    ;; Production mode: async 2PC token minting
+    int tx_id = seq_no;
+    seq_no += 1;
+
+    ;; Store pending transaction
+    cell tx_state = begin_cell()
+      .store_uint(1, 8)  ;; State: initiated
+      .store_uint(0, 8)  ;; Retry count
+      .store_uint(now(), 32)  ;; Created at
+      .store_uint(op::deposit, 32)
+      .store_coins(tokens)
+      .store_slice(token_address)
+      .store_slice(depositor)
+      .store_uint(tranche_id, 8)
+      .store_coins(amount)  ;; Original amount for refunds
+      .end_cell();
+    pending_txs~udict_set_ref(64, tx_id, tx_state);
+
+    ;; Send mint message to LP token contract
+    send_internal_msg(
+      token_address,
+      100000000,  ;; 0.1 TON
+      op::mint_tokens,
+      begin_cell()
+        .store_uint(tx_id, 64)
+        .store_slice(depositor)
+        .store_coins(tokens)
+        .end_cell()
+    );
+  }
+
+  ;; Release tranche lock
+  tranche_locks = release_tranche_lock(tranche_locks, tranche_id, current_seq);
+
+  ;; Emit event
+  emit_log_event(EVENT_VAULT_DEPOSIT,
+    begin_cell()
+      .store_slice(depositor)
+      .store_uint(tranche_id, 8)
+      .store_coins(amount)
+      .store_coins(tokens)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; WITHDRAW LOGIC
+;; ================================================================
+
+() withdraw(slice withdrawer, int tranche_id, int token_amount) impure {
+  validate_tranche_id(tranche_id);
+  throw_unless(err::invalid_amount, token_amount > 0);
+
+  ;; Acquire tranche lock
+  var (lock_acquired, updated_locks) = acquire_tranche_lock(tranche_locks, tranche_id, seq_no, 60);
+  throw_unless(err::tranche_locked, lock_acquired);
+  tranche_locks = updated_locks;
+
+  ;; Verify user balance
+  (slice balance_data, int found) = udict_get?(depositor_balances, 267, slice_hash(withdrawer));
+  throw_unless(err::insufficient_balance, found);
+
+  int stored_tranche_id = balance_data~load_uint(8);
+  int user_total_tokens = balance_data~load_coins();
+  int lock_until = balance_data~load_uint(32);
+
+  throw_unless(err::invalid_tranche, stored_tranche_id == tranche_id);
+  throw_unless(err::lockup_active, now() >= lock_until);
+  throw_unless(err::insufficient_balance, user_total_tokens >= token_amount);
+
+  var (capital, apy_min, apy_max, curve_type, allocation_percent, accumulated_yield, token_address, total_tokens) = load_tranche(tranche_id);
+
+  ;; In test mode, allow withdrawals without token contracts
+  if (test_mode == 0) {
+    throw_unless(err::token_not_set, is_valid_address(token_address));
+  }
+
+  ;; Calculate NAV
+  ;; ⚠️ REFACTOR: Replace with bonding curve pricing
+  int nav = DECIMALS;
+  if (total_tokens > 0) {
+    nav = muldiv(capital + accumulated_yield, DECIMALS, total_tokens);
+  }
+  int capital_to_return = muldiv(token_amount, nav, DECIMALS);
+
+  ;; Simplified: no separate yield tracking yet
+  int total_payout = capital_to_return;
+
+  ;; Update tranche state
+  capital -= capital_to_return;
+  total_capital -= capital_to_return;
+  total_tokens -= token_amount;
+  save_tranche(tranche_id, capital, apy_min, apy_max, curve_type, allocation_percent, accumulated_yield, token_address, total_tokens);
+
+  ;; Update user balance
+  int remaining_total_tokens = user_total_tokens - token_amount;
+  if (remaining_total_tokens == 0) {
+    depositor_balances~udict_delete?(267, slice_hash(withdrawer));
+  } else {
+    cell new_balance = begin_cell()
+      .store_uint(tranche_id, 8)
+      .store_coins(remaining_total_tokens)
+      .store_uint(lock_until, 32)
+      .end_cell();
+    depositor_balances~udict_set_ref(267, slice_hash(withdrawer), new_balance);
+  }
+
+  int current_seq = seq_no;
+
+  ;; In test mode, skip async token burning
+  if (test_mode) {
+    ;; Send funds directly
+    send_internal_msg(withdrawer, total_payout, 0, begin_cell().end_cell());
+  } else {
+    ;; Production mode: async 2PC token burning
+    int tx_id = seq_no;
+    seq_no += 1;
+
+    ;; Store pending transaction
+    cell tx_state = begin_cell()
+      .store_uint(1, 8)  ;; State: initiated
+      .store_uint(0, 8)  ;; Retry count
+      .store_uint(now(), 32)
+      .store_uint(op::withdraw, 32)
+      .store_coins(token_amount)
+      .store_slice(token_address)
+      .store_slice(withdrawer)
+      .store_uint(tranche_id, 8)
+      .store_coins(total_payout)  ;; For rollback
+      .end_cell();
+    pending_txs~udict_set_ref(64, tx_id, tx_state);
+
+    ;; Send burn message to LP token contract
+    send_internal_msg(
+      token_address,
+      50000000,  ;; 0.05 TON
+      op::burn_tokens,
+      begin_cell()
+        .store_uint(tx_id, 64)
+        .store_coins(token_amount)
+        .store_slice(withdrawer)
+        .store_slice(withdrawer)  ;; Response destination
+        .end_cell()
+    );
+  }
+
+  ;; Release tranche lock
+  tranche_locks = release_tranche_lock(tranche_locks, tranche_id, current_seq);
+
+  ;; Emit event
+  emit_log_event(EVENT_VAULT_WITHDRAW,
+    begin_cell()
+      .store_slice(withdrawer)
+      .store_uint(tranche_id, 8)
+      .store_coins(token_amount)
+      .store_coins(total_payout)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; PREMIUM DISTRIBUTION
+;; ================================================================
+
+;; ⚠️ REFACTOR: Premium flow redesign
+;; CURRENT: Premiums sent directly from child contracts → distribute across tranches
+;; CORRECT: Premiums → Float → Investment strategy → LP deposits to vault
+;;
+;; This function will be REMOVED in Float refactor. The vault will only receive
+;; Float's LP capital deposits (op::deposit), not direct premiums.
+;;
+;; Float investment allocation example:
+;; - 60% Vault LP capital (deposits to tranches)
+;; - 20% Polymarket hedges
+;; - 15% Perpetual futures hedges
+;; - 5% Protocol reserve
+;;
+;; Base returns per tranche (REFACTOR: need user specs):
+;; - BTC: 3-5% APY (lowest risk)
+;; - SNR: 5-8% APY
+;; - MEZZ: 8-12% APY
+;; - JNR: 12-18% APY
+;; - JNR+: 18-25% APY
+;; - EQT: 25%+ APY, capped at 25% (excess → protocol capital for buybacks)
+
+() distribute_premiums(int premium_amount) impure {
+  throw_unless(err::invalid_amount, premium_amount > 0);
+
+  accumulated_premiums += premium_amount;
+
+  ;; Distribute across tranches by allocation_percent
+  ;; REFACTOR: This entire function will be replaced with Float LP deposits
+  int i = TRANCHE_BTC;
+  while (i <= TRANCHE_EQT) {
+    var (capital, apy_min, apy_max, curve_type, allocation_percent, accumulated_yield, token_address, total_tokens) = load_tranche(i);
+
+    int tranche_share = muldiv(premium_amount, allocation_percent, 100);
+    accumulated_yield += tranche_share;
+
+    ;; REFACTOR: Apply EQT 25% cap here
+    ;; If i == TRANCHE_EQT and yield > 25% of capital:
+    ;;   excess = yield - (capital * 25 / 100)
+    ;;   protocol_capital += excess
+    ;;   accumulated_yield = capital * 25 / 100
+
+    save_tranche(i, capital, apy_min, apy_max, curve_type, allocation_percent, accumulated_yield, token_address, total_tokens);
+    i += 1;
+  }
+
+  emit_log_event(EVENT_PREMIUM_DISTRIBUTED,
+    begin_cell()
+      .store_coins(premium_amount)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; CONTINUOUS DAILY YIELD ACCRUAL
+;; ================================================================
+
+;; Called daily by FloatMaster OCaml backend
+;; Distributes investment returns to tranches
+;; Applies EQT 25% cap (excess → protocol_earned_capital)
+() accrue_daily_yield(cell yield_data) impure {
+  slice ys = yield_data.begin_parse();
+
+  ;; Parse yield amounts for each tranche
+  int btc_yield = ys~load_coins();
+  int snr_yield = ys~load_coins();
+  int mezz_yield = ys~load_coins();
+  int jnr_yield = ys~load_coins();
+  int jnr_plus_yield = ys~load_coins();
+  int eqt_yield = ys~load_coins();
+
+  ;; Apply yield to tranches 1-5 (BTC, SNR, MEZZ, JNR, JNR+)
+  int i = TRANCHE_BTC;
+  while (i <= TRANCHE_JNR_PLUS) {
+    var (capital, apy_min, apy_max, curve_type, allocation_percent, accumulated_yield, token_address, total_tokens) = load_tranche(i);
+
+    int yield_to_add = 0;
+    if (i == TRANCHE_BTC) { yield_to_add = btc_yield; }
+    if (i == TRANCHE_SNR) { yield_to_add = snr_yield; }
+    if (i == TRANCHE_MEZZ) { yield_to_add = mezz_yield; }
+    if (i == TRANCHE_JNR) { yield_to_add = jnr_yield; }
+    if (i == TRANCHE_JNR_PLUS) { yield_to_add = jnr_plus_yield; }
+
+    accumulated_yield += yield_to_add;
+    save_tranche(i, capital, apy_min, apy_max, curve_type, allocation_percent, accumulated_yield, token_address, total_tokens);
+
+    i += 1;
+  }
+
+  ;; EQT Tranche: Apply 25% cap
+  var (eqt_capital, eqt_apy_min, eqt_apy_max, eqt_curve_type, eqt_allocation_percent, eqt_accumulated_yield, eqt_token_address, eqt_total_tokens) = load_tranche(TRANCHE_EQT);
+
+  ;; Add new yield
+  int new_eqt_yield = eqt_accumulated_yield + eqt_yield;
+
+  ;; Calculate 25% cap: capital * 0.25
+  int cap_amount = muldiv(eqt_capital, 25, 100);
+
+  ;; Check if exceeds cap
+  if (new_eqt_yield > cap_amount) {
+    ;; Transfer excess to protocol_earned_capital
+    int excess = new_eqt_yield - cap_amount;
+    protocol_earned_capital += excess;
+    new_eqt_yield = cap_amount;
+
+    emit_log_event(EVENT_EQT_CAP_REACHED,
+      begin_cell()
+        .store_coins(excess)
+        .store_coins(protocol_earned_capital)
+        .store_uint(now(), 32)
+        .end_cell()
+    );
+  }
+
+  save_tranche(TRANCHE_EQT, eqt_capital, eqt_apy_min, eqt_apy_max, eqt_curve_type, eqt_allocation_percent, new_eqt_yield, eqt_token_address, eqt_total_tokens);
+
+  emit_log_event(EVENT_DAILY_YIELD_ACCRUED,
+    begin_cell()
+      .store_coins(btc_yield + snr_yield + mezz_yield + jnr_yield + jnr_plus_yield + eqt_yield)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; LOSS ABSORPTION (WATERFALL) + DIRECT PAYOUT
+;; ================================================================
+
+() absorb_loss(slice sender, int loss_amount, slice claimant_address) impure {
+  check_claims_processor(sender);
+  throw_unless(err::invalid_amount, loss_amount > 0);
+
+  int initial_capital = total_capital;
+
+  ;; Circuit breaker: max 10% loss per 24h
+  if (initial_capital > 0) {
+    ;; Reset window if >24h elapsed
+    int time_elapsed = now() - circuit_breaker_window_start;
+    if (time_elapsed > 86400) {
+      circuit_breaker_window_start = now();
+      circuit_breaker_losses = 0;
+    }
+
+    ;; Check 10% threshold
+    int new_total_losses = circuit_breaker_losses + loss_amount;
+    int threshold = muldiv(total_capital, 10, 100);
+    throw_unless(err::circuit_breaker, new_total_losses <= threshold);
+
+    circuit_breaker_losses = new_total_losses;
+  }
+
+  ;; Waterfall loss absorption: EQT → JNR+ → JNR → MEZZ → SNR → BTC
+  int remaining_loss = loss_amount;
+
+  int i = TRANCHE_EQT;
+  while (i >= TRANCHE_BTC) {
+    if (remaining_loss == 0) {
+      i = 0;  ;; Break loop
+    } else {
+      var (capital, apy_min, apy_max, curve_type, allocation_percent, accumulated_yield, token_address, total_tokens) = load_tranche(i);
+
+      if (capital > 0) {
+        int loss_to_absorb = min(remaining_loss, capital);
+        capital -= loss_to_absorb;
+        remaining_loss -= loss_to_absorb;
+        total_capital -= loss_to_absorb;
+        save_tranche(i, capital, apy_min, apy_max, curve_type, allocation_percent, accumulated_yield, token_address, total_tokens);
+      }
+
+      i -= 1;
+    }
+  }
+
+  accumulated_losses += loss_amount;
+
+  ;; Insolvency check
+  if (initial_capital > 0) {
+    throw_unless(err::insolvency, remaining_loss == 0);
+  }
+
+  ;; Pay 100% to PolicyNFT holder (claimant_address)
+  ;; Use mode 128 (carry all remaining balance, ignore errors)
+  send_internal_msg(claimant_address, loss_amount, 0, begin_cell().end_cell());
+
+  emit_log_event(EVENT_LOSS_ABSORBED,
+    begin_cell()
+      .store_coins(loss_amount)
+      .store_slice(claimant_address)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; BOUNCE HANDLERS (2PC Recovery)
+;; ================================================================
+
+() handle_mint_bounce(slice in_msg_body) impure {
+  in_msg_body~skip_bits(32);  ;; Skip 0xFFFFFFFF
+  int op = in_msg_body~load_uint(32);
+  int tx_id = in_msg_body~load_uint(64);
+
+  (cell tx_state, int found) = udict_get_ref?(pending_txs, 64, tx_id);
+  if (found == 0) { return (); }
+
+  slice ts = tx_state.begin_parse();
+  int state = ts~load_uint(8);
+  int retry_count = ts~load_uint(8);
+  int created_at = ts~load_uint(32);
+  int stored_op = ts~load_uint(32);
+  int token_amount = ts~load_coins();
+  slice token_address = ts~load_msg_addr();
+  slice user_address = ts~load_msg_addr();
+  int tranche_id = ts~load_uint(8);
+  int original_amount = ts~load_coins();
+
+  ;; Retry up to 3 times with exponential backoff
+  if (retry_count < 3) {
+    retry_count += 1;
+
+    ;; Update pending tx
+    cell new_tx_state = begin_cell()
+      .store_uint(state, 8)
+      .store_uint(retry_count, 8)
+      .store_uint(created_at, 32)
+      .store_uint(stored_op, 32)
+      .store_coins(token_amount)
+      .store_slice(token_address)
+      .store_slice(user_address)
+      .store_uint(tranche_id, 8)
+      .store_coins(original_amount)
+      .end_cell();
+    pending_txs~udict_set_ref(64, tx_id, new_tx_state);
+
+    ;; Retry mint
+    send_internal_msg(
+      token_address,
+      100000000,
+      op::mint_tokens,
+      begin_cell()
+        .store_uint(tx_id, 64)
+        .store_slice(user_address)
+        .store_coins(token_amount)
+        .end_cell()
+    );
+  } else {
+    ;; Max retries exceeded - ROLLBACK
+
+    ;; Rollback tranche state
+    var (capital, apy_min, apy_max, curve_type, allocation_percent, accumulated_yield, token_addr, total_tokens) = load_tranche(tranche_id);
+    capital -= original_amount;
+    total_capital -= original_amount;
+    total_tokens -= token_amount;
+    save_tranche(tranche_id, capital, apy_min, apy_max, curve_type, allocation_percent, accumulated_yield, token_addr, total_tokens);
+
+    ;; Remove depositor balance
+    depositor_balances~udict_delete?(267, slice_hash(user_address));
+
+    ;; Refund user
+    send_internal_msg(user_address, original_amount, 0, begin_cell().end_cell());
+
+    ;; Remove pending tx
+    pending_txs~udict_delete?(64, tx_id);
+
+    emit_log_event(EVENT_DEPOSIT_ROLLBACK,
+      begin_cell()
+        .store_uint(tx_id, 64)
+        .store_slice(user_address)
+        .store_coins(original_amount)
+        .end_cell()
+    );
+  }
+}
+
+() handle_burn_bounce(slice in_msg_body) impure {
+  in_msg_body~skip_bits(32);  ;; Skip 0xFFFFFFFF
+  int op = in_msg_body~load_uint(32);
+  int tx_id = in_msg_body~load_uint(64);
+
+  (cell tx_state, int found) = udict_get_ref?(pending_txs, 64, tx_id);
+  if (found == 0) { return (); }
+
+  slice ts = tx_state.begin_parse();
+  int state = ts~load_uint(8);
+  int retry_count = ts~load_uint(8);
+  int created_at = ts~load_uint(32);
+  int stored_op = ts~load_uint(32);
+  int token_amount = ts~load_coins();
+  slice token_address = ts~load_msg_addr();
+  slice user_address = ts~load_msg_addr();
+  int tranche_id = ts~load_uint(8);
+  int total_payout = ts~load_coins();
+
+  ;; Retry up to 3 times
+  if (retry_count < 3) {
+    retry_count += 1;
+
+    ;; Update pending tx
+    cell new_tx_state = begin_cell()
+      .store_uint(state, 8)
+      .store_uint(retry_count, 8)
+      .store_uint(created_at, 32)
+      .store_uint(stored_op, 32)
+      .store_coins(token_amount)
+      .store_slice(token_address)
+      .store_slice(user_address)
+      .store_uint(tranche_id, 8)
+      .store_coins(total_payout)
+      .end_cell();
+    pending_txs~udict_set_ref(64, tx_id, new_tx_state);
+
+    ;; Retry burn
+    send_internal_msg(
+      token_address,
+      50000000,
+      op::burn_tokens,
+      begin_cell()
+        .store_uint(tx_id, 64)
+        .store_coins(token_amount)
+        .store_slice(user_address)
+        .store_slice(user_address)
+        .end_cell()
+    );
+  } else {
+    ;; Max retries exceeded - ROLLBACK
+
+    ;; Restore tranche state
+    var (capital, apy_min, apy_max, curve_type, allocation_percent, accumulated_yield, token_addr, total_tokens) = load_tranche(tranche_id);
+
+    int nav = calculate_tranche_nav(tranche_id);
+    int capital_amount = muldiv(token_amount, nav, DECIMALS);
+
+    capital += capital_amount;
+    total_capital += capital_amount;
+    total_tokens += token_amount;
+    save_tranche(tranche_id, capital, apy_min, apy_max, curve_type, allocation_percent, accumulated_yield, token_addr, total_tokens);
+
+    ;; Restore user balance
+    (slice balance_data, int bal_found) = udict_get?(depositor_balances, 267, slice_hash(user_address));
+    if (bal_found) {
+      int stored_tranche_id = balance_data~load_uint(8);
+      int user_total_tokens = balance_data~load_coins();
+      int lock_until = balance_data~load_uint(32);
+
+      cell new_balance = begin_cell()
+        .store_uint(tranche_id, 8)
+        .store_coins(user_total_tokens + token_amount)
+        .store_uint(lock_until, 32)
+        .end_cell();
+      depositor_balances~udict_set_ref(267, slice_hash(user_address), new_balance);
+    } else {
+      cell new_balance = begin_cell()
+        .store_uint(tranche_id, 8)
+        .store_coins(token_amount)
+        .store_uint(0, 32)
+        .end_cell();
+      depositor_balances~udict_set_ref(267, slice_hash(user_address), new_balance);
+    }
+
+    ;; Remove pending tx
+    pending_txs~udict_delete?(64, tx_id);
+
+    emit_log_event(EVENT_WITHDRAW_ROLLBACK,
+      begin_cell()
+        .store_uint(tx_id, 64)
+        .store_slice(user_address)
+        .store_coins(token_amount)
+        .end_cell()
+    );
+  }
+}
+
+;; ================================================================
+;; MESSAGE HANDLERS
+;; ================================================================
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+
+  ;; Handle bounced messages
+  if (flags & 1) {
+    load_data();
+    slice bounce_body = in_msg_body;
+    bounce_body~skip_bits(32);  ;; Skip 0xFFFFFFFF
+    int op = bounce_body~load_uint(32);
+
+    if (op == op::mint_tokens) {
+      handle_mint_bounce(in_msg_body);
+    }
+    if (op == op::burn_tokens) {
+      handle_burn_bounce(in_msg_body);
+    }
+
+    save_data();
+    return ();
+  }
+
+  slice sender = cs~load_msg_addr();
+
+  if (in_msg_body.slice_empty?()) {
+    return ();  ;; Accept funds
+  }
+
+  load_data();
+
+  int op = in_msg_body~load_uint(32);
+
+  if (op == op::deposit) {
+    require_not_paused(paused);
+
+    ;; Reentrancy guard
+    throw_unless(err::reentrancy, reentrancy_guard == 0);
+    reentrancy_guard = 1;
+
+    int tranche_id = in_msg_body~load_uint(8);
+    deposit(sender, tranche_id, msg_value);
+
+    reentrancy_guard = 0;
+    save_data();
+    return ();
+  }
+
+  if (op == op::withdraw) {
+    require_not_paused(paused);
+
+    ;; Reentrancy guard
+    throw_unless(err::reentrancy, reentrancy_guard == 0);
+    reentrancy_guard = 1;
+
+    int tranche_id = in_msg_body~load_uint(8);
+    int token_amount = in_msg_body~load_coins();
+    withdraw(sender, tranche_id, token_amount);
+
+    reentrancy_guard = 0;
+    save_data();
+    return ();
+  }
+
+  if (op == op::distribute_premiums) {
+    require_not_paused(paused);
+
+    ;; REFACTOR: Remove this opcode in Float integration
+    ;; Premiums will come via op::deposit from Float, not direct distribution
+    int premium_amount = in_msg_body~load_coins();
+    distribute_premiums(premium_amount);
+
+    save_data();
+    return ();
+  }
+
+  if (op == op::absorb_loss) {
+    int loss_amount = in_msg_body~load_coins();
+    slice claimant_address = in_msg_body~load_msg_addr();
+    absorb_loss(sender, loss_amount, claimant_address);
+
+    save_data();
+    return ();
+  }
+
+  if (op == op::withdraw_for_claim) {
+    ;; Claim withdrawal from MasterFactory
+    ;; MasterFactory coordinates claim processing and requests vault withdrawal
+
+    require_not_paused(paused);
+
+    ;; Only MasterFactory can request claim withdrawals
+    throw_unless(err::unauthorized, equal_slice_bits(sender, master_factory_address));
+
+    ;; Parse withdrawal request
+    int policy_id = in_msg_body~load_uint(64);
+    int product_type = in_msg_body~load_uint(8);
+    int asset_id = in_msg_body~load_uint(16);
+    slice user_addr = in_msg_body~load_msg_addr();
+    int coverage_amount = in_msg_body~load_coins();
+    int trigger_price = in_msg_body~load_uint(32);
+    int trigger_timestamp = in_msg_body~load_uint(32);
+
+    ;; Validate sufficient capital
+    throw_unless(err::insufficient_balance, total_capital >= coverage_amount);
+
+    ;; Absorb loss via waterfall (EQT → JNR+ → JNR → MEZZ → SNR → BTC)
+    absorb_loss(sender, coverage_amount, user_addr);
+
+    ;; Send payout directly to user
+    send_simple_message(user_addr, coverage_amount);
+
+    ;; Emit event
+    emit_log_event(EVENT_CLAIM_PAID, begin_cell()
+      .store_uint(policy_id, 64)
+      .store_slice(user_addr)
+      .store_coins(coverage_amount)
+      .store_uint(trigger_price, 32)
+      .end_cell());
+
+    save_data();
+    return ();
+  }
+
+  if (op == op::accrue_daily_yield) {
+    require_not_paused(paused);
+
+    ;; Only FloatMaster can accrue yield
+    throw_unless(err::unauthorized, equal_slice_bits(sender, float_manager_address));
+
+    cell yield_data = in_msg_body~load_ref();
+    accrue_daily_yield(yield_data);
+
+    save_data();
+    return ();
+  }
+
+  if (op == op::mint_confirmation) {
+    int tx_id = in_msg_body~load_uint(64);
+    pending_txs~udict_delete?(64, tx_id);
+
+    save_data();
+    return ();
+  }
+
+  if (op == op::burn_confirmation) {
+    int tx_id = in_msg_body~load_uint(64);
+    pending_txs~udict_delete?(64, tx_id);
+
+    save_data();
+    return ();
+  }
+
+  if (op == op::set_master_factory) {
+    check_master_factory(sender);
+
+    slice new_factory = in_msg_body~load_msg_addr();
+    master_factory_address = new_factory;
+
+    save_data();
+
+    emit_log_simple(EVENT_MASTER_FACTORY_SET, 1);
+    return ();
+  }
+
+  if (op == op::set_claims_processor) {
+    check_master_factory(sender);
+
+    slice new_processor = in_msg_body~load_msg_addr();
+    claims_processor_address = new_processor;
+
+    save_data();
+
+    emit_log_simple(EVENT_CLAIMS_PROCESSOR_SET, 1);
+    return ();
+  }
+
+  if (op == op::set_float_manager) {
+    check_master_factory(sender);
+
+    slice new_float_manager = in_msg_body~load_msg_addr();
+    float_manager_address = new_float_manager;
+
+    save_data();
+
+    emit_log_simple(EVENT_FLOAT_MANAGER_SET, 1);
+    return ();
+  }
+
+  if (op == op::set_tranche_token) {
+    check_master_factory(sender);
+
+    int tranche_id = in_msg_body~load_uint(8);
+    slice token_addr = in_msg_body~load_msg_addr();
+
+    var (capital, apy_min, apy_max, curve_type, allocation_percent, accumulated_yield, _, total_tokens) = load_tranche(tranche_id);
+    save_tranche(tranche_id, capital, apy_min, apy_max, curve_type, allocation_percent, accumulated_yield, token_addr, total_tokens);
+
+    save_data();
+
+    emit_log_simple(EVENT_TRANCHE_TOKEN_SET, 1);
+    return ();
+  }
+
+  if (op == op::pause) {
+    check_master_factory(sender);
+
+    paused = 1;
+    save_data();
+
+    emit_log_simple(EVENT_VAULT_PAUSED, 1);
+    return ();
+  }
+
+  if (op == op::unpause) {
+    check_master_factory(sender);
+
+    paused = 0;
+    save_data();
+
+    emit_log_simple(EVENT_VAULT_UNPAUSED, 1);
+    return ();
+  }
+
+  throw(0xFFFF);
+}
+
+;; ================================================================
+;; GET METHODS
+;; ================================================================
+
+slice get_master_factory() method_id {
+  load_data();
+  return master_factory_address;
+}
+
+slice get_claims_processor() method_id {
+  load_data();
+  return claims_processor_address;
+}
+
+int get_total_capital() method_id {
+  load_data();
+  return total_capital;
+}
+
+int get_total_coverage_sold() method_id {
+  load_data();
+  return total_coverage_sold;
+}
+
+int get_accumulated_premiums() method_id {
+  load_data();
+  return accumulated_premiums;
+}
+
+int get_accumulated_losses() method_id {
+  load_data();
+  return accumulated_losses;
+}
+
+int get_paused() method_id {
+  load_data();
+  return paused;
+}
+
+int get_tranche_capital(int tranche_id) method_id {
+  load_data();
+  validate_tranche_id(tranche_id);
+  var (capital, _, _, _, _, _, _, _) = load_tranche(tranche_id);
+  return capital;
+}
+
+(int, int) get_tranche_apy(int tranche_id) method_id {
+  load_data();
+  validate_tranche_id(tranche_id);
+  var (_, apy_min, apy_max, _, _, _, _, _) = load_tranche(tranche_id);
+  return (apy_min, apy_max);
+}
+
+int get_tranche_nav(int tranche_id) method_id {
+  load_data();
+  validate_tranche_id(tranche_id);
+  return calculate_tranche_nav(tranche_id);
+}
+
+(int, int, int, int, int, int, slice, int) get_tranche_info(int tranche_id) method_id {
+  load_data();
+  validate_tranche_id(tranche_id);
+  return load_tranche(tranche_id);
+}
+
+(int, int, int, int) get_depositor_balance(slice depositor_address) method_id {
+  load_data();
+  (slice balance_data, int found) = udict_get?(depositor_balances, 267, slice_hash(depositor_address));
+
+  if (found == 0) {
+    return (0, 0, 0, 0);
+  }
+
+  int stored_tranche_id = balance_data~load_uint(8);
+  int balance = balance_data~load_coins();
+  int lock_until = balance_data~load_uint(32);
+
+  return (stored_tranche_id, balance, lock_until, 0);
+}
+
+(int, int) get_circuit_breaker_status() method_id {
+  load_data();
+  return (circuit_breaker_window_start, circuit_breaker_losses);
+}
+
+int get_test_mode() method_id {
+  load_data();
+  return test_mode;
+}
+
+int get_protocol_earned_capital() method_id {
+  load_data();
+  return protocol_earned_capital;
+}
+
+slice get_float_manager() method_id {
+  load_data();
+  return float_manager_address;
+}
+
+int get_tranche_deposit_time(int tranche_id) method_id {
+  load_data();
+  (slice deposit_time_data, int found) = udict_get?(tranche_deposit_times, 8, tranche_id);
+  if (found == 0) {
+    return 0;
+  }
+  return deposit_time_data~load_uint(32);
+}
+
+int get_version() method_id {
+  return 3;
+}
+
+;; ================================================================
+;; END OF MULTITRANCHEVAULT CONTRACT
+;; ================================================================

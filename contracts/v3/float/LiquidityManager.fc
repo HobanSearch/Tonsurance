@@ -1,0 +1,474 @@
+;; ================================================================
+;; LiquidityManager Contract - Tranche Crossover Market Maker
+;; ================================================================
+;;
+;; Purpose: Provides liquidity at bonding curve crossover points
+;; Features:
+;; - Detects NAV crossovers between adjacent tranches
+;; - Deploys LP when fee APY > 15% AND our share < 30%
+;; - Earns trading fees while balancing tranche risk/reward
+;; - Reduces overall cost of LP capital for protocol
+;;
+;; Crossover Example: SNR/MEZZ at t=0.5 years
+;;   SNR (Log): NAV = 1.0 + 0.08*log(1.5) = 1.032
+;;   MEZZ (Linear): NAV = 1.0 + 0.10*0.5 = 1.050
+;;   → MEZZ yields more than SNR = arbitrage opportunity
+;;
+;; Target Shard: 0xF0
+;; Gas Cost: ~0.2 TON per LP deployment
+;; ================================================================
+
+#include "../libs/security_helpers.fc";
+
+;; ================================================================
+;; CONSTANTS
+;; ================================================================
+
+const int MIN_FEE_APY_BPS = 1500;    ;; 15% minimum fee APY to deploy LP
+const int MAX_POOL_SHARE_BPS = 3000; ;; Max 30% of pool liquidity
+
+;; Opcodes
+const int op::deploy_crossover_lp = 0xA6;
+const int op::withdraw_crossover_lp = 0xA7;
+const int op::claim_lp_fees = 0xA8;
+const int op::set_dedust_router = 0xA9;
+const int op::set_float_master = 0xAA;
+const int op::set_vault = 0xAB;
+const int op::pause = 0xAC;
+const int op::unpause = 0xAD;
+
+;; Error codes
+const int err::unauthorized = 401;
+const int err::paused = 402;
+const int err::invalid_amount = 403;
+const int err::router_not_set = 404;
+const int err::fee_apy_too_low = 405;
+const int err::pool_share_too_high = 406;
+
+;; Event types
+const int EVENT_CROSSOVER_LP_DEPLOYED = 0x01;
+const int EVENT_CROSSOVER_LP_WITHDRAWN = 0x02;
+const int EVENT_LP_FEES_CLAIMED = 0x03;
+const int EVENT_CROSSOVER_DETECTED = 0x04;
+const int EVENT_DEDUST_ROUTER_SET = 0x05;
+const int EVENT_FLOAT_MASTER_SET = 0x06;
+const int EVENT_VAULT_SET = 0x07;
+const int EVENT_LIQUIDITY_MANAGER_PAUSED = 0x08;
+const int EVENT_LIQUIDITY_MANAGER_UNPAUSED = 0x09;
+
+;; ================================================================
+;; STORAGE LAYOUT
+;; ================================================================
+
+global slice admin_address;
+global slice float_master_address;
+global slice vault_address;
+global slice dedust_router_address;
+
+global int total_lp_deployed;
+global int accumulated_fees;
+
+;; Active LP positions
+global cell lp_positions;           ;; Dict<position_id:uint64, position:cell>
+global int next_position_id;
+
+;; Crossover tracking
+global cell detected_crossovers;    ;; Dict<crossover_id:uint32, crossover:cell>
+
+global int paused;
+
+;; ================================================================
+;; STORAGE FUNCTIONS
+;; ================================================================
+
+() load_data() impure inline {
+  slice ds = get_data().begin_parse();
+
+  ;; Addresses split into 2 refs (2 + 2) to avoid cell overflow (4 × 267 = 1068 bits > 1023)
+  slice addr_ref1 = ds~load_ref().begin_parse();
+  admin_address = addr_ref1~load_msg_addr();
+  float_master_address = addr_ref1~load_msg_addr();
+
+  slice addr_ref2 = ds~load_ref().begin_parse();
+  vault_address = addr_ref2~load_msg_addr();
+  dedust_router_address = addr_ref2~load_msg_addr();
+
+  total_lp_deployed = ds~load_coins();
+  accumulated_fees = ds~load_coins();
+
+  lp_positions = ds~load_dict();
+  next_position_id = ds~load_uint(64);
+  detected_crossovers = ds~load_dict();
+
+  paused = ds~load_uint(1);
+}
+
+() save_data() impure inline {
+  ;; Split addresses into 2 refs (2 + 2) to avoid cell overflow
+  cell addr_data1 = begin_cell()
+    .store_slice(admin_address)
+    .store_slice(float_master_address)
+    .end_cell();
+
+  cell addr_data2 = begin_cell()
+    .store_slice(vault_address)
+    .store_slice(dedust_router_address)
+    .end_cell();
+
+  set_data(
+    begin_cell()
+      .store_ref(addr_data1)
+      .store_ref(addr_data2)
+      .store_coins(total_lp_deployed)
+      .store_coins(accumulated_fees)
+      .store_dict(lp_positions)
+      .store_uint(next_position_id, 64)
+      .store_dict(detected_crossovers)
+      .store_uint(paused, 1)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; CROSSOVER LP DEPLOYMENT
+;; ================================================================
+
+() deploy_crossover_liquidity(
+  int tranche1_id,
+  int tranche2_id,
+  int amount,
+  int estimated_fee_apy_bps,
+  int pool_total_liquidity
+) impure {
+  throw_unless(err::invalid_amount, amount > 0);
+  throw_if(err::router_not_set, is_valid_address(dedust_router_address) == false);
+
+  ;; Verify fee APY threshold
+  throw_unless(err::fee_apy_too_low, estimated_fee_apy_bps >= MIN_FEE_APY_BPS);
+
+  ;; Verify pool share limit (prevent dominating pools)
+  int our_share_bps = 0;
+  if (pool_total_liquidity > 0) {
+    our_share_bps = muldiv(amount, 10000, pool_total_liquidity);
+  }
+  throw_unless(err::pool_share_too_high, our_share_bps <= MAX_POOL_SHARE_BPS);
+
+  int position_id = next_position_id;
+  next_position_id += 1;
+
+  ;; Store LP position
+  cell position_data = begin_cell()
+    .store_uint(tranche1_id, 8)
+    .store_uint(tranche2_id, 8)
+    .store_coins(amount)
+    .store_uint(estimated_fee_apy_bps, 16)
+    .store_uint(now(), 32)
+    .store_coins(0)  ;; Fees earned (initialized to 0)
+    .end_cell();
+
+  lp_positions~udict_set_ref(64, position_id, position_data);
+  total_lp_deployed += amount;
+
+  ;; Deploy LP to DeDust pool for tranche pair
+  ;; Pool format: TRANCHE1_TOKEN / TRANCHE2_TOKEN
+  send_internal_msg(
+    dedust_router_address,
+    amount + 150000000,  ;; 0.15 TON gas
+    op::deploy_crossover_lp,
+    begin_cell()
+      .store_uint(position_id, 64)
+      .store_uint(tranche1_id, 8)
+      .store_uint(tranche2_id, 8)
+      .store_coins(amount)
+      .end_cell()
+  );
+
+  emit_log_event(EVENT_CROSSOVER_LP_DEPLOYED,
+    begin_cell()
+      .store_uint(position_id, 64)
+      .store_uint(tranche1_id, 8)
+      .store_uint(tranche2_id, 8)
+      .store_coins(amount)
+      .store_uint(estimated_fee_apy_bps, 16)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; LP WITHDRAWAL
+;; ================================================================
+
+() withdraw_crossover_liquidity(int position_id) impure {
+  (cell position_cell, int found) = udict_get_ref?(lp_positions, 64, position_id);
+  throw_unless(err::invalid_amount, found);
+
+  slice ps = position_cell.begin_parse();
+  int tranche1_id = ps~load_uint(8);
+  int tranche2_id = ps~load_uint(8);
+  int amount = ps~load_coins();
+  int estimated_fee_apy_bps = ps~load_uint(16);
+  int deployed_at = ps~load_uint(32);
+  int fees_earned = ps~load_coins();
+
+  ;; Withdraw LP from DeDust
+  send_internal_msg(
+    dedust_router_address,
+    100000000,  ;; 0.1 TON gas
+    op::withdraw_crossover_lp,
+    begin_cell()
+      .store_uint(position_id, 64)
+      .end_cell()
+  );
+
+  ;; Update tracking
+  total_lp_deployed -= amount;
+  accumulated_fees += fees_earned;
+
+  ;; Remove position
+  lp_positions~udict_delete?(64, position_id);
+
+  emit_log_event(EVENT_CROSSOVER_LP_WITHDRAWN,
+    begin_cell()
+      .store_uint(position_id, 64)
+      .store_coins(amount)
+      .store_coins(fees_earned)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; FEE CLAIMING
+;; ================================================================
+
+() claim_lp_fees(int position_id, int fees_earned) impure {
+  ;; Called by DeDust router when fees accumulate
+  (cell position_cell, int found) = udict_get_ref?(lp_positions, 64, position_id);
+  throw_unless(err::invalid_amount, found);
+
+  slice ps = position_cell.begin_parse();
+  int tranche1_id = ps~load_uint(8);
+  int tranche2_id = ps~load_uint(8);
+  int amount = ps~load_coins();
+  int estimated_fee_apy_bps = ps~load_uint(16);
+  int deployed_at = ps~load_uint(32);
+  int current_fees = ps~load_coins();
+
+  ;; Update fees earned
+  int new_total_fees = current_fees + fees_earned;
+
+  cell updated_position = begin_cell()
+    .store_uint(tranche1_id, 8)
+    .store_uint(tranche2_id, 8)
+    .store_coins(amount)
+    .store_uint(estimated_fee_apy_bps, 16)
+    .store_uint(deployed_at, 32)
+    .store_coins(new_total_fees)
+    .end_cell();
+
+  lp_positions~udict_set_ref(64, position_id, updated_position);
+  accumulated_fees += fees_earned;
+
+  emit_log_event(EVENT_LP_FEES_CLAIMED,
+    begin_cell()
+      .store_uint(position_id, 64)
+      .store_coins(fees_earned)
+      .store_coins(new_total_fees)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; CROSSOVER DETECTION (called by OCaml backend)
+;; ================================================================
+
+() record_crossover_detection(
+  int tranche1_id,
+  int tranche2_id,
+  int t_crossover_years_fp,  ;; Fixed-point years (9 decimals)
+  int yield_differential_fp  ;; Fixed-point (9 decimals)
+) impure {
+  ;; Store detected crossover for monitoring
+  int crossover_id = (tranche1_id * 10) + tranche2_id;
+
+  cell crossover_data = begin_cell()
+    .store_uint(tranche1_id, 8)
+    .store_uint(tranche2_id, 8)
+    .store_uint(t_crossover_years_fp, 64)
+    .store_uint(yield_differential_fp, 64)
+    .store_uint(now(), 32)
+    .end_cell();
+
+  detected_crossovers~udict_set_ref(32, crossover_id, crossover_data);
+
+  emit_log_event(EVENT_CROSSOVER_DETECTED,
+    begin_cell()
+      .store_uint(tranche1_id, 8)
+      .store_uint(tranche2_id, 8)
+      .store_uint(t_crossover_years_fp, 64)
+      .store_uint(yield_differential_fp, 64)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; MESSAGE HANDLERS
+;; ================================================================
+
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  if (in_msg_body.slice_empty?()) {
+    return ();
+  }
+
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+  slice sender = cs~load_msg_addr();
+
+  load_data();
+
+  int op = in_msg_body~load_uint(32);
+
+  if (op == op::deploy_crossover_lp) {
+    require_not_paused(paused);
+
+    ;; Admin or FloatMaster
+    throw_unless(err::unauthorized,
+      equal_slice_bits(sender, admin_address) | equal_slice_bits(sender, float_master_address));
+
+    int tranche1_id = in_msg_body~load_uint(8);
+    int tranche2_id = in_msg_body~load_uint(8);
+    int amount = in_msg_body~load_coins();
+    int estimated_fee_apy_bps = in_msg_body~load_uint(16);
+    int pool_total_liquidity = in_msg_body~load_coins();
+
+    deploy_crossover_liquidity(tranche1_id, tranche2_id, amount, estimated_fee_apy_bps, pool_total_liquidity);
+
+    save_data();
+    return ();
+  }
+
+  if (op == op::withdraw_crossover_lp) {
+    require_not_paused(paused);
+
+    throw_unless(err::unauthorized,
+      equal_slice_bits(sender, admin_address) | equal_slice_bits(sender, float_master_address));
+
+    int position_id = in_msg_body~load_uint(64);
+    withdraw_crossover_liquidity(position_id);
+
+    save_data();
+    return ();
+  }
+
+  if (op == op::claim_lp_fees) {
+    ;; Called by DeDust router
+    throw_unless(err::unauthorized, equal_slice_bits(sender, dedust_router_address));
+
+    int position_id = in_msg_body~load_uint(64);
+    int fees_earned = in_msg_body~load_coins();
+
+    claim_lp_fees(position_id, fees_earned);
+
+    save_data();
+    return ();
+  }
+
+  if (op == op::set_dedust_router) {
+    throw_unless(err::unauthorized, equal_slice_bits(sender, admin_address));
+    dedust_router_address = in_msg_body~load_msg_addr();
+    save_data();
+    emit_log_simple(EVENT_DEDUST_ROUTER_SET, 1);
+    return ();
+  }
+
+  if (op == op::set_float_master) {
+    throw_unless(err::unauthorized, equal_slice_bits(sender, admin_address));
+    float_master_address = in_msg_body~load_msg_addr();
+    save_data();
+    emit_log_simple(EVENT_FLOAT_MASTER_SET, 1);
+    return ();
+  }
+
+  if (op == op::set_vault) {
+    throw_unless(err::unauthorized, equal_slice_bits(sender, admin_address));
+    vault_address = in_msg_body~load_msg_addr();
+    save_data();
+    emit_log_simple(EVENT_VAULT_SET, 1);
+    return ();
+  }
+
+  if (op == op::pause) {
+    throw_unless(err::unauthorized, equal_slice_bits(sender, admin_address));
+    paused = 1;
+    save_data();
+    emit_log_simple(EVENT_LIQUIDITY_MANAGER_PAUSED, 1);
+    return ();
+  }
+
+  if (op == op::unpause) {
+    throw_unless(err::unauthorized, equal_slice_bits(sender, admin_address));
+    paused = 0;
+    save_data();
+    emit_log_simple(EVENT_LIQUIDITY_MANAGER_UNPAUSED, 1);
+    return ();
+  }
+
+  throw(0xFFFF);
+}
+
+;; ================================================================
+;; GET METHODS
+;; ================================================================
+
+slice get_admin() method_id {
+  load_data();
+  return admin_address;
+}
+
+slice get_float_master() method_id {
+  load_data();
+  return float_master_address;
+}
+
+int get_total_lp_deployed() method_id {
+  load_data();
+  return total_lp_deployed;
+}
+
+int get_accumulated_fees() method_id {
+  load_data();
+  return accumulated_fees;
+}
+
+int get_active_lp_count() method_id {
+  load_data();
+  ;; Count active LP positions
+  int count = 0;
+  int position_id = 0;
+
+  while (position_id < next_position_id) {
+    (cell position_cell, int found) = udict_get_ref?(lp_positions, 64, position_id);
+    if (found) {
+      count += 1;
+    }
+    position_id += 1;
+  }
+
+  return count;
+}
+
+int get_paused() method_id {
+  load_data();
+  return paused;
+}
+
+int get_version() method_id {
+  return 3;
+}
+
+;; ================================================================
+;; END OF LIQUIDITYMANAGER CONTRACT
+;; ================================================================

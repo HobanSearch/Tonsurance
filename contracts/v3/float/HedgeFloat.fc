@@ -1,0 +1,447 @@
+;; ================================================================
+;; HedgeFloat Contract - Active Hedging Manager
+;; ================================================================
+;;
+;; Purpose: Manages active hedges across perpetual futures and options
+;; Venues: Storm Trade (TON-native 80%), GMX/dYdX (EVM bridged 20%)
+;; Features:
+;; - Dynamic hedge sizing based on policy exposure
+;; - 4 instrument types: Shorts 40%, Puts 30%, Vol 20%, Stable 10%
+;; - Continuous rebalancing (1-5 min via OCaml backend)
+;; - Target: -1.32% to -2.68% cost (hedges are cost centers)
+;;
+;; Allocation: 20% of total premium float
+;; Target Shard: 0xF0
+;; Gas Cost: ~0.2 TON per hedge open/close
+;; ================================================================
+
+#include "../libs/security_helpers.fc";
+
+;; ================================================================
+;; CONSTANTS
+;; ================================================================
+
+;; Hedge Instrument Types
+const int INSTRUMENT_SHORT = 1;      ;; 40% allocation
+const int INSTRUMENT_PUT = 2;        ;; 30% allocation
+const int INSTRUMENT_VOL = 3;        ;; 20% allocation
+const int INSTRUMENT_STABLE = 4;     ;; 10% allocation
+
+;; Opcodes
+const int op::add_hedge_capital = 0x83;
+const int op::open_short = 0x8E;
+const int op::close_short = 0x8F;
+const int op::buy_put = 0xA0;
+const int op::set_storm_trade = 0xA1;
+const int op::set_gmx_router = 0xA2;
+const int op::set_float_master = 0xA3;
+const int op::pause = 0xA4;
+const int op::unpause = 0xA5;
+
+;; Error codes
+const int err::unauthorized = 401;
+const int err::paused = 402;
+const int err::invalid_amount = 403;
+const int err::venue_not_set = 404;
+const int err::insufficient_capital = 405;
+const int err::position_not_found = 406;
+
+;; Event types
+const int EVENT_HEDGE_CAPITAL_ADDED = 0x01;
+const int EVENT_SHORT_POSITION_OPENED = 0x02;
+const int EVENT_SHORT_POSITION_CLOSED = 0x03;
+const int EVENT_STORM_TRADE_SET = 0x04;
+const int EVENT_GMX_ROUTER_SET = 0x05;
+const int EVENT_FLOAT_MASTER_SET = 0x06;
+const int EVENT_HEDGE_FLOAT_PAUSED = 0x07;
+const int EVENT_HEDGE_FLOAT_UNPAUSED = 0x08;
+
+;; ================================================================
+;; STORAGE LAYOUT
+;; ================================================================
+
+global slice admin_address;
+global slice float_master_address;
+global slice storm_trade_address;     ;; TON-native perpetuals (launching Q1 2026)
+global slice gmx_router_address;      ;; GMX on Arbitrum (via bridge)
+
+global int total_hedge_capital;
+global int active_capital_deployed;
+global int unrealized_pnl;
+
+;; Hedge positions tracking
+global cell active_positions;         ;; Dict<position_id:uint64, position:cell>
+global int next_position_id;
+
+;; Coverage exposure tracking (for sizing hedges)
+global cell coverage_exposure;        ;; Dict<asset_id:uint16, exposure:int>
+
+global int paused;
+
+;; ================================================================
+;; STORAGE FUNCTIONS
+;; ================================================================
+
+() load_data() impure inline {
+  slice ds = get_data().begin_parse();
+
+  ;; Addresses split into 2 refs (2 + 2) to avoid cell overflow (4 × 267 = 1068 bits > 1023)
+  slice addr_ref1 = ds~load_ref().begin_parse();
+  admin_address = addr_ref1~load_msg_addr();
+  float_master_address = addr_ref1~load_msg_addr();
+
+  slice addr_ref2 = ds~load_ref().begin_parse();
+  storm_trade_address = addr_ref2~load_msg_addr();
+  gmx_router_address = addr_ref2~load_msg_addr();
+
+  total_hedge_capital = ds~load_coins();
+  active_capital_deployed = ds~load_coins();
+  unrealized_pnl = ds~load_coins();
+
+  active_positions = ds~load_dict();
+  next_position_id = ds~load_uint(64);
+  coverage_exposure = ds~load_dict();
+
+  paused = ds~load_uint(1);
+}
+
+() save_data() impure inline {
+  ;; Split addresses into 2 refs (2 + 2) to avoid cell overflow
+  cell addr_data1 = begin_cell()
+    .store_slice(admin_address)
+    .store_slice(float_master_address)
+    .end_cell();
+
+  cell addr_data2 = begin_cell()
+    .store_slice(storm_trade_address)
+    .store_slice(gmx_router_address)
+    .end_cell();
+
+  set_data(
+    begin_cell()
+      .store_ref(addr_data1)
+      .store_ref(addr_data2)
+      .store_coins(total_hedge_capital)
+      .store_coins(active_capital_deployed)
+      .store_coins(unrealized_pnl)
+      .store_dict(active_positions)
+      .store_uint(next_position_id, 64)
+      .store_dict(coverage_exposure)
+      .store_uint(paused, 1)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; CAPITAL MANAGEMENT
+;; ================================================================
+
+() add_capital(int amount, int product_type, int asset_id, int coverage_amount) impure {
+  throw_unless(err::invalid_amount, amount > 0);
+
+  total_hedge_capital += amount;
+
+  ;; Track coverage exposure for this asset
+  (slice existing_exposure, int found) = udict_get?(coverage_exposure, 16, asset_id);
+  int current_exposure = 0;
+
+  if (found) {
+    current_exposure = existing_exposure~load_coins();
+  }
+
+  current_exposure += coverage_amount;
+
+  coverage_exposure~udict_set(16, asset_id,
+    begin_cell()
+      .store_coins(current_exposure)
+      .end_cell()
+      .begin_parse()
+  );
+
+  ;; Auto-deploy hedges based on exposure
+  ;; OCaml backend will continuously rebalance, this is initial allocation
+  int hedge_size = muldiv(coverage_amount, 20, 100);  ;; 20% of coverage as hedge
+  open_automatic_hedge(asset_id, hedge_size);
+
+  emit_log_event(EVENT_HEDGE_CAPITAL_ADDED,
+    begin_cell()
+      .store_coins(amount)
+      .store_uint(asset_id, 16)
+      .store_coins(coverage_amount)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; AUTOMATIC HEDGE DEPLOYMENT
+;; ================================================================
+
+() open_automatic_hedge(int asset_id, int hedge_size) impure inline {
+  throw_unless(err::invalid_amount, hedge_size > 0);
+  throw_unless(err::insufficient_capital, total_hedge_capital >= hedge_size);
+
+  ;; Default allocation: 40% short, 30% put, 20% vol, 10% stable
+  int short_size = muldiv(hedge_size, 40, 100);
+  int put_size = muldiv(hedge_size, 30, 100);
+  int vol_size = muldiv(hedge_size, 20, 100);
+  int stable_size = hedge_size - short_size - put_size - vol_size;
+
+  ;; Open short position (prioritize TON-native Storm Trade)
+  if (is_valid_address(storm_trade_address)) {
+    open_short_position(asset_id, short_size, storm_trade_address, 1);
+  } else {
+    if (is_valid_address(gmx_router_address)) {
+      open_short_position(asset_id, short_size, gmx_router_address, 2);
+    }
+  }
+
+  ;; Put options, volatility strategies, and stablecoin hedges
+  ;; Will be implemented with full venue integrations in Phase 3
+}
+
+;; ================================================================
+;; SHORT POSITION MANAGEMENT
+;; ================================================================
+
+() open_short_position(
+  int asset_id,
+  int size_usd,
+  slice venue_address,
+  int venue_type  ;; 1=Storm Trade, 2=GMX
+) impure inline {
+  int position_id = next_position_id;
+  next_position_id += 1;
+
+  ;; Store position metadata
+  cell position_data = begin_cell()
+    .store_uint(asset_id, 16)
+    .store_uint(INSTRUMENT_SHORT, 8)
+    .store_coins(size_usd)
+    .store_uint(venue_type, 8)
+    .store_uint(now(), 32)
+    .store_coins(0)  ;; Initial PnL = 0
+    .end_cell();
+
+  active_positions~udict_set_ref(64, position_id, position_data);
+  active_capital_deployed += size_usd;
+
+  ;; Send open position message to venue
+  send_internal_msg(
+    venue_address,
+    size_usd + 150000000,  ;; 0.15 TON gas
+    op::open_short,
+    begin_cell()
+      .store_uint(position_id, 64)
+      .store_uint(asset_id, 16)
+      .store_coins(size_usd)
+      .store_uint(5, 8)  ;; Leverage: 5x
+      .end_cell()
+  );
+
+  emit_log_event(EVENT_SHORT_POSITION_OPENED,
+    begin_cell()
+      .store_uint(position_id, 64)
+      .store_uint(asset_id, 16)
+      .store_coins(size_usd)
+      .store_uint(venue_type, 8)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+() close_short_position(int position_id) impure {
+  (cell position_cell, int found) = udict_get_ref?(active_positions, 64, position_id);
+  throw_unless(err::position_not_found, found);
+
+  slice ps = position_cell.begin_parse();
+  int asset_id = ps~load_uint(16);
+  int instrument_type = ps~load_uint(8);
+  int size_usd = ps~load_coins();
+  int venue_type = ps~load_uint(8);
+  int opened_at = ps~load_uint(32);
+  int pnl = ps~load_coins();
+
+  ;; Determine venue address
+  slice venue_address = storm_trade_address;
+  if (venue_type == 2) {
+    venue_address = gmx_router_address;
+  }
+
+  ;; Send close position message
+  send_internal_msg(
+    venue_address,
+    100000000,  ;; 0.1 TON gas
+    op::close_short,
+    begin_cell()
+      .store_uint(position_id, 64)
+      .end_cell()
+  );
+
+  ;; Update tracking
+  active_capital_deployed -= size_usd;
+  unrealized_pnl += pnl;
+
+  ;; Remove from active positions
+  active_positions~udict_delete?(64, position_id);
+
+  emit_log_event(EVENT_SHORT_POSITION_CLOSED,
+    begin_cell()
+      .store_uint(position_id, 64)
+      .store_coins(pnl)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; MESSAGE HANDLERS
+;; ================================================================
+
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  if (in_msg_body.slice_empty?()) {
+    return ();
+  }
+
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+  slice sender = cs~load_msg_addr();
+
+  load_data();
+
+  int op = in_msg_body~load_uint(32);
+
+  if (op == op::add_hedge_capital) {
+    require_not_paused(paused);
+
+    throw_unless(err::unauthorized, equal_slice_bits(sender, float_master_address));
+
+    int amount = in_msg_body~load_coins();
+    int product_type = in_msg_body~load_uint(8);
+    int asset_id = in_msg_body~load_uint(16);
+    int coverage_amount = in_msg_body~load_coins();
+
+    add_capital(amount, product_type, asset_id, coverage_amount);
+
+    save_data();
+    return ();
+  }
+
+  if (op == op::close_short) {
+    require_not_paused(paused);
+
+    ;; Admin or OCaml backend
+    throw_unless(err::unauthorized, equal_slice_bits(sender, admin_address));
+
+    int position_id = in_msg_body~load_uint(64);
+    close_short_position(position_id);
+
+    save_data();
+    return ();
+  }
+
+  if (op == op::set_storm_trade) {
+    throw_unless(err::unauthorized, equal_slice_bits(sender, admin_address));
+    storm_trade_address = in_msg_body~load_msg_addr();
+    save_data();
+    emit_log_simple(EVENT_STORM_TRADE_SET, 1);
+    return ();
+  }
+
+  if (op == op::set_gmx_router) {
+    throw_unless(err::unauthorized, equal_slice_bits(sender, admin_address));
+    gmx_router_address = in_msg_body~load_msg_addr();
+    save_data();
+    emit_log_simple(EVENT_GMX_ROUTER_SET, 1);
+    return ();
+  }
+
+  if (op == op::set_float_master) {
+    throw_unless(err::unauthorized, equal_slice_bits(sender, admin_address));
+    float_master_address = in_msg_body~load_msg_addr();
+    save_data();
+    emit_log_simple(EVENT_FLOAT_MASTER_SET, 1);
+    return ();
+  }
+
+  if (op == op::pause) {
+    throw_unless(err::unauthorized, equal_slice_bits(sender, admin_address));
+    paused = 1;
+    save_data();
+    emit_log_simple(EVENT_HEDGE_FLOAT_PAUSED, 1);
+    return ();
+  }
+
+  if (op == op::unpause) {
+    throw_unless(err::unauthorized, equal_slice_bits(sender, admin_address));
+    paused = 0;
+    save_data();
+    emit_log_simple(EVENT_HEDGE_FLOAT_UNPAUSED, 1);
+    return ();
+  }
+
+  throw(0xFFFF);
+}
+
+;; ================================================================
+;; GET METHODS
+;; ================================================================
+
+slice get_admin() method_id {
+  load_data();
+  return admin_address;
+}
+
+slice get_float_master() method_id {
+  load_data();
+  return float_master_address;
+}
+
+int get_total_hedge_capital() method_id {
+  load_data();
+  return total_hedge_capital;
+}
+
+int get_active_capital_deployed() method_id {
+  load_data();
+  return active_capital_deployed;
+}
+
+int get_unrealized_pnl() method_id {
+  load_data();
+  return unrealized_pnl;
+}
+
+int get_coverage_exposure(int asset_id) method_id {
+  load_data();
+  (slice exposure_data, int found) = udict_get?(coverage_exposure, 16, asset_id);
+  if (found == 0) {
+    return 0;
+  }
+  return exposure_data~load_coins();
+}
+
+int get_total_balance() method_id {
+  load_data();
+  return total_hedge_capital;
+}
+
+;; Calculate daily PnL (negative, hedges are cost centers: -2% of capital)
+int get_daily_yield() method_id {
+  load_data();
+  ;; Daily cost = capital * -0.02 / 365
+  return muldiv(total_hedge_capital, -2, 365 * 100);
+}
+
+int get_paused() method_id {
+  load_data();
+  return paused;
+}
+
+int get_version() method_id {
+  return 3;
+}
+
+;; ================================================================
+;; END OF HEDGEFLOAT CONTRACT
+;; ================================================================

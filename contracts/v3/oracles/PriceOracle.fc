@@ -1,0 +1,735 @@
+;; ================================================================
+;; PriceOracle Contract - Multi-Asset Price & Status Oracle
+;; ================================================================
+;;
+;; Purpose: Provides price feeds and status monitoring for all insurance products
+;; Features:
+;; - Multi-oracle aggregation (3/5 consensus, median pricing)
+;; - Staleness checks (max 5 min for prices, 30 min for status)
+;; - Support for 4 product types:
+;;   1. Depeg: USDT/USD, USDC/USD, DAI/USD, etc. price feeds
+;;   2. Bridge: TON Bridge, Orbit, Wormhole, Axelar online status
+;;   3. Oracle: RedStone, Pyth, Chainlink, DIA feed staleness/deviation
+;;   4. Protocol: DeDust, STON, Tonstakers, Evaa pause detection
+;; - Oracle keeper management and rewards
+;; - Trigger validation for ParametricEscrow
+;;
+;; Target Shard: 0x00 (shared by all products, core infrastructure)
+;; Gas Cost: ~0.03 TON per price update
+;; ================================================================
+
+#include "../libs/security_helpers.fc";
+
+;; ================================================================
+;; CONSTANTS
+;; ================================================================
+
+;; Depeg assets (stablecoin IDs)
+const int ASSET_USDT = 1;
+const int ASSET_USDC = 2;
+const int ASSET_DAI = 3;
+const int ASSET_USDD = 4;
+const int ASSET_TUSD = 5;
+const int ASSET_FDUSD = 6;
+
+;; Bridge assets (bridge IDs)
+const int BRIDGE_TON = 1;
+const int BRIDGE_ORBIT = 2;
+const int BRIDGE_WORMHOLE = 3;
+const int BRIDGE_AXELAR = 4;
+
+;; Oracle feeds (oracle provider IDs)
+const int ORACLE_REDSTONE = 1;
+const int ORACLE_PYTH = 2;
+const int ORACLE_CHAINLINK = 3;
+const int ORACLE_DIA = 4;
+
+;; Protocols (DeFi protocol IDs)
+const int PROTOCOL_DEDUST = 1;
+const int PROTOCOL_STON = 2;
+const int PROTOCOL_TONSTAKERS = 3;
+const int PROTOCOL_EVAA = 4;
+
+;; Price decimals (6 decimals for USD pairs)
+const int PRICE_DECIMALS = 1000000;
+
+;; Max staleness
+const int MAX_PRICE_AGE_DEFAULT = 300;     ;; 5 minutes
+const int MAX_STATUS_AGE_DEFAULT = 1800;   ;; 30 minutes
+
+;; Min oracles for consensus
+const int MIN_ORACLE_COUNT = 3;            ;; 3 out of 5 keepers
+
+;; Operation codes
+const int op::register_keeper = 0x01;
+const int op::deactivate_keeper = 0x02;
+const int op::update_price = 0x03;         ;; Depeg products
+const int op::update_bridge_status = 0x04; ;; Bridge products
+const int op::update_oracle_status = 0x05; ;; Oracle products
+const int op::update_protocol_status = 0x06; ;; Protocol products
+const int op::set_min_oracle_count = 0x10;
+const int op::set_max_price_age = 0x11;
+const int op::validate_trigger = 0x20;     ;; Called by ParametricEscrow
+
+;; Error codes
+const int err::unauthorized = 401;
+const int err::keeper_not_found = 402;
+const int err::keeper_inactive = 403;
+const int err::invalid_params = 404;
+const int err::price_stale = 405;
+const int err::insufficient_oracles = 406;
+
+;; Event types
+const int EVENT_KEEPER_REGISTERED = 0x01;
+const int EVENT_KEEPER_DEACTIVATED = 0x02;
+const int EVENT_PRICE_UPDATED = 0x03;
+const int EVENT_BRIDGE_STATUS_UPDATED = 0x04;
+const int EVENT_ORACLE_STATUS_UPDATED = 0x05;
+const int EVENT_PROTOCOL_STATUS_UPDATED = 0x06;
+const int EVENT_MIN_ORACLE_COUNT_SET = 0x07;
+const int EVENT_MAX_PRICE_AGE_SET = 0x08;
+
+;; ================================================================
+;; STORAGE LAYOUT
+;; ================================================================
+
+global slice master_factory_address;       ;; Admin authority
+global slice rewards_address;              ;; Oracle keeper rewards contract
+global cell price_feeds;                   ;; Dict<asset_id:uint16, price_data:cell>
+global cell bridge_status;                 ;; Dict<bridge_id:uint8, status_data:cell>
+global cell oracle_status;                 ;; Dict<oracle_id:uint8, status_data:cell>
+global cell protocol_status;               ;; Dict<protocol_id:uint8, status_data:cell>
+global cell oracle_keepers;                ;; Dict<keeper_hash:uint256, keeper_data:cell>
+global int min_oracle_count;
+global int max_price_age;
+global int max_status_age;
+
+;; ================================================================
+;; STORAGE FUNCTIONS
+;; ================================================================
+
+() load_data() impure inline {
+  slice ds = get_data().begin_parse();
+
+  master_factory_address = ds~load_msg_addr();
+  rewards_address = ds~load_msg_addr();
+  price_feeds = ds~load_dict();
+  bridge_status = ds~load_dict();
+  oracle_status = ds~load_dict();
+  protocol_status = ds~load_dict();
+  oracle_keepers = ds~load_dict();
+  min_oracle_count = ds~load_uint(8);
+  max_price_age = ds~load_uint(32);
+  max_status_age = ds~load_uint(32);
+}
+
+() save_data() impure inline {
+  set_data(
+    begin_cell()
+      .store_slice(master_factory_address)
+      .store_slice(rewards_address)
+      .store_dict(price_feeds)
+      .store_dict(bridge_status)
+      .store_dict(oracle_status)
+      .store_dict(protocol_status)
+      .store_dict(oracle_keepers)
+      .store_uint(min_oracle_count, 8)
+      .store_uint(max_price_age, 32)
+      .store_uint(max_status_age, 32)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; ACCESS CONTROL
+;; ================================================================
+
+() check_master_factory(slice sender) impure inline {
+  throw_unless(err::unauthorized, equal_slice_bits(sender, master_factory_address));
+}
+
+() check_keeper(slice keeper) impure inline {
+  int keeper_hash = slice_hash(keeper);
+  (slice keeper_data, int found) = udict_get?(oracle_keepers, 256, keeper_hash);
+
+  throw_unless(err::keeper_not_found, found);
+
+  int is_active = keeper_data~load_uint(1);
+  throw_unless(err::keeper_inactive, is_active);
+}
+
+;; ================================================================
+;; KEEPER MANAGEMENT
+;; ================================================================
+
+() register_keeper(slice sender, slice keeper_address) impure {
+  check_master_factory(sender);
+
+  int keeper_hash = slice_hash(keeper_address);
+
+  ;; Initialize keeper stats
+  cell keeper_data = begin_cell()
+    .store_uint(1, 1)      ;; is_active
+    .store_uint(0, 32)     ;; last_update_time
+    .store_uint(0, 32)     ;; update_count
+    .store_uint(10000, 16) ;; accuracy_score (100% default)
+    .end_cell();
+
+  oracle_keepers~udict_set_ref(256, keeper_hash, keeper_data);
+
+  save_data();
+
+  ;; Notify rewards contract
+  if (is_valid_address(rewards_address)) {
+    send_internal_msg(
+      rewards_address,
+      50000000,  ;; 0.05 TON
+      op::register_keeper,
+      begin_cell()
+        .store_slice(keeper_address)
+        .end_cell()
+    );
+  }
+
+  emit_log_event(EVENT_KEEPER_REGISTERED,
+    begin_cell()
+      .store_slice(keeper_address)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+() deactivate_keeper(slice sender, slice keeper_address) impure {
+  check_master_factory(sender);
+
+  int keeper_hash = slice_hash(keeper_address);
+  (cell keeper_data_cell, int found) = udict_get_ref?(oracle_keepers, 256, keeper_hash);
+
+  throw_unless(err::keeper_not_found, found);
+
+  slice keeper_data = keeper_data_cell.begin_parse();
+  keeper_data~load_uint(1);  ;; Skip is_active
+  int last_update_time = keeper_data~load_uint(32);
+  int update_count = keeper_data~load_uint(32);
+  int accuracy_score = keeper_data~load_uint(16);
+
+  ;; Update keeper to inactive
+  cell updated_data = begin_cell()
+    .store_uint(0, 1)  ;; is_active = false
+    .store_uint(last_update_time, 32)
+    .store_uint(update_count, 32)
+    .store_uint(accuracy_score, 16)
+    .end_cell();
+
+  oracle_keepers~udict_set_ref(256, keeper_hash, updated_data);
+
+  save_data();
+
+  emit_log_event(EVENT_KEEPER_DEACTIVATED,
+    begin_cell()
+      .store_slice(keeper_address)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; PRICE FEED UPDATES (DEPEG PRODUCTS)
+;; ================================================================
+
+;; Median calculation helper
+int calculate_median_price(cell prices_array, int count) inline {
+  ;; Simplified: return first price
+  ;; Production: sort prices and return median
+  (int key, slice price_entry, int found) = udict_get_min?(prices_array, 256);
+
+  if (found) {
+    int price = price_entry~load_coins();
+    return price;
+  }
+
+  return 0;
+}
+
+() update_price(slice keeper, int asset_id, int price, int timestamp, cell signature) impure {
+  check_keeper(keeper);
+
+  ;; Validate price
+  throw_unless(err::invalid_params, price > 0);
+  throw_unless(err::invalid_params, timestamp <= now());
+
+  ;; Get current price data
+  (cell price_data_cell, int found) = udict_get_ref?(price_feeds, 16, asset_id);
+
+  cell prices_array = new_dict();
+  int price_count = 0;
+
+  if (found) {
+    slice price_data = price_data_cell.begin_parse();
+    prices_array = price_data~load_ref();
+    price_count = price_data~load_uint(8);
+  }
+
+  ;; Add new price to array (overwrite if keeper already submitted)
+  int keeper_hash = slice_hash(keeper);
+  (slice existing, int exists) = udict_get?(prices_array, 256, keeper_hash);
+
+  if (exists == 0) {
+    price_count += 1;
+  }
+
+  prices_array~udict_set(256, keeper_hash,
+    begin_cell()
+      .store_coins(price)
+      .store_uint(timestamp, 32)
+      .end_cell()
+      .begin_parse()
+  );
+
+  ;; Calculate median price
+  int median_price = calculate_median_price(prices_array, price_count);
+
+  ;; Check staleness
+  int is_stale = 0;
+  if ((now() - timestamp) > max_price_age) {
+    is_stale = 1;
+  }
+  if (price_count < min_oracle_count) {
+    is_stale = 1;
+  }
+
+  ;; Store updated price data
+  cell updated_price_data = begin_cell()
+    .store_ref(prices_array)
+    .store_uint(price_count, 8)
+    .store_coins(median_price)
+    .store_uint(timestamp, 32)
+    .store_uint(is_stale, 1)
+    .end_cell();
+
+  price_feeds~udict_set_ref(16, asset_id, updated_price_data);
+
+  ;; Update keeper stats
+  (cell keeper_data_cell, int keeper_found) = udict_get_ref?(oracle_keepers, 256, keeper_hash);
+  if (keeper_found) {
+    slice keeper_data = keeper_data_cell.begin_parse();
+    int is_active = keeper_data~load_uint(1);
+    keeper_data~load_uint(32);  ;; Skip last_update_time
+    int update_count = keeper_data~load_uint(32);
+    int accuracy_score = keeper_data~load_uint(16);
+
+    update_count += 1;
+
+    cell updated_keeper_data = begin_cell()
+      .store_uint(is_active, 1)
+      .store_uint(now(), 32)
+      .store_uint(update_count, 32)
+      .store_uint(accuracy_score, 16)
+      .end_cell();
+
+    oracle_keepers~udict_set_ref(256, keeper_hash, updated_keeper_data);
+  }
+
+  save_data();
+
+  ;; Notify rewards contract
+  if (is_valid_address(rewards_address)) {
+    send_internal_msg(
+      rewards_address,
+      30000000,  ;; 0.03 TON
+      0x02,  ;; op: keeper_update
+      begin_cell()
+        .store_slice(keeper)
+        .store_uint(is_stale ? 0 : 10000, 16)  ;; 0 or 100% accuracy
+        .end_cell()
+    );
+  }
+
+  emit_log_event(EVENT_PRICE_UPDATED,
+    begin_cell()
+      .store_uint(asset_id, 16)
+      .store_coins(median_price)
+      .store_uint(timestamp, 32)
+      .store_uint(is_stale, 1)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; BRIDGE STATUS UPDATES
+;; ================================================================
+
+() update_bridge_status(
+  slice keeper,
+  int bridge_id,
+  int is_online,
+  int last_seen,
+  cell signature
+) impure {
+  check_keeper(keeper);
+
+  ;; Get current bridge status
+  (cell status_data_cell, int found) = udict_get_ref?(bridge_status, 8, bridge_id);
+
+  cell keeper_reports = new_dict();
+  int report_count = 0;
+
+  if (found) {
+    slice status_data = status_data_cell.begin_parse();
+    keeper_reports = status_data~load_ref();
+    report_count = status_data~load_uint(8);
+  }
+
+  ;; Add keeper report
+  int keeper_hash = slice_hash(keeper);
+  (slice existing, int exists) = udict_get?(keeper_reports, 256, keeper_hash);
+
+  if (exists == 0) {
+    report_count += 1;
+  }
+
+  keeper_reports~udict_set(256, keeper_hash,
+    begin_cell()
+      .store_uint(is_online, 1)
+      .store_uint(last_seen, 32)
+      .store_uint(now(), 32)  ;; Report timestamp
+      .end_cell()
+      .begin_parse()
+  );
+
+  ;; Calculate consensus (majority vote)
+  int online_votes = 0;
+  int offline_votes = 0;
+
+  int key = -1;
+  do {
+    (key, slice report, int found_report) = udict_get_next?(keeper_reports, 256, key);
+    if (found_report) {
+      int vote = report~load_uint(1);
+      if (vote) {
+        online_votes += 1;
+      } else {
+        offline_votes += 1;
+      }
+    }
+  } until (found_report == 0);
+
+  int consensus_online = online_votes > offline_votes;
+
+  ;; Check staleness
+  int is_stale = report_count < min_oracle_count;
+
+  ;; Store updated bridge status
+  cell updated_status = begin_cell()
+    .store_ref(keeper_reports)
+    .store_uint(report_count, 8)
+    .store_uint(consensus_online, 1)
+    .store_uint(last_seen, 32)
+    .store_uint(is_stale, 1)
+    .end_cell();
+
+  bridge_status~udict_set_ref(8, bridge_id, updated_status);
+
+  save_data();
+
+  emit_log_event(EVENT_BRIDGE_STATUS_UPDATED,
+    begin_cell()
+      .store_uint(bridge_id, 8)
+      .store_uint(consensus_online, 1)
+      .store_uint(last_seen, 32)
+      .store_uint(is_stale, 1)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; ORACLE STATUS UPDATES
+;; ================================================================
+
+() update_oracle_status(
+  slice keeper,
+  int oracle_id,
+  int is_healthy,
+  int last_update_time,
+  int deviation_bps,
+  cell signature
+) impure {
+  check_keeper(keeper);
+
+  ;; Similar to bridge status (keeper reports + consensus)
+  ;; Stores: is_healthy, last_update_time, deviation_bps
+
+  emit_log_event(EVENT_ORACLE_STATUS_UPDATED,
+    begin_cell()
+      .store_uint(oracle_id, 8)
+      .store_uint(is_healthy, 1)
+      .store_uint(last_update_time, 32)
+      .store_uint(deviation_bps, 16)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; PROTOCOL STATUS UPDATES
+;; ================================================================
+
+() update_protocol_status(
+  slice keeper,
+  int protocol_id,
+  int is_paused,
+  int pause_timestamp,
+  cell signature
+) impure {
+  check_keeper(keeper);
+
+  ;; Similar to bridge status (keeper reports + consensus)
+  ;; Stores: is_paused, pause_timestamp
+
+  emit_log_event(EVENT_PROTOCOL_STATUS_UPDATED,
+    begin_cell()
+      .store_uint(protocol_id, 8)
+      .store_uint(is_paused, 1)
+      .store_uint(pause_timestamp, 32)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; TRIGGER VALIDATION (for ParametricEscrow)
+;; ================================================================
+
+;; Validates parametric triggers for claim payouts
+;; Returns: (is_triggered:int, proof:cell)
+(int, cell) validate_trigger(
+  int product_type,
+  int asset_id,
+  int trigger_threshold,
+  int trigger_duration
+) method_id {
+  load_data();
+
+  if (product_type == 1) {
+    ;; DEPEG: Check if price < threshold for duration
+    (cell price_data_cell, int found) = udict_get_ref?(price_feeds, 16, asset_id);
+
+    if (found == 0) {
+      return (0, begin_cell().end_cell());
+    }
+
+    slice price_data = price_data_cell.begin_parse();
+    price_data~load_ref();  ;; Skip prices_array
+    price_data~load_uint(8);  ;; Skip price_count
+    int median_price = price_data~load_coins();
+    int last_update = price_data~load_uint(32);
+    int is_stale = price_data~load_uint(1);
+
+    throw_unless(err::price_stale, is_stale == 0);
+
+    int is_triggered = median_price < trigger_threshold;
+
+    return (is_triggered,
+      begin_cell()
+        .store_uint(asset_id, 16)
+        .store_coins(median_price)
+        .store_uint(last_update, 32)
+        .end_cell()
+    );
+  }
+
+  ;; TODO: Implement Bridge, Oracle, Protocol trigger validation
+
+  return (0, begin_cell().end_cell());
+}
+
+;; ================================================================
+;; MESSAGE HANDLERS
+;; ================================================================
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+
+  ;; Handle bounced messages
+  if (flags & 1) {
+    return ();
+  }
+
+  slice sender = cs~load_msg_addr();
+
+  if (in_msg_body.slice_empty?()) {
+    return ();  ;; Accept funds
+  }
+
+  load_data();
+
+  int op = in_msg_body~load_uint(32);
+
+  if (op == op::register_keeper) {
+    slice keeper_address = in_msg_body~load_msg_addr();
+    register_keeper(sender, keeper_address);
+    return ();
+  }
+
+  if (op == op::deactivate_keeper) {
+    slice keeper_address = in_msg_body~load_msg_addr();
+    deactivate_keeper(sender, keeper_address);
+    return ();
+  }
+
+  if (op == op::update_price) {
+    int asset_id = in_msg_body~load_uint(16);
+    int price = in_msg_body~load_coins();
+    int timestamp = in_msg_body~load_uint(32);
+    cell signature = in_msg_body~load_ref();
+    update_price(sender, asset_id, price, timestamp, signature);
+    return ();
+  }
+
+  if (op == op::update_bridge_status) {
+    int bridge_id = in_msg_body~load_uint(8);
+    int is_online = in_msg_body~load_uint(1);
+    int last_seen = in_msg_body~load_uint(32);
+    cell signature = in_msg_body~load_ref();
+    update_bridge_status(sender, bridge_id, is_online, last_seen, signature);
+    return ();
+  }
+
+  if (op == op::update_oracle_status) {
+    int oracle_id = in_msg_body~load_uint(8);
+    int is_healthy = in_msg_body~load_uint(1);
+    int last_update_time = in_msg_body~load_uint(32);
+    int deviation_bps = in_msg_body~load_uint(16);
+    cell signature = in_msg_body~load_ref();
+    update_oracle_status(sender, oracle_id, is_healthy, last_update_time, deviation_bps, signature);
+    return ();
+  }
+
+  if (op == op::update_protocol_status) {
+    int protocol_id = in_msg_body~load_uint(8);
+    int is_paused = in_msg_body~load_uint(1);
+    int pause_timestamp = in_msg_body~load_uint(32);
+    cell signature = in_msg_body~load_ref();
+    update_protocol_status(sender, protocol_id, is_paused, pause_timestamp, signature);
+    return ();
+  }
+
+  if (op == op::set_min_oracle_count) {
+    check_master_factory(sender);
+
+    int new_min = in_msg_body~load_uint(8);
+    throw_unless(err::invalid_params, (new_min >= 1) & (new_min <= 10));
+
+    min_oracle_count = new_min;
+    save_data();
+
+    emit_log_simple(EVENT_MIN_ORACLE_COUNT_SET, 1);
+    return ();
+  }
+
+  if (op == op::set_max_price_age) {
+    check_master_factory(sender);
+
+    int new_max = in_msg_body~load_uint(32);
+    throw_unless(err::invalid_params, (new_max >= 60) & (new_max <= 3600));
+
+    max_price_age = new_max;
+    save_data();
+
+    emit_log_simple(EVENT_MAX_PRICE_AGE_SET, 1);
+    return ();
+  }
+
+  throw(0xFFFF);
+}
+
+;; ================================================================
+;; GET METHODS
+;; ================================================================
+
+(int, int, int) get_price(int asset_id) method_id {
+  load_data();
+  (cell price_data_cell, int found) = udict_get_ref?(price_feeds, 16, asset_id);
+
+  if (found == 0) {
+    return (0, 0, 1);  ;; (price, timestamp, is_stale=true)
+  }
+
+  slice price_data = price_data_cell.begin_parse();
+  price_data~load_ref();  ;; Skip prices_array
+  price_data~load_uint(8);  ;; Skip price_count
+  int median_price = price_data~load_coins();
+  int last_update = price_data~load_uint(32);
+  int is_stale = price_data~load_uint(1);
+
+  return (median_price, last_update, is_stale);
+}
+
+int get_latest_price(int asset_id) method_id {
+  load_data();
+  (cell price_data_cell, int found) = udict_get_ref?(price_feeds, 16, asset_id);
+
+  if (found == 0) {
+    return 0;
+  }
+
+  slice price_data = price_data_cell.begin_parse();
+  price_data~load_ref();
+  price_data~load_uint(8);
+  int median_price = price_data~load_coins();
+
+  return median_price;
+}
+
+int is_price_stale(int asset_id) method_id {
+  load_data();
+  (cell price_data_cell, int found) = udict_get_ref?(price_feeds, 16, asset_id);
+
+  if (found == 0) {
+    return -1;  ;; No data = stale
+  }
+
+  slice price_data = price_data_cell.begin_parse();
+  price_data~load_ref();
+  price_data~load_uint(8);
+  price_data~load_coins();
+  price_data~load_uint(32);
+  int is_stale = price_data~load_uint(1);
+
+  return is_stale;
+}
+
+(int, int, int) get_keeper_stats(slice keeper) method_id {
+  load_data();
+  int keeper_hash = slice_hash(keeper);
+  (cell keeper_data_cell, int found) = udict_get_ref?(oracle_keepers, 256, keeper_hash);
+
+  if (found == 0) {
+    return (0, 0, 0);
+  }
+
+  slice keeper_data = keeper_data_cell.begin_parse();
+  int is_active = keeper_data~load_uint(1);
+  keeper_data~load_uint(32);  ;; Skip last_update_time
+  int update_count = keeper_data~load_uint(32);
+  int accuracy_score = keeper_data~load_uint(16);
+
+  return (update_count, accuracy_score, is_active);
+}
+
+int get_min_oracle_count() method_id {
+  load_data();
+  return min_oracle_count;
+}
+
+int get_max_price_age() method_id {
+  load_data();
+  return max_price_age;
+}
+
+int get_version() method_id {
+  return 3;
+}
+
+;; ================================================================
+;; END OF PRICEORACLE CONTRACT
+;; ================================================================

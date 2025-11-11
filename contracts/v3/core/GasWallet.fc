@@ -1,0 +1,386 @@
+;; ================================================================
+;; GasWallet Contract - DoS-Resistant Gas Abstraction Layer
+;; ================================================================
+;;
+;; Purpose: Centralized gas wallet that sponsors user transactions
+;; Features:
+;; - Early signature validation (~1k gas to reject invalid)
+;; - Rate limiting (5 tx/min per address)
+;; - Nonce-based replay protection
+;; - Gas buffer reservation (0.05 TON for bounces)
+;; - Automatic forwarding to MasterFactory
+;;
+;; Target Shard: 0x00 (Core Protocol)
+;; Gas Cost: ~0.005 TON per forwarded transaction
+;; ================================================================
+
+#include "../libs/security_helpers.fc";
+
+;; ================================================================
+;; STORAGE LAYOUT
+;; ================================================================
+
+global slice admin_address;
+global slice master_factory_address;
+global int total_sponsored;           ;; Total TON sponsored (analytics)
+global cell user_nonces;              ;; Dict<addr_hash:uint256, last_nonce:uint64>
+global cell rate_limits;              ;; Dict<addr_hash:uint256, (last_ts:uint32, count:uint8)>
+global int reserve_balance;           ;; Reserved balance for gas buffer
+global int public_key;                ;; Public key for signature validation
+global int paused;                    ;; 0 = active, 1 = paused
+
+;; ================================================================
+;; OPCODES
+;; ================================================================
+
+const int op::forward_to_factory = 0x01;
+const int op::set_master_factory = 0x02;
+const int op::fund_wallet = 0x03;
+const int op::withdraw = 0x04;
+const int op::pause = 0x05;
+const int op::unpause = 0x06;
+const int op::set_public_key = 0x07;
+
+;; ================================================================
+;; ERROR CODES
+;; ================================================================
+
+const int err::unauthorized = 401;
+const int err::paused = 402;
+const int err::insufficient_funds = 403;
+const int err::factory_not_set = 404;
+
+;; ================================================================
+;; EVENT TYPES
+;; ================================================================
+
+const int EVENT_TRANSACTION_SPONSORED = 0x01;
+const int EVENT_TRANSACTION_FAILED = 0x02;
+const int EVENT_MASTER_FACTORY_SET = 0x03;
+const int EVENT_WALLET_FUNDED = 0x04;
+const int EVENT_FUNDS_WITHDRAWN = 0x05;
+const int EVENT_CONTRACT_PAUSED = 0x06;
+const int EVENT_CONTRACT_UNPAUSED = 0x07;
+const int EVENT_PUBLIC_KEY_UPDATED = 0x08;
+
+;; ================================================================
+;; STORAGE FUNCTIONS
+;; ================================================================
+
+() load_data() impure inline {
+  slice ds = get_data().begin_parse();
+
+  admin_address = ds~load_msg_addr();
+  master_factory_address = ds~load_msg_addr();
+  total_sponsored = ds~load_coins();
+  user_nonces = ds~load_dict();
+  rate_limits = ds~load_dict();
+  reserve_balance = ds~load_coins();
+  public_key = ds~load_uint(256);
+  paused = ds~load_uint(1);
+}
+
+() save_data() impure inline {
+  set_data(
+    begin_cell()
+      .store_slice(admin_address)
+      .store_slice(master_factory_address)
+      .store_coins(total_sponsored)
+      .store_dict(user_nonces)
+      .store_dict(rate_limits)
+      .store_coins(reserve_balance)
+      .store_uint(public_key, 256)
+      .store_uint(paused, 1)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; EXTERNAL MESSAGE HANDLER (DoS Protection)
+;; ================================================================
+
+() recv_external(slice in_msg) impure {
+  ;; CRITICAL: Early validation before load_data() to minimize gas waste
+
+  ;; Step 1: Signature validation (~1k gas)
+  ;; Message format: signature(512 bits) + nonce(64 bits) + user_addr + payload
+  int msg_hash = slice_hash(in_msg);
+  slice signature = in_msg~load_bits(512);
+
+  ;; Load data only after signature check passes
+  load_data();
+
+  int sig_valid = check_signature(msg_hash, signature, public_key);
+  throw_unless(ERROR_SIGNATURE_INVALID, sig_valid);
+
+  ;; Accept message (signature valid, will process)
+  accept_message();
+
+  ;; Step 2: Parse message
+  int nonce = in_msg~load_uint(64);
+  slice user_addr = in_msg~load_msg_addr();
+
+  ;; Step 3: Rate limit check (reject spam)
+  throw_unless(ERROR_RATE_LIMIT, rate_limit_check(user_addr, rate_limits));
+
+  ;; Step 4: Nonce validation (prevent replay)
+  throw_unless(ERROR_INVALID_NONCE, validate_nonce(user_addr, nonce, user_nonces));
+
+  ;; Step 5: Contract state checks
+  require_not_paused(paused);
+  throw_if(err::factory_not_set, is_valid_address(master_factory_address) == false);
+
+  ;; Step 6: Reserve gas buffer (0.05 TON for bounce handling)
+  reserve_gas_buffer();
+
+  ;; Step 7: Forward to MasterFactory
+  int forward_amount = 500000000; ;; 0.5 TON for MasterFactory + downstream
+
+  var forward_msg = begin_cell()
+    .store_slice(user_addr)
+    .store_slice(in_msg) ;; Remaining payload (product_type, asset_id, params)
+    .end_cell();
+
+  send_internal_msg(
+    master_factory_address,
+    forward_amount,
+    op::forward_to_factory,
+    forward_msg
+  );
+
+  ;; Update analytics
+  total_sponsored += forward_amount;
+
+  ;; Emit event for monitoring
+  var event_data = begin_cell()
+    .store_slice(user_addr)
+    .store_uint(nonce, 64)
+    .store_uint(forward_amount, 120) ;; Coins
+    .store_uint(now(), 32)
+    .end_cell();
+
+  emit_log_event(EVENT_TRANSACTION_SPONSORED, event_data);
+
+  save_data();
+}
+
+;; ================================================================
+;; INTERNAL MESSAGE HANDLER
+;; ================================================================
+
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  if (in_msg_body.slice_empty?()) {
+    ;; Empty message, just accept funds
+    return ();
+  }
+
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+  slice sender = cs~load_msg_addr();
+
+  ;; Check if bounced
+  if (flags & 1) {
+    handle_bounce(in_msg_body);
+    return ();
+  }
+
+  load_data();
+
+  int op = in_msg_body~load_uint(32);
+
+  if (op == op::set_master_factory) {
+    require_admin(sender, admin_address);
+
+    slice new_factory = in_msg_body~load_msg_addr();
+    master_factory_address = new_factory;
+
+    save_data();
+
+    emit_log_simple(EVENT_MASTER_FACTORY_SET, 1);
+    return ();
+  }
+
+  if (op == op::fund_wallet) {
+    ;; Anyone can fund the wallet
+    reserve_balance += msg_value;
+
+    save_data();
+
+    emit_log_simple(EVENT_WALLET_FUNDED, 1);
+    return ();
+  }
+
+  if (op == op::withdraw) {
+    require_admin(sender, admin_address);
+
+    int withdraw_amount = in_msg_body~load_coins();
+    slice dest_addr = in_msg_body~load_msg_addr();
+
+    throw_unless(err::insufficient_funds, reserve_balance >= withdraw_amount);
+
+    send_simple_message(dest_addr, withdraw_amount);
+
+    reserve_balance -= withdraw_amount;
+    save_data();
+
+    emit_log_simple(EVENT_FUNDS_WITHDRAWN, 1);
+    return ();
+  }
+
+  if (op == op::pause) {
+    require_admin(sender, admin_address);
+
+    paused = 1;
+    save_data();
+
+    emit_log_simple(EVENT_CONTRACT_PAUSED, 1);
+    return ();
+  }
+
+  if (op == op::unpause) {
+    require_admin(sender, admin_address);
+
+    paused = 0;
+    save_data();
+
+    emit_log_simple(EVENT_CONTRACT_UNPAUSED, 1);
+    return ();
+  }
+
+  if (op == op::set_public_key) {
+    require_admin(sender, admin_address);
+
+    int new_pubkey = in_msg_body~load_uint(256);
+    public_key = new_pubkey;
+
+    save_data();
+
+    emit_log_simple(EVENT_PUBLIC_KEY_UPDATED, 1);
+    return ();
+  }
+
+  ;; Unknown operation
+  throw(0xFFFF);
+}
+
+;; ================================================================
+;; BOUNCED MESSAGE HANDLER
+;; ================================================================
+
+() handle_bounce(slice in_msg) impure {
+  load_data();
+
+  (int op, int error_code, cell payload) = parse_bounced_message(in_msg);
+
+  if (op == op::forward_to_factory) {
+    ;; MasterFactory rejected transaction
+    slice user_addr = extract_user_address(payload);
+    int refund_amount = extract_amount(payload);
+
+    if (is_valid_address(user_addr)) {
+      ;; Refund user (subtract processing fee)
+      int fee = 10000000; ;; 0.01 TON fee
+      int refund = refund_amount > fee ? refund_amount - fee : 0;
+
+      if (refund > 0) {
+        send_simple_message(user_addr, refund);
+      }
+    }
+
+    ;; Emit error event
+    var event_data = begin_cell()
+      .store_slice(user_addr)
+      .store_uint(error_code, 32)
+      .store_uint(op, 32)
+      .store_uint(now(), 32)
+      .end_cell();
+
+    emit_log_event(EVENT_TRANSACTION_FAILED, event_data);
+  }
+
+  save_data();
+}
+
+;; ================================================================
+;; GET METHODS
+;; ================================================================
+
+;; Get admin address
+slice get_admin() method_id {
+  load_data();
+  return admin_address;
+}
+
+;; Get master factory address
+slice get_master_factory() method_id {
+  load_data();
+  return master_factory_address;
+}
+
+;; Get total sponsored amount
+int get_total_sponsored() method_id {
+  load_data();
+  return total_sponsored;
+}
+
+;; Get reserve balance
+int get_reserve_balance() method_id {
+  load_data();
+  return reserve_balance;
+}
+
+;; Get public key
+int get_public_key() method_id {
+  load_data();
+  return public_key;
+}
+
+;; Get paused status
+int get_paused() method_id {
+  load_data();
+  return paused;
+}
+
+;; Get next expected nonce for user
+int get_user_next_nonce(slice user_addr) method_id {
+  load_data();
+  return get_next_nonce(user_addr, user_nonces);
+}
+
+;; Get rate limit status for user
+;; Returns: (last_timestamp, count_in_window, limit_reached)
+(int, int, int) get_rate_limit_status(slice user_addr) method_id {
+  load_data();
+
+  int addr_hash = slice_hash(user_addr);
+  (slice data, int found) = udict_get?(rate_limits, 256, addr_hash);
+
+  if (found == 0) {
+    return (0, 0, 0); ;; No history, not rate limited
+  }
+
+  int last_ts = data~load_uint(32);
+  int count = data~load_uint(8);
+  int time_elapsed = now() - last_ts;
+
+  if (time_elapsed > RATE_LIMIT_WINDOW) {
+    return (last_ts, 0, 0); ;; Window expired, count reset
+  }
+
+  int limit_reached = count >= RATE_LIMIT_MAX ? 1 : 0;
+  return (last_ts, count, limit_reached);
+}
+
+;; Get contract version
+int get_version() method_id {
+  return 3; ;; V3
+}
+
+;; Get contract balance
+int get_wallet_balance() method_id {
+  return get_balance().pair_first();
+}
+
+;; ================================================================
+;; END OF GASWALLET CONTRACT
+;; ================================================================

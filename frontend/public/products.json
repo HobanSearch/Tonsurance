@@ -1,0 +1,520 @@
+{
+  "version": "3.0.0",
+  "description": "Tonsurance V3 Insurance Products Configuration",
+  "updated": "2025-01-05",
+
+  "products": [
+    {
+      "id": 1,
+      "type": "DEPEG",
+      "name": "Stablecoin Depeg Insurance",
+      "description": "Protect against stablecoin depegging events",
+      "icon": "🪙",
+      "active": true,
+      "baseAPR": 0.8,
+      "shard": "0x10",
+
+      "assets": [
+        {
+          "id": 1,
+          "symbol": "USDT",
+          "name": "Tether USD",
+          "icon": "https://cryptologos.cc/logos/tether-usdt-logo.png",
+          "network": "TON",
+          "contractAddress": "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs",
+          "active": true,
+
+          "trigger": {
+            "type": "PRICE_THRESHOLD",
+            "description": "Pays out when USDT/USD drops below $0.98 for 1+ hour",
+            "threshold": 0.98,
+            "duration": 3600,
+            "oracles": ["redstone", "pyth", "custom"],
+            "consensusRequired": 2
+          },
+
+          "pricing": {
+            "baseAPR": 0.8,
+            "minCoverage": 100,
+            "maxCoverage": 100000,
+            "minDuration": 7,
+            "maxDuration": 365,
+            "formula": "coverage × APR × (days / 365)"
+          },
+
+          "examples": [
+            {
+              "coverage": 10000,
+              "duration": 30,
+              "premium": 6.58,
+              "calculation": "$10,000 × 0.8% × (30/365) = $6.58"
+            },
+            {
+              "coverage": 50000,
+              "duration": 90,
+              "premium": 98.63,
+              "calculation": "$50,000 × 0.8% × (90/365) = $98.63"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "symbol": "USDC",
+          "name": "USD Coin",
+          "icon": "https://cryptologos.cc/logos/usd-coin-usdc-logo.png",
+          "network": "TON",
+          "contractAddress": "EQB-MPwrd1G6WKNkLz_VnV6WqBDd142KMQv-g1O-8QUA3728",
+          "active": true,
+
+          "trigger": {
+            "type": "PRICE_THRESHOLD",
+            "description": "Pays out when USDC/USD drops below $0.98 for 1+ hour",
+            "threshold": 0.98,
+            "duration": 3600,
+            "oracles": ["redstone", "pyth", "custom"],
+            "consensusRequired": 2
+          },
+
+          "pricing": {
+            "baseAPR": 0.6,
+            "minCoverage": 100,
+            "maxCoverage": 100000,
+            "minDuration": 7,
+            "maxDuration": 365,
+            "formula": "coverage × APR × (days / 365)"
+          }
+        },
+        {
+          "id": 7,
+          "symbol": "USDe",
+          "name": "Ethena USDe",
+          "icon": "https://assets.coingecko.com/coins/images/33613/large/logo_200x200.png",
+          "network": "TON",
+          "contractAddress": "EQC-...",
+          "active": true,
+
+          "trigger": {
+            "type": "PRICE_THRESHOLD",
+            "description": "Pays out when USDe/USD drops below $0.98 for 1+ hour",
+            "threshold": 0.98,
+            "duration": 3600,
+            "oracles": ["redstone", "pyth", "custom"],
+            "consensusRequired": 2
+          },
+
+          "pricing": {
+            "baseAPR": 0.8,
+            "minCoverage": 100,
+            "maxCoverage": 100000,
+            "minDuration": 7,
+            "maxDuration": 365,
+            "formula": "coverage × APR × (days / 365)"
+          },
+
+          "examples": [
+            {
+              "coverage": 10000,
+              "duration": 30,
+              "premium": 6.58,
+              "calculation": "$10,000 × 0.8% × (30/365) = $6.58"
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "symbol": "DAI",
+          "name": "Dai Stablecoin",
+          "icon": "https://cryptologos.cc/logos/multi-collateral-dai-dai-logo.png",
+          "network": "TON",
+          "active": false,
+          "comingSoon": true,
+
+          "trigger": {
+            "type": "PRICE_THRESHOLD",
+            "threshold": 0.98,
+            "duration": 3600
+          },
+
+          "pricing": {
+            "baseAPR": 1.0,
+            "minCoverage": 100,
+            "maxCoverage": 50000,
+            "minDuration": 7,
+            "maxDuration": 365
+          }
+        }
+      ]
+    },
+
+    {
+      "id": 2,
+      "type": "BRIDGE",
+      "name": "Bridge Failure Insurance",
+      "description": "Protect against bridge exploits and failures",
+      "icon": "🌉",
+      "active": true,
+      "baseAPR": 2.5,
+      "shard": "0x20",
+
+      "assets": [
+        {
+          "id": 1,
+          "symbol": "TON_BRIDGE",
+          "name": "TON Bridge (Official)",
+          "icon": "https://ton.org/logo.svg",
+          "network": "TON",
+          "bridgeUrl": "https://bridge.ton.org",
+          "active": true,
+
+          "trigger": {
+            "type": "BRIDGE_EXPLOIT",
+            "description": "Pays out if bridge is exploited or fails to process withdrawals for 24+ hours",
+            "conditions": [
+              "Bridge contract paused for 24+ hours",
+              "Bridge exploit confirmed by 3+ auditors",
+              "Withdrawal queue > $10M for 48+ hours"
+            ],
+            "validationPeriod": 86400
+          },
+
+          "pricing": {
+            "baseAPR": 2.5,
+            "minCoverage": 1000,
+            "maxCoverage": 500000,
+            "minDuration": 30,
+            "maxDuration": 365,
+            "formula": "coverage × APR × (days / 365)"
+          },
+
+          "examples": [
+            {
+              "coverage": 10000,
+              "duration": 90,
+              "premium": 61.64,
+              "calculation": "$10,000 × 2.5% × (90/365) = $61.64"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "symbol": "ORBIT_BRIDGE",
+          "name": "Orbit Bridge",
+          "icon": "https://orbitchain.io/logo.png",
+          "network": "TON",
+          "active": false,
+          "comingSoon": true,
+
+          "trigger": {
+            "type": "BRIDGE_EXPLOIT",
+            "validationPeriod": 86400
+          },
+
+          "pricing": {
+            "baseAPR": 3.0,
+            "minCoverage": 1000,
+            "maxCoverage": 200000,
+            "minDuration": 30,
+            "maxDuration": 365
+          }
+        }
+      ]
+    },
+
+    {
+      "id": 3,
+      "type": "ORACLE",
+      "name": "Oracle Failure Insurance",
+      "description": "Protect against oracle failures and manipulation",
+      "icon": "🔮",
+      "active": true,
+      "baseAPR": 1.5,
+      "shard": "0x30",
+
+      "assets": [
+        {
+          "id": 1,
+          "symbol": "REDSTONE",
+          "name": "RedStone Oracle",
+          "icon": "https://redstone.finance/logo.png",
+          "network": "TON",
+          "active": true,
+
+          "trigger": {
+            "type": "ORACLE_FAILURE",
+            "description": "Pays out if oracle is down for 6+ hours or price deviates >10% from consensus",
+            "conditions": [
+              "Oracle downtime > 6 hours",
+              "Price deviation > 10% from 3 other oracles",
+              "Manipulation confirmed by protocol"
+            ],
+            "validationPeriod": 21600
+          },
+
+          "pricing": {
+            "baseAPR": 1.5,
+            "minCoverage": 5000,
+            "maxCoverage": 1000000,
+            "minDuration": 30,
+            "maxDuration": 365,
+            "formula": "coverage × APR × (days / 365)"
+          }
+        },
+        {
+          "id": 2,
+          "symbol": "PYTH",
+          "name": "Pyth Network",
+          "icon": "https://pyth.network/logo.png",
+          "network": "TON",
+          "active": true,
+
+          "trigger": {
+            "type": "ORACLE_FAILURE",
+            "validationPeriod": 21600
+          },
+
+          "pricing": {
+            "baseAPR": 1.2,
+            "minCoverage": 5000,
+            "maxCoverage": 1000000,
+            "minDuration": 30,
+            "maxDuration": 365
+          }
+        }
+      ]
+    },
+
+    {
+      "id": 4,
+      "type": "CONTRACT",
+      "name": "Smart Contract Exploit Insurance",
+      "description": "Protect against smart contract exploits",
+      "icon": "📜",
+      "active": true,
+      "baseAPR": 3.0,
+      "shard": "0x40",
+
+      "assets": [
+        {
+          "id": 1,
+          "symbol": "DEDUST",
+          "name": "DeDust AMM",
+          "icon": "https://dedust.io/logo.png",
+          "network": "TON",
+          "contractAddress": "EQBfBWT7X2BHg9tXAxzhz2aKiNTU1tpt5NsiK0uSDW_YAJ67",
+          "active": true,
+
+          "trigger": {
+            "type": "CONTRACT_EXPLOIT",
+            "description": "Pays out if contract is exploited with confirmed loss > $100K",
+            "conditions": [
+              "Exploit confirmed by 3+ auditors",
+              "Loss > $100,000",
+              "Protocol acknowledges exploit publicly"
+            ],
+            "validationPeriod": 172800
+          },
+
+          "pricing": {
+            "baseAPR": 3.0,
+            "minCoverage": 10000,
+            "maxCoverage": 1000000,
+            "minDuration": 30,
+            "maxDuration": 180,
+            "formula": "coverage × APR × (days / 365)"
+          },
+
+          "examples": [
+            {
+              "coverage": 50000,
+              "duration": 90,
+              "premium": 369.86,
+              "calculation": "$50,000 × 3.0% × (90/365) = $369.86"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "symbol": "STONFI",
+          "name": "STON.fi AMM",
+          "icon": "https://ston.fi/logo.png",
+          "network": "TON",
+          "active": true,
+
+          "trigger": {
+            "type": "CONTRACT_EXPLOIT",
+            "validationPeriod": 172800
+          },
+
+          "pricing": {
+            "baseAPR": 2.8,
+            "minCoverage": 10000,
+            "maxCoverage": 1000000,
+            "minDuration": 30,
+            "maxDuration": 180
+          }
+        },
+        {
+          "id": 3,
+          "symbol": "EVAA",
+          "name": "Evaa Protocol",
+          "icon": "https://evaa.finance/logo.png",
+          "network": "TON",
+          "active": false,
+          "comingSoon": true,
+
+          "trigger": {
+            "type": "CONTRACT_EXPLOIT",
+            "validationPeriod": 172800
+          },
+
+          "pricing": {
+            "baseAPR": 3.5,
+            "minCoverage": 10000,
+            "maxCoverage": 500000,
+            "minDuration": 30,
+            "maxDuration": 180
+          }
+        }
+      ]
+    },
+
+    {
+      "id": 5,
+      "type": "TRADFI_NATCAT",
+      "name": "Natural Catastrophe Insurance",
+      "description": "Parametric insurance for hurricanes and earthquakes",
+      "icon": "🌪️",
+      "active": true,
+      "baseAPR": 2.25,
+      "shard": "0x50",
+
+      "assets": [
+        {
+          "id": 1,
+          "symbol": "HURRICANE",
+          "name": "Hurricane Insurance",
+          "icon": "🌀",
+          "network": "TON",
+          "active": true,
+
+          "trigger": {
+            "type": "PARAMETRIC",
+            "description": "Pays out when Category 3+ hurricane occurs within coverage radius",
+            "conditions": [
+              "Hurricane reaches Category 3 or higher (111+ mph winds)",
+              "Hurricane center passes within coverage radius",
+              "Data verified by NOAA National Hurricane Center"
+            ],
+            "validationPeriod": 21600,
+            "dataSource": "NOAA National Hurricane Center"
+          },
+
+          "pricing": {
+            "baseAPR": 3.0,
+            "minCoverage": 1000,
+            "maxCoverage": 100000,
+            "minDuration": 7,
+            "maxDuration": 365,
+            "formula": "coverage × APR × (days / 365)"
+          },
+
+          "examples": [
+            {
+              "coverage": 10000,
+              "duration": 30,
+              "premium": 24.66,
+              "calculation": "$10,000 × 3.0% × (30/365) = $24.66",
+              "location": "Miami, FL",
+              "radius": 100
+            },
+            {
+              "coverage": 50000,
+              "duration": 180,
+              "premium": 739.73,
+              "calculation": "$50,000 × 3.0% × (180/365) = $739.73",
+              "location": "New Orleans, LA",
+              "radius": 150
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "symbol": "EARTHQUAKE",
+          "name": "Earthquake Insurance",
+          "icon": "🏚️",
+          "network": "TON",
+          "active": true,
+
+          "trigger": {
+            "type": "PARAMETRIC",
+            "description": "Pays out when Magnitude 6.0+ earthquake occurs within coverage radius",
+            "conditions": [
+              "Earthquake reaches Magnitude 6.0 or higher",
+              "Epicenter is within coverage radius",
+              "Data verified by USGS Earthquake Hazards Program"
+            ],
+            "validationPeriod": 21600,
+            "dataSource": "USGS Earthquake Hazards Program"
+          },
+
+          "pricing": {
+            "baseAPR": 1.5,
+            "minCoverage": 1000,
+            "maxCoverage": 100000,
+            "minDuration": 7,
+            "maxDuration": 365,
+            "formula": "coverage × APR × (days / 365)"
+          },
+
+          "examples": [
+            {
+              "coverage": 10000,
+              "duration": 30,
+              "premium": 12.33,
+              "calculation": "$10,000 × 1.5% × (30/365) = $12.33",
+              "location": "San Francisco, CA",
+              "radius": 200
+            },
+            {
+              "coverage": 50000,
+              "duration": 180,
+              "premium": 369.86,
+              "calculation": "$50,000 × 1.5% × (180/365) = $369.86",
+              "location": "Los Angeles, CA",
+              "radius": 250
+            }
+          ]
+        }
+      ]
+    }
+  ],
+
+  "metadata": {
+    "totalProducts": 5,
+    "totalAssets": 13,
+    "activeAssets": 10,
+    "comingSoonAssets": 3,
+
+    "supportedNetworks": ["TON"],
+
+    "kycTiers": {
+      "1": { "name": "Basic", "maxCoverage": 5000 },
+      "2": { "name": "Standard", "maxCoverage": 50000 },
+      "3": { "name": "Enhanced", "maxCoverage": 1000000 }
+    },
+
+    "pricing": {
+      "currency": "USD",
+      "paymentTokens": ["TON", "USDT", "USDC"],
+      "minPremium": 1,
+      "gasCost": "~0.045 TON"
+    },
+
+    "claimProcess": {
+      "triggerValidation": "Automatic via oracle monitoring",
+      "claimTime": "<10 seconds",
+      "payoutMethod": "Direct to wallet",
+      "appealPeriod": "None (parametric triggers)"
+    }
+  }
+}

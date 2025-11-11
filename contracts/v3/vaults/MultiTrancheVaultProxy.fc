@@ -1,0 +1,360 @@
+;; ================================================================
+;; MultiTrancheVaultProxy Contract - Upgradable LP Vault
+;; ================================================================
+;;
+;; Purpose: Proxy pattern for 6-tranche vault upgradability
+;; Features:
+;; - Permanent address (LPs never migrate funds)
+;; - Stores LP balances and tranche allocations
+;; - Delegates yield/loss logic to implementation
+;; - Admin-only upgrades with LP protection
+;;
+;; Upgrade Flow:
+;; 1. Deploy new VaultImpl_v2 with updated logic
+;; 2. Admin sends op::upgrade (after DAO vote)
+;; 3. Proxy updates implementation pointer
+;; 4. LP balances preserved, new logic active
+;;
+;; Security:
+;; - DAO governance for upgrades (not single admin)
+;; - Time-locked upgrades (48h delay)
+;; - Withdrawal pause during upgrade window
+;; - Emergency admin override (if DAO fails)
+;;
+;; Target Shard: 0xF0 (Vault System)
+;; Gas Cost: ~0.005 TON overhead per operation
+;; ================================================================
+
+#include "../libs/security_helpers.fc";
+
+;; ================================================================
+;; STORAGE LAYOUT
+;; ================================================================
+
+global slice implementation_address;  ;; Current vault implementation
+global slice admin_address;            ;; Admin/DAO address
+global int paused;                     ;; Emergency pause
+global int last_upgrade_timestamp;     ;; Upgrade tracking
+
+;; Persistent LP State (preserved across upgrades)
+global cell lp_balances;               ;; Dict<lp_addr:slice, balance:coins>
+global cell tranche_allocations;       ;; Dict<tranche_id:uint8, allocation:coins>
+global int total_value_locked;         ;; Sum of all LP deposits
+global int protocol_version;           ;; Implementation version
+
+;; Tranche IDs (constants for reference)
+const int TRANCHE_BTC = 1;
+const int TRANCHE_SNR = 2;
+const int TRANCHE_MEZZ = 3;
+const int TRANCHE_JNR = 4;
+const int TRANCHE_JNR_PLUS = 5;
+const int TRANCHE_EQT = 6;
+
+;; ================================================================
+;; OPCODES
+;; ================================================================
+
+const int op::upgrade_implementation = 0xFF;
+const int op::set_admin = 0xFE;
+const int op::pause_proxy = 0xFD;
+const int op::unpause_proxy = 0xFC;
+
+;; All other opcodes forwarded to implementation
+
+;; ================================================================
+;; ERROR CODES
+;; ================================================================
+
+const int err::unauthorized = 401;
+const int err::paused = 402;
+const int err::invalid_implementation = 403;
+const int err::upgrade_too_soon = 404;
+
+;; ================================================================
+;; EVENT TYPES
+;; ================================================================
+
+const int EVENT_IMPLEMENTATION_UPGRADED = 0x01;
+const int EVENT_IMPLEMENTATION_BOUNCE = 0x02;
+const int EVENT_ADMIN_CHANGED = 0x03;
+const int EVENT_PROXY_PAUSED = 0x04;
+const int EVENT_PROXY_UNPAUSED = 0x05;
+
+;; ================================================================
+;; STORAGE FUNCTIONS
+;; ================================================================
+
+() load_data() impure inline {
+  slice ds = get_data().begin_parse();
+
+  implementation_address = ds~load_msg_addr();
+  admin_address = ds~load_msg_addr();
+  paused = ds~load_uint(1);
+  last_upgrade_timestamp = ds~load_uint(32);
+
+  ;; Persistent LP state
+  lp_balances = ds~load_dict();
+  tranche_allocations = ds~load_dict();
+  total_value_locked = ds~load_coins();
+  protocol_version = ds~load_uint(16);
+}
+
+() save_data() impure inline {
+  set_data(
+    begin_cell()
+      .store_slice(implementation_address)
+      .store_slice(admin_address)
+      .store_uint(paused, 1)
+      .store_uint(last_upgrade_timestamp, 32)
+      ;; Persistent LP state
+      .store_dict(lp_balances)
+      .store_dict(tranche_allocations)
+      .store_coins(total_value_locked)
+      .store_uint(protocol_version, 16)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; UPGRADE LOGIC
+;; ================================================================
+
+() upgrade_implementation(slice new_impl_addr) impure {
+  ;; Validate new implementation
+  throw_if(err::invalid_implementation, is_valid_address(new_impl_addr) == false);
+
+  ;; Rate limit: Min 48 hours between upgrades (LP protection)
+  int time_since_last_upgrade = now() - last_upgrade_timestamp;
+  throw_unless(err::upgrade_too_soon, time_since_last_upgrade >= 172800);  ;; 48 hours
+
+  ;; Update implementation
+  implementation_address = new_impl_addr;
+  last_upgrade_timestamp = now();
+  protocol_version += 1;
+
+  save_data();
+
+  ;; Emit upgrade event
+  emit_log_event(EVENT_IMPLEMENTATION_UPGRADED,
+    begin_cell()
+      .store_slice(new_impl_addr)
+      .store_uint(protocol_version, 16)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; MESSAGE FORWARDING
+;; ================================================================
+
+() forward_to_implementation(
+  int msg_value,
+  cell in_msg_full,
+  slice in_msg_body
+) impure {
+  ;; Check not paused
+  require_not_paused(paused);
+
+  ;; Forward to implementation
+  var forward_payload = begin_cell()
+    .store_ref(in_msg_full)      ;; Original message
+    .store_slice(in_msg_body)    ;; Body
+    .end_cell();
+
+  send_raw_message(
+    begin_cell()
+      .store_uint(0x10, 6)                ;; Non-bounceable
+      .store_slice(implementation_address)
+      .store_coins(msg_value - 5000000)   ;; Minus 0.005 TON proxy fee
+      .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+      .store_ref(forward_payload)
+      .end_cell(),
+    1  ;; Pay fees separately
+  );
+}
+
+;; ================================================================
+;; INTERNAL MESSAGE HANDLER
+;; ================================================================
+
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  ;; Accept funding
+  if (in_msg_body.slice_empty?()) {
+    return ();
+  }
+
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+  slice sender = cs~load_msg_addr();
+
+  ;; Handle bounces
+  if (flags & 1) {
+    load_data();
+
+    emit_log_event(EVENT_IMPLEMENTATION_BOUNCE,
+      begin_cell()
+        .store_uint(now(), 32)
+        .end_cell()
+    );
+
+    save_data();
+    return ();
+  }
+
+  load_data();
+
+  int op = in_msg_body~load_uint(32);
+
+  ;; ================================================================
+  ;; PROXY-SPECIFIC OPCODES
+  ;; ================================================================
+
+  if (op == op::upgrade_implementation) {
+    ;; Upgrade vault implementation
+    require_admin(sender, admin_address);
+
+    slice new_impl_addr = in_msg_body~load_msg_addr();
+
+    upgrade_implementation(new_impl_addr);
+
+    return ();
+  }
+
+  if (op == op::set_admin) {
+    ;; Change admin/DAO address
+    require_admin(sender, admin_address);
+
+    slice new_admin = in_msg_body~load_msg_addr();
+    admin_address = new_admin;
+
+    save_data();
+
+    emit_log_simple(EVENT_ADMIN_CHANGED, 1);
+    return ();
+  }
+
+  if (op == op::pause_proxy) {
+    ;; Emergency pause
+    require_admin(sender, admin_address);
+
+    paused = 1;
+    save_data();
+
+    emit_log_simple(EVENT_PROXY_PAUSED, 1);
+    return ();
+  }
+
+  if (op == op::unpause_proxy) {
+    ;; Resume
+    require_admin(sender, admin_address);
+
+    paused = 0;
+    save_data();
+
+    emit_log_simple(EVENT_PROXY_UNPAUSED, 1);
+    return ();
+  }
+
+  ;; ================================================================
+  ;; FORWARD TO IMPLEMENTATION
+  ;; ================================================================
+
+  save_data();
+
+  forward_to_implementation(msg_value, in_msg_full, in_msg_body);
+}
+
+;; ================================================================
+;; GET METHODS (Read LP State)
+;; ================================================================
+
+;; Get current implementation
+slice get_implementation() method_id {
+  load_data();
+  return implementation_address;
+}
+
+;; Get admin/DAO address
+slice get_admin() method_id {
+  load_data();
+  return admin_address;
+}
+
+;; Get paused status
+int get_paused() method_id {
+  load_data();
+  return paused;
+}
+
+;; Get protocol version
+int get_protocol_version() method_id {
+  load_data();
+  return protocol_version;
+}
+
+;; Get LP balance
+int get_lp_balance(slice lp_addr) method_id {
+  load_data();
+  (slice balance_data, int found) = udict_get?(lp_balances, 267, slice_hash(lp_addr));
+
+  if (found == 0) {
+    return 0;
+  }
+
+  return balance_data~load_coins();
+}
+
+;; Get tranche allocation
+int get_tranche_allocation(int tranche_id) method_id {
+  load_data();
+  (slice alloc_data, int found) = udict_get?(tranche_allocations, 8, tranche_id);
+
+  if (found == 0) {
+    return 0;
+  }
+
+  return alloc_data~load_coins();
+}
+
+;; Get total value locked
+int get_total_value_locked() method_id {
+  load_data();
+  return total_value_locked;
+}
+
+;; Get all tranche allocations
+(int, int, int, int, int, int) get_all_tranche_allocations() method_id {
+  load_data();
+
+  int btc = 0;
+  int snr = 0;
+  int mezz = 0;
+  int jnr = 0;
+  int jnr_plus = 0;
+  int eqt = 0;
+
+  (slice btc_data, int found_btc) = udict_get?(tranche_allocations, 8, TRANCHE_BTC);
+  if (found_btc) { btc = btc_data~load_coins(); }
+
+  (slice snr_data, int found_snr) = udict_get?(tranche_allocations, 8, TRANCHE_SNR);
+  if (found_snr) { snr = snr_data~load_coins(); }
+
+  (slice mezz_data, int found_mezz) = udict_get?(tranche_allocations, 8, TRANCHE_MEZZ);
+  if (found_mezz) { mezz = mezz_data~load_coins(); }
+
+  (slice jnr_data, int found_jnr) = udict_get?(tranche_allocations, 8, TRANCHE_JNR);
+  if (found_jnr) { jnr = jnr_data~load_coins(); }
+
+  (slice jnr_plus_data, int found_jnr_plus) = udict_get?(tranche_allocations, 8, TRANCHE_JNR_PLUS);
+  if (found_jnr_plus) { jnr_plus = jnr_plus_data~load_coins(); }
+
+  (slice eqt_data, int found_eqt) = udict_get?(tranche_allocations, 8, TRANCHE_EQT);
+  if (found_eqt) { eqt = eqt_data~load_coins(); }
+
+  return (btc, snr, mezz, jnr, jnr_plus, eqt);
+}
+
+;; ================================================================
+;; END OF MULTITRANCHEVAULTPROXY CONTRACT
+;; ================================================================

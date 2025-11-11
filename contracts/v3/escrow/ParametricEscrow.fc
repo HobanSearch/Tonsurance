@@ -1,0 +1,614 @@
+;; ================================================================
+;; ParametricEscrow Contract - Insurance Claims Escrow
+;; ================================================================
+;;
+;; Purpose: Holds policy collateral and releases on parametric trigger
+;; Features:
+;; - Parametric trigger validation (oracle-verified conditions)
+;; - 8-party distribution on claim payout
+;; - Timeout handling (expiry → refund vault)
+;; - Integration with PriceOracle for trigger verification
+;; - Status tracking (pending, active, paid_out, expired, disputed)
+;;
+;; Target Shard: Various (deployed by Vault per policy)
+;; Gas Cost: ~0.10 TON payout, ~0.05 TON timeout
+;;
+;; ⚠️ REFACTOR AREAS (awaiting Float specs):
+;; - Collateral should come from Float, not direct vault transfer
+;; - Float holds reserves, escrow just references allocation
+;; ================================================================
+
+#include "../libs/security_helpers.fc";
+
+;; ================================================================
+;; CONSTANTS
+;; ================================================================
+
+;; Status constants
+const int STATUS_PENDING = 0;      ;; Awaiting collateral deposit
+const int STATUS_ACTIVE = 1;       ;; Collateral locked, monitoring trigger
+const int STATUS_PAID_OUT = 2;     ;; Claim paid to user
+const int STATUS_EXPIRED = 3;      ;; Policy expired, funds returned to vault
+const int STATUS_DISPUTED = 4;     ;; Frozen by admin for investigation
+const int STATUS_CANCELLED = 5;    ;; Policy cancelled before activation
+
+;; Operation codes
+const int op::initialize = 0x01;
+const int op::deposit_collateral = 0x02;
+const int op::trigger_claim = 0x03;        ;; Oracle signals trigger
+const int op::handle_expiry = 0x04;
+const int op::freeze_dispute = 0x05;
+const int op::resolve_dispute = 0x06;
+const int op::emergency_withdraw = 0x07;   ;; Admin override (30+ days disputed)
+
+;; Error codes
+const int err::unauthorized = 401;
+const int err::oracle_only = 402;
+const int err::not_active = 403;
+const int err::invalid_trigger = 404;
+const int err::already_initialized = 405;
+const int err::already_paid = 406;
+const int err::not_expired = 407;
+const int err::invalid_status = 408;
+const int err::insufficient_collateral = 409;
+
+;; Event types
+const int EVENT_ESCROW_ACTIVATED = 0x01;
+const int EVENT_CLAIM_PAID_OUT = 0x02;
+const int EVENT_ESCROW_EXPIRED = 0x03;
+const int EVENT_ESCROW_FROZEN = 0x04;
+const int EVENT_DISPUTE_RESOLVED = 0x05;
+const int EVENT_EMERGENCY_WITHDRAW = 0x06;
+const int EVENT_MESSAGE_BOUNCED = 0x07;
+
+;; ================================================================
+;; STORAGE LAYOUT
+;; ================================================================
+
+global int policy_id;                  ;; Unique policy ID
+global slice policy_owner;             ;; User who owns the policy
+global slice vault_address;            ;; MultiTrancheVault (collateral source)
+global slice oracle_address;           ;; PriceOracle (trigger verification)
+global slice admin_address;            ;; MasterFactory (admin authority)
+global int coverage_amount;            ;; Payout amount (if triggered)
+global int collateral_amount;          ;; Actual locked collateral
+global int status;
+global int created_at;
+global int expiry_timestamp;
+global int product_type;               ;; 1=Depeg, 2=Bridge, 3=Oracle, 4=Contract
+global int asset_id;                   ;; Asset ID (USDT=1, TON Bridge=1, etc.)
+
+;; Trigger parameters (product-specific)
+global int trigger_threshold;          ;; Price threshold, duration, etc.
+global int trigger_duration;           ;; Minimum duration for trigger
+
+;; 8-party distribution (basis points, sum = 10000)
+global int user_share_bps;             ;; 9000 = 90%
+global int lp_share_bps;               ;; 300 = 3%
+global int staker_share_bps;           ;; 200 = 2%
+global int protocol_share_bps;         ;; 150 = 1.5%
+global int arbiter_share_bps;          ;; 100 = 1%
+global int builder_share_bps;          ;; 100 = 1%
+global int admin_share_bps;            ;; 100 = 1%
+global int gas_refund_bps;             ;; 50 = 0.5%
+
+;; Party addresses
+global slice lp_rewards_address;
+global slice staker_rewards_address;
+global slice protocol_treasury_address;
+global slice arbiter_rewards_address;
+global slice builder_rewards_address;
+global slice admin_fee_address;
+
+;; ================================================================
+;; STORAGE FUNCTIONS
+;; ================================================================
+
+() load_data() impure inline {
+  slice ds = get_data().begin_parse();
+
+  policy_id = ds~load_uint(64);
+
+  ;; Core addresses (from 2 references)
+  slice addresses_1 = ds~load_ref().begin_parse();
+  policy_owner = addresses_1~load_msg_addr();
+  vault_address = addresses_1~load_msg_addr();
+
+  slice addresses_2 = ds~load_ref().begin_parse();
+  oracle_address = addresses_2~load_msg_addr();
+  admin_address = addresses_2~load_msg_addr();
+
+  coverage_amount = ds~load_coins();
+  collateral_amount = ds~load_coins();
+  status = ds~load_uint(8);
+  created_at = ds~load_uint(32);
+  expiry_timestamp = ds~load_uint(32);
+  product_type = ds~load_uint(8);
+  asset_id = ds~load_uint(16);
+
+  ;; Extended data (separate cell)
+  slice ext = ds~load_ref().begin_parse();
+  trigger_threshold = ext~load_uint(32);
+  trigger_duration = ext~load_uint(32);
+  user_share_bps = ext~load_uint(16);
+  lp_share_bps = ext~load_uint(16);
+  staker_share_bps = ext~load_uint(16);
+  protocol_share_bps = ext~load_uint(16);
+  arbiter_share_bps = ext~load_uint(16);
+  builder_share_bps = ext~load_uint(16);
+  admin_share_bps = ext~load_uint(16);
+  gas_refund_bps = ext~load_uint(16);
+
+  ;; Party addresses (nested in single ref to avoid 5-ref overflow)
+  slice party_root = ds~load_ref().begin_parse();
+  slice parties_1 = party_root~load_ref().begin_parse();
+  lp_rewards_address = parties_1~load_msg_addr();
+  staker_rewards_address = parties_1~load_msg_addr();
+  protocol_treasury_address = parties_1~load_msg_addr();
+
+  slice parties_2 = party_root~load_ref().begin_parse();
+  arbiter_rewards_address = parties_2~load_msg_addr();
+  builder_rewards_address = parties_2~load_msg_addr();
+  admin_fee_address = parties_2~load_msg_addr();
+}
+
+() save_data() impure inline {
+  ;; Core addresses (split into 2 cells to avoid overflow)
+  cell address_data_1 = begin_cell()
+    .store_slice(policy_owner)
+    .store_slice(vault_address)
+    .end_cell();
+
+  cell address_data_2 = begin_cell()
+    .store_slice(oracle_address)
+    .store_slice(admin_address)
+    .end_cell();
+
+  ;; Extended data
+  cell ext_data = begin_cell()
+    .store_uint(trigger_threshold, 32)
+    .store_uint(trigger_duration, 32)
+    .store_uint(user_share_bps, 16)
+    .store_uint(lp_share_bps, 16)
+    .store_uint(staker_share_bps, 16)
+    .store_uint(protocol_share_bps, 16)
+    .store_uint(arbiter_share_bps, 16)
+    .store_uint(builder_share_bps, 16)
+    .store_uint(admin_share_bps, 16)
+    .store_uint(gas_refund_bps, 16)
+    .end_cell();
+
+  ;; Party addresses (nest in single ref to avoid 5-ref overflow)
+  cell party_data_1 = begin_cell()
+    .store_slice(lp_rewards_address)
+    .store_slice(staker_rewards_address)
+    .store_slice(protocol_treasury_address)
+    .end_cell();
+
+  cell party_data_2 = begin_cell()
+    .store_slice(arbiter_rewards_address)
+    .store_slice(builder_rewards_address)
+    .store_slice(admin_fee_address)
+    .end_cell();
+
+  cell party_root = begin_cell()
+    .store_ref(party_data_1)
+    .store_ref(party_data_2)
+    .end_cell();
+
+  set_data(
+    begin_cell()
+      .store_uint(policy_id, 64)
+      .store_ref(address_data_1)
+      .store_ref(address_data_2)
+      .store_coins(coverage_amount)
+      .store_coins(collateral_amount)
+      .store_uint(status, 8)
+      .store_uint(created_at, 32)
+      .store_uint(expiry_timestamp, 32)
+      .store_uint(product_type, 8)
+      .store_uint(asset_id, 16)
+      .store_ref(ext_data)
+      .store_ref(party_root)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; ACCESS CONTROL
+;; ================================================================
+
+() check_oracle(slice sender) impure inline {
+  throw_unless(err::oracle_only, equal_slice_bits(sender, oracle_address));
+}
+
+() check_admin(slice sender) impure inline {
+  throw_unless(err::unauthorized, equal_slice_bits(sender, admin_address));
+}
+
+() check_vault(slice sender) impure inline {
+  throw_unless(err::unauthorized, equal_slice_bits(sender, vault_address));
+}
+
+() check_active() impure inline {
+  throw_unless(err::not_active, status == STATUS_ACTIVE);
+}
+
+;; ================================================================
+;; INITIALIZATION
+;; ================================================================
+
+;; ⚠️ REFACTOR: Collateral deposit flow
+;; CURRENT: Vault sends collateral directly → escrow locks it
+;; CORRECT: Float holds reserves → escrow just references allocation
+;;
+;; In Float refactor:
+;; - Float tracks virtual escrow allocations (no actual transfer)
+;; - Claim payout: Float transfers from its pool
+;; - Expiry: Float marks allocation as released (no refund transfer)
+;; - Gas savings: ~0.05 TON per policy (no deposit/refund messages)
+
+() initialize_escrow(slice sender, int msg_value) impure {
+  check_vault(sender);
+
+  throw_if(err::already_initialized, status != STATUS_PENDING);
+
+  ;; Accept collateral deposit
+  ;; REFACTOR: In Float model, this would just mark allocation, no transfer
+  collateral_amount = msg_value;
+
+  throw_unless(err::insufficient_collateral, collateral_amount >= coverage_amount);
+
+  ;; Activate escrow
+  status = STATUS_ACTIVE;
+  save_data();
+
+  emit_log_event(EVENT_ESCROW_ACTIVATED,
+    begin_cell()
+      .store_uint(policy_id, 64)
+      .store_coins(collateral_amount)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; CLAIM PAYOUT (8-PARTY DISTRIBUTION)
+;; ================================================================
+
+() trigger_claim_payout(slice sender, cell trigger_proof) impure {
+  check_oracle(sender);
+  check_active();
+
+  ;; Parse trigger proof (oracle signature + data)
+  slice proof = trigger_proof.begin_parse();
+  int proof_policy_id = proof~load_uint(64);
+  int proof_timestamp = proof~load_uint(32);
+  int proof_product_type = proof~load_uint(8);
+  int proof_asset_id = proof~load_uint(16);
+  int proof_threshold = proof~load_uint(32);
+
+  ;; Validate proof matches policy
+  throw_unless(err::invalid_trigger, proof_policy_id == policy_id);
+  throw_unless(err::invalid_trigger, proof_product_type == product_type);
+  throw_unless(err::invalid_trigger, proof_asset_id == asset_id);
+  throw_unless(err::invalid_trigger, proof_threshold == trigger_threshold);
+
+  ;; Check not expired
+  throw_unless(err::not_active, now() < expiry_timestamp);
+
+  ;; 8-party distribution
+  int user_amount = muldiv(coverage_amount, user_share_bps, 10000);
+  int lp_amount = muldiv(coverage_amount, lp_share_bps, 10000);
+  int staker_amount = muldiv(coverage_amount, staker_share_bps, 10000);
+  int protocol_amount = muldiv(coverage_amount, protocol_share_bps, 10000);
+  int arbiter_amount = muldiv(coverage_amount, arbiter_share_bps, 10000);
+  int builder_amount = muldiv(coverage_amount, builder_share_bps, 10000);
+  int admin_amount = muldiv(coverage_amount, admin_share_bps, 10000);
+  int gas_refund = muldiv(coverage_amount, gas_refund_bps, 10000);
+
+  ;; Send to all parties
+  send_internal_msg(policy_owner, user_amount, 0, begin_cell().end_cell());
+  send_internal_msg(lp_rewards_address, lp_amount, 0, begin_cell().end_cell());
+  send_internal_msg(staker_rewards_address, staker_amount, 0, begin_cell().end_cell());
+  send_internal_msg(protocol_treasury_address, protocol_amount, 0, begin_cell().end_cell());
+  send_internal_msg(arbiter_rewards_address, arbiter_amount, 0, begin_cell().end_cell());
+  send_internal_msg(builder_rewards_address, builder_amount, 0, begin_cell().end_cell());
+  send_internal_msg(admin_fee_address, admin_amount, 0, begin_cell().end_cell());
+
+  ;; Gas refund to oracle (reimburse trigger gas)
+  send_internal_msg(oracle_address, gas_refund, 0, begin_cell().end_cell());
+
+  ;; Update status
+  status = STATUS_PAID_OUT;
+  save_data();
+
+  ;; Emit event
+  emit_log_event(EVENT_CLAIM_PAID_OUT,
+    begin_cell()
+      .store_uint(policy_id, 64)
+      .store_coins(coverage_amount)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+
+  ;; Notify vault to absorb loss
+  send_internal_msg(
+    vault_address,
+    10000000,  ;; 0.01 TON gas
+    0x04,  ;; op::absorb_loss
+    begin_cell()
+      .store_coins(coverage_amount)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; EXPIRY HANDLING
+;; ================================================================
+
+() handle_expiry(slice sender) impure {
+  ;; Anyone can trigger expiry handling
+
+  ;; Must be active
+  throw_unless(err::not_active, status == STATUS_ACTIVE);
+
+  ;; Must be past expiry
+  throw_unless(err::not_expired, now() >= expiry_timestamp);
+
+  ;; Refund collateral to vault
+  ;; REFACTOR: In Float model, just mark allocation as released
+  send_internal_msg(vault_address, collateral_amount, 128, begin_cell().end_cell());
+
+  ;; Update status
+  status = STATUS_EXPIRED;
+  save_data();
+
+  emit_log_event(EVENT_ESCROW_EXPIRED,
+    begin_cell()
+      .store_uint(policy_id, 64)
+      .store_coins(collateral_amount)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; DISPUTE HANDLING
+;; ================================================================
+
+() freeze_dispute(slice sender) impure {
+  check_admin(sender);
+  check_active();
+
+  status = STATUS_DISPUTED;
+  save_data();
+
+  emit_log_event(EVENT_ESCROW_FROZEN,
+    begin_cell()
+      .store_uint(policy_id, 64)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+() resolve_dispute(slice sender, int resolution) impure {
+  check_admin(sender);
+
+  throw_unless(err::invalid_status, status == STATUS_DISPUTED);
+
+  ;; Resolution: 0=refund vault, 1=pay user, 2=split
+  if (resolution == 0) {
+    ;; Refund vault
+    send_internal_msg(vault_address, collateral_amount, 128, begin_cell().end_cell());
+    status = STATUS_EXPIRED;
+  } elseif (resolution == 1) {
+    ;; Pay user (full coverage)
+    send_internal_msg(policy_owner, coverage_amount, 128, begin_cell().end_cell());
+    status = STATUS_PAID_OUT;
+  } elseif (resolution == 2) {
+    ;; Split 50/50
+    int half = collateral_amount / 2;
+    send_internal_msg(policy_owner, half, 0, begin_cell().end_cell());
+    send_internal_msg(vault_address, half, 128, begin_cell().end_cell());
+    status = STATUS_EXPIRED;
+  }
+
+  save_data();
+
+  emit_log_event(EVENT_DISPUTE_RESOLVED,
+    begin_cell()
+      .store_uint(policy_id, 64)
+      .store_uint(resolution, 8)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+() emergency_withdraw(slice sender) impure {
+  check_admin(sender);
+
+  ;; Must be disputed for 30+ days
+  throw_unless(err::invalid_status, status == STATUS_DISPUTED);
+  throw_unless(err::not_expired, now() >= (created_at + 2592000));
+
+  ;; Refund vault
+  send_internal_msg(vault_address, collateral_amount, 128, begin_cell().end_cell());
+
+  status = STATUS_CANCELLED;
+  save_data();
+
+  emit_log_event(EVENT_EMERGENCY_WITHDRAW,
+    begin_cell()
+      .store_uint(policy_id, 64)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; MESSAGE HANDLERS
+;; ================================================================
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+
+  ;; Handle bounced messages
+  if (flags & 1) {
+    load_data();
+
+    ;; Parse bounce
+    slice bounce_body = in_msg_body;
+    bounce_body~skip_bits(32);  ;; Skip 0xFFFFFFFF
+    int op = bounce_body~load_uint(32);
+
+    ;; Log bounce event
+    emit_log_event(EVENT_MESSAGE_BOUNCED,
+      begin_cell()
+        .store_uint(policy_id, 64)
+        .store_uint(op, 32)
+        .store_uint(now(), 32)
+        .end_cell()
+    );
+
+    save_data();
+    return ();
+  }
+
+  slice sender = cs~load_msg_addr();
+
+  if (in_msg_body.slice_empty?()) {
+    return ();  ;; Accept funds
+  }
+
+  load_data();
+
+  int op = in_msg_body~load_uint(32);
+
+  if (op == op::initialize) {
+    initialize_escrow(sender, msg_value);
+    return ();
+  }
+
+  if (op == op::trigger_claim) {
+    cell trigger_proof = in_msg_body~load_ref();
+    trigger_claim_payout(sender, trigger_proof);
+    return ();
+  }
+
+  if (op == op::handle_expiry) {
+    handle_expiry(sender);
+    return ();
+  }
+
+  if (op == op::freeze_dispute) {
+    freeze_dispute(sender);
+    return ();
+  }
+
+  if (op == op::resolve_dispute) {
+    int resolution = in_msg_body~load_uint(8);
+    resolve_dispute(sender, resolution);
+    return ();
+  }
+
+  if (op == op::emergency_withdraw) {
+    emergency_withdraw(sender);
+    return ();
+  }
+
+  throw(0xFFFF);
+}
+
+;; ================================================================
+;; GET METHODS
+;; ================================================================
+
+(int, slice, int, int, int) get_escrow_info() method_id {
+  load_data();
+  return (policy_id, policy_owner, coverage_amount, status, expiry_timestamp);
+}
+
+int get_status() method_id {
+  load_data();
+  return status;
+}
+
+int get_policy_id() method_id {
+  load_data();
+  return policy_id;
+}
+
+slice get_policy_owner() method_id {
+  load_data();
+  return policy_owner;
+}
+
+int get_coverage_amount() method_id {
+  load_data();
+  return coverage_amount;
+}
+
+int get_collateral_amount() method_id {
+  load_data();
+  return collateral_amount;
+}
+
+int get_expiry_timestamp() method_id {
+  load_data();
+  return expiry_timestamp;
+}
+
+int get_time_remaining() method_id {
+  load_data();
+
+  if (now() >= expiry_timestamp) {
+    return 0;
+  }
+
+  return expiry_timestamp - now();
+}
+
+(int, int) get_trigger_params() method_id {
+  load_data();
+  return (trigger_threshold, trigger_duration);
+}
+
+(int, int, int, int) get_product_info() method_id {
+  load_data();
+  return (product_type, asset_id, trigger_threshold, trigger_duration);
+}
+
+;; Get 8-party distribution percentages
+(int, int, int, int, int, int, int, int) get_distribution() method_id {
+  load_data();
+  return (
+    user_share_bps,
+    lp_share_bps,
+    staker_share_bps,
+    protocol_share_bps,
+    arbiter_share_bps,
+    builder_share_bps,
+    admin_share_bps,
+    gas_refund_bps
+  );
+}
+
+slice get_vault_address() method_id {
+  load_data();
+  return vault_address;
+}
+
+slice get_oracle_address() method_id {
+  load_data();
+  return oracle_address;
+}
+
+int get_version() method_id {
+  return 3;
+}
+
+;; ================================================================
+;; END OF PARAMETRICESCROW CONTRACT
+;; ================================================================

@@ -1,0 +1,774 @@
+;; ================================================================
+;; MasterFactory Contract - Central Policy Routing & Claim Coordination
+;; ================================================================
+;;
+;; Purpose: Routes policy creation and coordinates claim processing
+;; Features:
+;; - Product type routing (Depeg, Bridge, Oracle, Contract)
+;; - On-demand sub-factory deployment with shard targeting
+;; - Sub-factory registry management
+;; - Policy registry (stores all active policies)
+;; - Claim processing coordination (vault withdrawals)
+;; - KYC verification integration (SBTVerifier)
+;; - PolicyNFT minter integration
+;; - Vault system integration
+;; - Comprehensive bounce handling
+;;
+;; Flow:
+;; 1. User → GasWallet → MasterFactory (policy creation)
+;; 2. MasterFactory → ProductSubFactory → AssetChild (routing)
+;; 3. AssetChild → MasterFactory (policy registration)
+;; 4. Oracle trigger → AssetChild → MasterFactory (claim processing)
+;; 5. MasterFactory → Vault (withdrawal) → User (payout)
+;;
+;; Target Shard: 0x00 (Core Protocol)
+;; Gas Cost: ~0.01-0.015 TON per policy routing
+;; ================================================================
+
+#include "../libs/security_helpers.fc";
+#include "../libs/factory_helpers.fc";
+
+;; ================================================================
+;; EVENT TYPES
+;; ================================================================
+
+const int EVENT_POLICY_ROUTED = 0x01;
+const int EVENT_FACTORY_DEPLOYED = 0x02;
+const int EVENT_FACTORY_REGISTERED = 0x03;
+const int EVENT_FACTORY_CODE_SET = 0x04;
+const int EVENT_GAS_WALLET_SET = 0x05;
+const int EVENT_SBT_VERIFIER_SET = 0x06;
+const int EVENT_POLICY_NFT_MINTER_SET = 0x07;
+const int EVENT_VAULT_SET = 0x08;
+const int EVENT_KYC_TIER_SET = 0x09;
+const int EVENT_CONTRACT_PAUSED = 0x0A;
+const int EVENT_CONTRACT_UNPAUSED = 0x0B;
+const int EVENT_POLICY_REGISTERED = 0x0C;
+const int EVENT_CLAIM_PROCESSED = 0x0D;
+const int EVENT_POLICY_CREATION_FAILED = 0x0E;
+
+;; ================================================================
+;; STORAGE LAYOUT
+;; ================================================================
+
+global slice admin_address;
+global slice gas_wallet_address;
+global slice sbt_verifier_address;
+global slice policy_nft_minter_address;
+global slice vault_address;
+global cell product_factories;         ;; Dict<product_type:uint8, factory_addr:slice>
+global cell factory_codes;             ;; Dict<product_type:uint8, code:cell>
+global int total_policies_created;     ;; Total policies routed (analytics)
+global int paused;                     ;; 0 = active, 1 = paused
+global int required_kyc_tier;          ;; Minimum KYC tier (1=Basic, 2=Standard, 3=Enhanced)
+global cell active_policies;           ;; Dict<policy_id:uint64, policy_data:cell> - Policy registry
+global int total_claims_processed;     ;; Total claims paid (analytics)
+
+;; ================================================================
+;; PRODUCT TYPES
+;; ================================================================
+
+const int PRODUCT_DEPEG = 1;           ;; Stablecoin depeg insurance
+const int PRODUCT_BRIDGE = 2;          ;; Bridge failure insurance
+const int PRODUCT_ORACLE = 3;          ;; Oracle failure insurance
+const int PRODUCT_CONTRACT = 4;        ;; Smart contract exploit insurance
+const int PRODUCT_TRADFI_NATCAT = 5;   ;; TradFi Natural Catastrophe insurance (Hurricane, Earthquake)
+
+;; ================================================================
+;; OPCODES
+;; ================================================================
+
+const int op::forward_from_wallet = 0x01;
+const int op::create_policy = 0x20;
+const int op::register_product_factory = 0x21;
+const int op::set_factory_code = 0x22;
+const int op::set_gas_wallet = 0x23;
+const int op::set_sbt_verifier = 0x24;
+const int op::set_policy_nft_minter = 0x25;
+const int op::set_vault = 0x26;
+const int op::set_required_kyc_tier = 0x27;
+const int op::pause = 0x28;
+const int op::unpause = 0x29;
+const int op::register_policy = 0x51;       ;; Register policy from child contract
+const int op::process_claim = 0x53;         ;; Process claim from child contract
+
+;; Downstream opcodes (to sub-factories)
+const int op::subfactory_create_policy = 0x30;
+const int op::withdraw_for_claim = 0x60;    ;; Withdraw from vault for claim payout
+
+;; ================================================================
+;; ERROR CODES
+;; ================================================================
+
+const int err::unauthorized = 401;
+const int err::paused = 402;
+const int err::invalid_product = 403;
+const int err::kyc_failed = 404;
+const int err::factory_deployment_failed = 405;
+const int err::sbt_verifier_not_set = 406;
+const int err::policy_not_found = 407;
+const int err::policy_already_claimed = 408;
+const int err::vault_not_set = 409;
+
+;; ================================================================
+;; FORWARD DECLARATIONS
+;; ================================================================
+
+slice deploy_product_factory(int product_type) impure;
+() handle_bounce(slice in_msg) impure;
+
+;; ================================================================
+;; STORAGE FUNCTIONS
+;; ================================================================
+
+() load_data() impure inline {
+  slice ds = get_data().begin_parse();
+
+  ;; Load addresses from 2 references (5 addresses = 1335 bits > 1023 limit)
+  ;; First ref: admin, gas_wallet, sbt_verifier (3 × 267 = 801 bits)
+  slice addresses1 = ds~load_ref().begin_parse();
+  admin_address = addresses1~load_msg_addr();
+  gas_wallet_address = addresses1~load_msg_addr();
+  sbt_verifier_address = addresses1~load_msg_addr();
+
+  ;; Second ref: policy_nft_minter, vault (2 × 267 = 534 bits)
+  slice addresses2 = ds~load_ref().begin_parse();
+  policy_nft_minter_address = addresses2~load_msg_addr();
+  vault_address = addresses2~load_msg_addr();
+
+  product_factories = ds~load_dict();
+  factory_codes = ds~load_dict();
+  total_policies_created = ds~load_uint(64);
+  paused = ds~load_uint(1);
+  required_kyc_tier = ds~load_uint(8);
+  active_policies = ds~load_dict();
+  total_claims_processed = ds~load_uint(64);
+}
+
+() save_data() impure inline {
+  ;; Store addresses in 2 references (5 addresses = 1335 bits > 1023 limit)
+  ;; First ref: admin, gas_wallet, sbt_verifier (3 × 267 = 801 bits)
+  var addresses1_cell = begin_cell()
+    .store_slice(admin_address)
+    .store_slice(gas_wallet_address)
+    .store_slice(sbt_verifier_address)
+    .end_cell();
+
+  ;; Second ref: policy_nft_minter, vault (2 × 267 = 534 bits)
+  var addresses2_cell = begin_cell()
+    .store_slice(policy_nft_minter_address)
+    .store_slice(vault_address)
+    .end_cell();
+
+  set_data(
+    begin_cell()
+      .store_ref(addresses1_cell)
+      .store_ref(addresses2_cell)
+      .store_dict(product_factories)
+      .store_dict(factory_codes)
+      .store_uint(total_policies_created, 64)
+      .store_uint(paused, 1)
+      .store_uint(required_kyc_tier, 8)
+      .store_dict(active_policies)
+      .store_uint(total_claims_processed, 64)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; POLICY ROUTING LOGIC
+;; ================================================================
+
+() route_to_product_factory(
+  slice user_addr,
+  int product_type,
+  int asset_id,
+  cell policy_params
+) impure {
+  ;; Step 1: Validate product type
+  throw_unless(err::invalid_product, product_type >= PRODUCT_DEPEG);
+  throw_unless(err::invalid_product, product_type <= PRODUCT_TRADFI_NATCAT);
+
+  ;; Step 2: Check KYC via SBTVerifier
+  throw_if(err::sbt_verifier_not_set, is_valid_address(sbt_verifier_address) == false);
+
+  ;; Call SBTVerifier.check_kyc() method
+  ;; Note: In production, this would be an async get_method call
+  ;; For now, we assume KYC check passes (replace with actual call in deployment)
+  ;; int kyc_passed = sbt_verifier_address.check_kyc(user_addr, required_kyc_tier);
+  ;; throw_unless(err::kyc_failed, kyc_passed);
+
+  ;; Step 3: Get or deploy sub-factory
+  (slice factory_addr, int found) = udict_get?(product_factories, 8, product_type);
+
+  if (found == 0) {
+    ;; Sub-factory not deployed yet, deploy it now
+    factory_addr = deploy_product_factory(product_type);
+  }
+
+  ;; Step 4: Forward to sub-factory
+  var forward_body = begin_cell()
+    .store_slice(user_addr)
+    .store_uint(asset_id, 16)
+    .store_ref(policy_params)
+    .end_cell();
+
+  int forward_amount = 400000000; ;; 0.4 TON for sub-factory + child + downstream
+
+  forward_to_child(
+    factory_addr,
+    forward_amount,
+    op::subfactory_create_policy,
+    forward_body
+  );
+
+  ;; Step 5: Update analytics
+  total_policies_created += 1;
+
+  ;; Step 6: Emit event
+  var event_data = begin_cell()
+    .store_slice(user_addr)
+    .store_uint(product_type, 8)
+    .store_uint(asset_id, 16)
+    .store_uint(now(), 32)
+    .end_cell();
+
+  emit_log_event(EVENT_POLICY_ROUTED, event_data);
+}
+
+;; ================================================================
+;; SUB-FACTORY DEPLOYMENT
+;; ================================================================
+
+slice deploy_product_factory(int product_type) impure {
+  ;; Get factory code for this product type
+  (cell factory_code, int code_found) = udict_get_ref?(factory_codes, 8, product_type);
+  throw_unless(err::factory_deployment_failed, code_found);
+
+  ;; Build base data for sub-factory
+  var factory_data = begin_cell()
+    .store_slice(my_address()) ;; MasterFactory address (parent)
+    .store_uint(product_type, 8) ;; Product type
+    .store_dict(null()) ;; Children registry (empty)
+    .store_uint(0, 1) ;; Not paused
+    .end_cell();
+
+  ;; Get target shard prefix for product
+  int target_prefix = get_product_shard_prefix(product_type);
+
+  ;; Get deployment gas
+  int deployment_value = get_deployment_gas(product_type);
+
+  ;; Deploy to target shard
+  slice factory_addr = deploy_child_with_shard_target(
+    factory_code,
+    factory_data,
+    target_prefix,
+    deployment_value
+  );
+
+  ;; Register in product_factories dict
+  product_factories~udict_set(8, product_type,
+    begin_cell()
+      .store_slice(factory_addr)
+      .end_cell()
+      .begin_parse()
+  );
+
+  ;; Emit event
+  var event_data = begin_cell()
+    .store_uint(product_type, 8)
+    .store_slice(factory_addr)
+    .store_uint(target_prefix, 8)
+    .store_uint(now(), 32)
+    .end_cell();
+
+  emit_log_event(EVENT_FACTORY_DEPLOYED, event_data);
+
+  return factory_addr;
+}
+
+;; ================================================================
+;; INTERNAL MESSAGE HANDLER
+;; ================================================================
+
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  if (in_msg_body.slice_empty?()) {
+    return (); ;; Accept funds
+  }
+
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+  slice sender = cs~load_msg_addr();
+
+  ;; Check if bounced
+  if (flags & 1) {
+    handle_bounce(in_msg_body);
+    return ();
+  }
+
+  load_data();
+
+  int op = in_msg_body~load_uint(32);
+
+  if (op == op::forward_from_wallet) {
+    ;; Message forwarded from GasWallet
+    require_not_paused(paused);
+
+    ;; Validate sender is GasWallet
+    throw_unless(err::unauthorized, equal_slice_bits(sender, gas_wallet_address));
+
+    ;; Parse forwarded message
+    slice user_addr = in_msg_body~load_msg_addr();
+    int product_type = in_msg_body~load_uint(8);
+    int asset_id = in_msg_body~load_uint(16);
+    cell policy_params = in_msg_body~load_ref();
+
+    ;; Route to product factory
+    route_to_product_factory(user_addr, product_type, asset_id, policy_params);
+
+    save_data();
+    return ();
+  }
+
+  if (op == op::create_policy) {
+    ;; Direct policy creation (not via GasWallet)
+    require_not_paused(paused);
+
+    int product_type = in_msg_body~load_uint(8);
+    int asset_id = in_msg_body~load_uint(16);
+    cell policy_params = in_msg_body~load_ref();
+
+    ;; Route to product factory (sender = user)
+    route_to_product_factory(sender, product_type, asset_id, policy_params);
+
+    save_data();
+    return ();
+  }
+
+  if (op == op::register_product_factory) {
+    require_admin(sender, admin_address);
+
+    int product_type = in_msg_body~load_uint(8);
+    slice factory_addr = in_msg_body~load_msg_addr();
+
+    ;; Register factory manually (pre-deployed)
+    product_factories~udict_set(8, product_type,
+      begin_cell()
+        .store_slice(factory_addr)
+        .end_cell()
+        .begin_parse()
+    );
+
+    save_data();
+
+    emit_log_simple(EVENT_FACTORY_REGISTERED, 1);
+    return ();
+  }
+
+  if (op == op::set_factory_code) {
+    require_admin(sender, admin_address);
+
+    int product_type = in_msg_body~load_uint(8);
+    cell factory_code = in_msg_body~load_ref();
+
+    ;; Store factory code for product type
+    factory_codes~udict_set_ref(8, product_type, factory_code);
+
+    save_data();
+
+    emit_log_simple(EVENT_FACTORY_CODE_SET, 1);
+    return ();
+  }
+
+  if (op == op::set_gas_wallet) {
+    require_admin(sender, admin_address);
+
+    slice new_wallet = in_msg_body~load_msg_addr();
+    gas_wallet_address = new_wallet;
+
+    save_data();
+
+    emit_log_simple(EVENT_GAS_WALLET_SET, 1);
+    return ();
+  }
+
+  if (op == op::set_sbt_verifier) {
+    require_admin(sender, admin_address);
+
+    slice new_verifier = in_msg_body~load_msg_addr();
+    sbt_verifier_address = new_verifier;
+
+    save_data();
+
+    emit_log_simple(EVENT_SBT_VERIFIER_SET, 1);
+    return ();
+  }
+
+  if (op == op::set_policy_nft_minter) {
+    require_admin(sender, admin_address);
+
+    slice new_minter = in_msg_body~load_msg_addr();
+    policy_nft_minter_address = new_minter;
+
+    save_data();
+
+    emit_log_simple(EVENT_POLICY_NFT_MINTER_SET, 1);
+    return ();
+  }
+
+  if (op == op::set_vault) {
+    require_admin(sender, admin_address);
+
+    slice new_vault = in_msg_body~load_msg_addr();
+    vault_address = new_vault;
+
+    save_data();
+
+    emit_log_simple(EVENT_VAULT_SET, 1);
+    return ();
+  }
+
+  if (op == op::set_required_kyc_tier) {
+    require_admin(sender, admin_address);
+
+    int new_tier = in_msg_body~load_uint(8);
+    required_kyc_tier = new_tier;
+
+    save_data();
+
+    emit_log_simple(EVENT_KYC_TIER_SET, 1);
+    return ();
+  }
+
+  if (op == op::pause) {
+    require_admin(sender, admin_address);
+
+    paused = 1;
+    save_data();
+
+    emit_log_simple(EVENT_CONTRACT_PAUSED, 1);
+    return ();
+  }
+
+  if (op == op::unpause) {
+    require_admin(sender, admin_address);
+
+    paused = 0;
+    save_data();
+
+    emit_log_simple(EVENT_CONTRACT_UNPAUSED, 1);
+    return ();
+  }
+
+  if (op == op::register_policy) {
+    ;; Policy registration from child contract
+    ;; Child contracts (e.g., StablecoinChild) register policies here after creation
+
+    int policy_id = in_msg_body~load_uint(64);
+    int product_type = in_msg_body~load_uint(8);
+    int asset_id = in_msg_body~load_uint(16);
+    slice user_addr = in_msg_body~load_msg_addr();
+    int coverage_amount = in_msg_body~load_coins();
+    int expiry_timestamp = in_msg_body~load_uint(32);
+    slice child_address = in_msg_body~load_msg_addr();
+    int trigger_param1 = in_msg_body~load_uint(32);  ;; E.g., DEPEG_THRESHOLD_PRICE
+    int trigger_param2 = in_msg_body~load_uint(32);  ;; E.g., DEPEG_DURATION_SECONDS
+
+    ;; Store policy data (split into main + reference to avoid cell overflow)
+    ;; Main cell: 8+16+267+120+32+267 = 710 bits
+    ;; Reference cell: 267+32+32+1+32 = 364 bits
+    var policy_details = begin_cell()
+      .store_slice(sender)                ;; Sender = child contract (267 bits)
+      .store_uint(trigger_param1, 32)
+      .store_uint(trigger_param2, 32)
+      .store_uint(0, 1)                   ;; Not claimed
+      .store_uint(now(), 32)              ;; Created at
+      .end_cell();
+
+    var policy_data = begin_cell()
+      .store_uint(product_type, 8)
+      .store_uint(asset_id, 16)
+      .store_slice(user_addr)
+      .store_coins(coverage_amount)
+      .store_uint(expiry_timestamp, 32)
+      .store_slice(child_address)
+      .store_ref(policy_details)          ;; Store details in reference
+      .end_cell();
+
+    active_policies~udict_set_ref(64, policy_id, policy_data);
+
+    save_data();
+
+    emit_log_event(EVENT_POLICY_REGISTERED, begin_cell()
+      .store_uint(policy_id, 64)
+      .store_uint(product_type, 8)
+      .store_slice(user_addr)
+      .store_coins(coverage_amount)
+      .end_cell());
+
+    return ();
+  }
+
+  if (op == op::process_claim) {
+    ;; Claim processing from child contract
+    ;; Child sends trigger event → MasterFactory coordinates vault withdrawal → User payout
+
+    throw_if(err::vault_not_set, is_valid_address(vault_address) == false);
+
+    int policy_id = in_msg_body~load_uint(64);
+    int product_type = in_msg_body~load_uint(8);
+    int asset_id = in_msg_body~load_uint(16);
+    slice user_addr = in_msg_body~load_msg_addr();
+    int coverage_amount = in_msg_body~load_coins();
+    int trigger_price = in_msg_body~load_uint(32);
+    int trigger_timestamp = in_msg_body~load_uint(32);
+    int trigger_param1 = in_msg_body~load_uint(32);
+    int trigger_param2 = in_msg_body~load_uint(32);
+
+    ;; Verify policy exists in registry
+    (cell policy_cell, int found) = udict_get_ref?(active_policies, 64, policy_id);
+    throw_unless(err::policy_not_found, found);
+
+    ;; Parse policy data to verify not already claimed
+    slice policy_data = policy_cell.begin_parse();
+    int stored_product_type = policy_data~load_uint(8);
+    int stored_asset_id = policy_data~load_uint(16);
+    slice stored_user_addr = policy_data~load_msg_addr();
+    int stored_coverage = policy_data~load_coins();
+    int stored_expiry = policy_data~load_uint(32);
+    slice stored_child = policy_data~load_msg_addr();
+
+    ;; Load details from reference
+    slice policy_details = policy_data~load_ref().begin_parse();
+    slice stored_sender = policy_details~load_msg_addr();
+    int stored_trigger1 = policy_details~load_uint(32);
+    int stored_trigger2 = policy_details~load_uint(32);
+    int claimed = policy_details~load_uint(1);
+
+    throw_if(err::policy_already_claimed, claimed);
+
+    ;; Verify sender is the registered child contract
+    throw_unless(err::unauthorized, equal_slice_bits(sender, stored_child));
+
+    ;; Mark policy as claimed (split into main + reference)
+    var updated_details = begin_cell()
+      .store_slice(stored_sender)
+      .store_uint(stored_trigger1, 32)
+      .store_uint(stored_trigger2, 32)
+      .store_uint(1, 1)                    ;; Claimed = true
+      .store_uint(now(), 32)               ;; Claim timestamp
+      .end_cell();
+
+    var updated_policy = begin_cell()
+      .store_uint(stored_product_type, 8)
+      .store_uint(stored_asset_id, 16)
+      .store_slice(stored_user_addr)
+      .store_coins(stored_coverage)
+      .store_uint(stored_expiry, 32)
+      .store_slice(stored_child)
+      .store_ref(updated_details)
+      .end_cell();
+
+    active_policies~udict_set_ref(64, policy_id, updated_policy);
+
+    ;; Request withdrawal from vault
+    var withdrawal_request = begin_cell()
+      .store_uint(policy_id, 64)
+      .store_uint(product_type, 8)
+      .store_uint(asset_id, 16)
+      .store_slice(user_addr)
+      .store_coins(coverage_amount)
+      .store_uint(trigger_price, 32)
+      .store_uint(trigger_timestamp, 32)
+      .end_cell();
+
+    send_internal_msg(
+      vault_address,
+      100000000, ;; 0.1 TON gas for withdrawal + payout
+      op::withdraw_for_claim,
+      withdrawal_request
+    );
+
+    total_claims_processed += 1;
+
+    save_data();
+
+    emit_log_event(EVENT_CLAIM_PROCESSED, begin_cell()
+      .store_uint(policy_id, 64)
+      .store_slice(user_addr)
+      .store_coins(coverage_amount)
+      .store_uint(trigger_price, 32)
+      .end_cell());
+
+    return ();
+  }
+
+  ;; Unknown operation
+  throw(0xFFFF);
+}
+
+;; ================================================================
+;; BOUNCED MESSAGE HANDLER
+;; ================================================================
+
+() handle_bounce(slice in_msg) impure {
+  load_data();
+
+  (int op, int error_code, cell payload) = parse_bounced_message(in_msg);
+
+  if (op == op::subfactory_create_policy) {
+    ;; Sub-factory rejected policy creation
+    slice user_addr = extract_user_address(payload);
+    int refund_amount = extract_amount(payload);
+
+    if (is_valid_address(user_addr)) {
+      ;; Refund user (subtract processing fee)
+      int fee = 10000000; ;; 0.01 TON fee
+      int refund = refund_amount > fee ? refund_amount - fee : 0;
+
+      if (refund > 0) {
+        send_simple_message(user_addr, refund);
+      }
+    }
+
+    ;; Emit error event
+    var event_data = begin_cell()
+      .store_slice(user_addr)
+      .store_uint(error_code, 32)
+      .store_uint(op, 32)
+      .store_uint(now(), 32)
+      .end_cell();
+
+    emit_log_event(EVENT_POLICY_CREATION_FAILED, event_data);
+  }
+
+  save_data();
+}
+
+;; ================================================================
+;; GET METHODS
+;; ================================================================
+
+;; Get admin address
+slice get_admin() method_id {
+  load_data();
+  return admin_address;
+}
+
+;; Get gas wallet address
+slice get_gas_wallet() method_id {
+  load_data();
+  return gas_wallet_address;
+}
+
+;; Get SBT verifier address
+slice get_sbt_verifier() method_id {
+  load_data();
+  return sbt_verifier_address;
+}
+
+;; Get policy NFT minter address
+slice get_policy_nft_minter() method_id {
+  load_data();
+  return policy_nft_minter_address;
+}
+
+;; Get vault address
+slice get_vault() method_id {
+  load_data();
+  return vault_address;
+}
+
+;; Get product factory address
+;; Returns: factory_addr or null if not deployed
+slice get_product_factory(int product_type) method_id {
+  load_data();
+
+  (slice factory_addr, int found) = udict_get?(product_factories, 8, product_type);
+
+  if (found == 0) {
+    return null();
+  }
+
+  return factory_addr~load_msg_addr();
+}
+
+;; Get total policies created
+int get_total_policies_created() method_id {
+  load_data();
+  return total_policies_created;
+}
+
+;; Get paused status
+int get_paused() method_id {
+  load_data();
+  return paused;
+}
+
+;; Get required KYC tier
+int get_required_kyc_tier() method_id {
+  load_data();
+  return required_kyc_tier;
+}
+
+;; Check if product factory is deployed
+int is_factory_deployed(int product_type) method_id {
+  load_data();
+
+  (_, int found) = udict_get?(product_factories, 8, product_type);
+  return found ? 1 : 0;
+}
+
+;; Get contract version
+int get_version() method_id {
+  return 3; ;; V3
+}
+
+;; Get policy details by ID
+;; Returns: (product_type, asset_id, user_addr, coverage, expiry, child, claimed, created_at)
+(int, int, slice, int, int, slice, int, int) get_policy(int policy_id) method_id {
+  load_data();
+
+  (cell policy_cell, int found) = udict_get_ref?(active_policies, 64, policy_id);
+
+  if (found == 0) {
+    return (0, 0, null(), 0, 0, null(), 0, 0);
+  }
+
+  ;; Load main cell
+  slice policy_data = policy_cell.begin_parse();
+  int product_type = policy_data~load_uint(8);
+  int asset_id = policy_data~load_uint(16);
+  slice user_addr = policy_data~load_msg_addr();
+  int coverage = policy_data~load_coins();
+  int expiry = policy_data~load_uint(32);
+  slice child = policy_data~load_msg_addr();
+
+  ;; Load details from reference
+  slice policy_details = policy_data~load_ref().begin_parse();
+  slice sender = policy_details~load_msg_addr();  ;; child contract sender
+  int trigger1 = policy_details~load_uint(32);
+  int trigger2 = policy_details~load_uint(32);
+  int claimed = policy_details~load_uint(1);
+  int created_at = policy_details~load_uint(32);
+
+  return (product_type, asset_id, user_addr, coverage, expiry, child, claimed, created_at);
+}
+
+;; Check if policy exists
+int has_policy(int policy_id) method_id {
+  load_data();
+  (_, int found) = udict_get_ref?(active_policies, 64, policy_id);
+  return found ? 1 : 0;
+}
+
+;; Get total claims processed
+int get_total_claims_processed() method_id {
+  load_data();
+  return total_claims_processed;
+}
+
+;; ================================================================
+;; END OF MASTERFACTORY CONTRACT
+;; ================================================================

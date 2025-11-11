@@ -1,0 +1,635 @@
+;; ================================================================
+;; FloatMaster Contract - Central Treasury & Investment Manager
+;; ================================================================
+;;
+;; Purpose: Receives premiums and manages 4-pillar investment allocation
+;; Features:
+;; - Immediate premium allocation: 50% RWA, 15% BTC, 15% DeFi, 20% Hedges
+;; - Capital maturity tracking (active vs expired coverage)
+;; - Protocol earned capital management (EQT 25% cap overflow)
+;; - Daily yield aggregation and distribution to vault tranches
+;; - Liquidity management (60% instant, 40% week redemption)
+;;
+;; Target Shard: 0xF0 (co-located with MultiTrancheVault)
+;; Gas Cost: ~0.25 TON per premium allocation (4 sub-messages)
+;; ================================================================
+
+#include "../libs/security_helpers.fc";
+
+;; ================================================================
+;; FORWARD DECLARATIONS
+;; ================================================================
+
+() track_policy_coverage(int policy_id, int product_type, int asset_id, int coverage_amount, int expiry_timestamp) impure inline;
+() send_to_rwa_float(int amount) impure inline;
+() send_to_btc_float(int amount) impure inline;
+() send_to_defi_float(int amount) impure inline;
+() send_to_hedge_float(int amount, int product_type, int asset_id, int coverage_amount) impure inline;
+
+;; ================================================================
+;; CONSTANTS
+;; ================================================================
+
+;; 4-Pillar Allocation Percentages (basis points)
+const int ALLOCATION_RWA = 5000;      ;; 50%
+const int ALLOCATION_BTC = 1500;      ;; 15%
+const int ALLOCATION_DEFI = 1500;     ;; 15%
+const int ALLOCATION_HEDGES = 2000;   ;; 20%
+
+;; Opcodes
+const int op::receive_premium = 0x60;
+const int op::release_expired_coverage = 0x61;
+const int op::aggregate_daily_yield = 0x62;
+const int op::distribute_yield_to_vault = 0x63;
+const int op::set_rwa_float = 0x70;
+const int op::set_btc_float = 0x71;
+const int op::set_defi_float = 0x72;
+const int op::set_hedge_float = 0x73;
+const int op::set_vault = 0x74;
+const int op::pause = 0x75;
+const int op::unpause = 0x76;
+
+;; Sub-float opcodes
+const int op::invest_rwa = 0x80;
+const int op::stake_btc = 0x81;
+const int op::deploy_defi = 0x82;
+const int op::add_hedge_capital = 0x83;
+
+;; Error codes
+const int err::unauthorized = 401;
+const int err::paused = 402;
+const int err::invalid_amount = 403;
+const int err::float_not_set = 404;
+const int err::vault_not_set = 405;
+
+;; Event types
+const int EVENT_PREMIUM_ALLOCATED = 0x01;
+const int EVENT_COVERAGE_EXPIRED = 0x02;
+const int EVENT_YIELD_AGGREGATED = 0x03;
+const int EVENT_RWA_FLOAT_SET = 0x04;
+const int EVENT_BTC_FLOAT_SET = 0x05;
+const int EVENT_DEFI_FLOAT_SET = 0x06;
+const int EVENT_HEDGE_FLOAT_SET = 0x07;
+const int EVENT_VAULT_SET = 0x08;
+const int EVENT_FLOAT_PAUSED = 0x09;
+const int EVENT_FLOAT_UNPAUSED = 0x0A;
+
+;; ================================================================
+;; STORAGE LAYOUT
+;; ================================================================
+
+global slice admin_address;
+global slice vault_address;
+global slice rwa_float_address;
+global slice btc_float_address;
+global slice defi_float_address;
+global slice hedge_float_address;
+
+global int total_premiums_collected;
+global int total_claims_paid;
+global int protocol_earned_capital;     ;; EQT 25% cap overflow
+
+;; Capital Maturity Tracking
+global cell active_policies;            ;; Dict<policy_id:uint64, policy:cell>
+global int total_active_coverage;       ;; Sum of all active policy coverage
+global int active_coverage_capital;     ;; Locked for active policies
+global int expired_coverage_capital;    ;; Available for illiquid deployment
+global cell coverage_maturities;        ;; Dict<maturity_date:uint32, amount:int>
+
+;; Float Allocations (current balances)
+global int rwa_allocated;
+global int btc_allocated;
+global int defi_allocated;
+global int hedge_allocated;
+global int illiquid_deployment;         ;; RWAs with >7 day redemption
+
+global int paused;
+
+;; ================================================================
+;; STORAGE FUNCTIONS
+;; ================================================================
+
+() load_data() impure inline {
+  slice ds = get_data().begin_parse();
+
+  ;; Addresses (split into 2 refs: 3 + 3 to avoid cell overflow)
+  ;; 6 addresses × 267 bits = 1602 bits > 1023, so split required
+  slice addr_ref1 = ds~load_ref().begin_parse();
+  admin_address = addr_ref1~load_msg_addr();
+  vault_address = addr_ref1~load_msg_addr();
+  rwa_float_address = addr_ref1~load_msg_addr();
+
+  slice addr_ref2 = ds~load_ref().begin_parse();
+  btc_float_address = addr_ref2~load_msg_addr();
+  defi_float_address = addr_ref2~load_msg_addr();
+  hedge_float_address = addr_ref2~load_msg_addr();
+
+  total_premiums_collected = ds~load_coins();
+  total_claims_paid = ds~load_coins();
+  protocol_earned_capital = ds~load_coins();
+
+  ;; Extended data
+  slice ext = ds~load_ref().begin_parse();
+  active_policies = ext~load_dict();
+  total_active_coverage = ext~load_coins();
+  active_coverage_capital = ext~load_coins();
+  expired_coverage_capital = ext~load_coins();
+  coverage_maturities = ext~load_dict();
+
+  ;; Allocation data
+  slice alloc = ds~load_ref().begin_parse();
+  rwa_allocated = alloc~load_coins();
+  btc_allocated = alloc~load_coins();
+  defi_allocated = alloc~load_coins();
+  hedge_allocated = alloc~load_coins();
+  illiquid_deployment = alloc~load_coins();
+
+  paused = ds~load_uint(1);
+}
+
+() save_data() impure inline {
+  ;; Split addresses into 2 refs to avoid cell overflow (3 + 3 addresses)
+  cell addr_ref1 = begin_cell()
+    .store_slice(admin_address)
+    .store_slice(vault_address)
+    .store_slice(rwa_float_address)
+    .end_cell();
+
+  cell addr_ref2 = begin_cell()
+    .store_slice(btc_float_address)
+    .store_slice(defi_float_address)
+    .store_slice(hedge_float_address)
+    .end_cell();
+
+  cell ext_data = begin_cell()
+    .store_dict(active_policies)
+    .store_coins(total_active_coverage)
+    .store_coins(active_coverage_capital)
+    .store_coins(expired_coverage_capital)
+    .store_dict(coverage_maturities)
+    .end_cell();
+
+  cell alloc_data = begin_cell()
+    .store_coins(rwa_allocated)
+    .store_coins(btc_allocated)
+    .store_coins(defi_allocated)
+    .store_coins(hedge_allocated)
+    .store_coins(illiquid_deployment)
+    .end_cell();
+
+  set_data(
+    begin_cell()
+      .store_ref(addr_ref1)
+      .store_ref(addr_ref2)
+      .store_coins(total_premiums_collected)
+      .store_coins(total_claims_paid)
+      .store_coins(protocol_earned_capital)
+      .store_ref(ext_data)
+      .store_ref(alloc_data)
+      .store_uint(paused, 1)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; PREMIUM ALLOCATION
+;; ================================================================
+
+() receive_premium(
+  slice sender,
+  int policy_id,
+  int premium_amount,
+  int product_type,
+  int asset_id,
+  int coverage_amount,
+  int expiry_timestamp
+) impure {
+  throw_unless(err::invalid_amount, premium_amount > 0);
+  throw_if(err::float_not_set, is_valid_address(rwa_float_address) == false);
+  throw_if(err::float_not_set, is_valid_address(btc_float_address) == false);
+  throw_if(err::float_not_set, is_valid_address(defi_float_address) == false);
+  throw_if(err::float_not_set, is_valid_address(hedge_float_address) == false);
+
+  total_premiums_collected += premium_amount;
+
+  ;; Calculate 4-pillar allocation
+  int rwa_allocation = muldiv(premium_amount, ALLOCATION_RWA, 10000);
+  int btc_allocation = muldiv(premium_amount, ALLOCATION_BTC, 10000);
+  int defi_allocation = muldiv(premium_amount, ALLOCATION_DEFI, 10000);
+  int hedge_allocation = muldiv(premium_amount, ALLOCATION_HEDGES, 10000);
+
+  ;; Update allocation tracking
+  rwa_allocated += rwa_allocation;
+  btc_allocated += btc_allocation;
+  defi_allocated += defi_allocation;
+  hedge_allocated += hedge_allocation;
+
+  ;; Track policy coverage for maturity calculation
+  track_policy_coverage(policy_id, product_type, asset_id, coverage_amount, expiry_timestamp);
+
+  ;; Send to 4 sub-floats IMMEDIATELY
+  send_to_rwa_float(rwa_allocation);
+  send_to_btc_float(btc_allocation);
+  send_to_defi_float(defi_allocation);
+  send_to_hedge_float(hedge_allocation, product_type, asset_id, coverage_amount);
+
+  emit_log_event(EVENT_PREMIUM_ALLOCATED,
+    begin_cell()
+      .store_uint(policy_id, 64)
+      .store_coins(premium_amount)
+      .store_coins(rwa_allocation)
+      .store_coins(btc_allocation)
+      .store_coins(defi_allocation)
+      .store_coins(hedge_allocation)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; CAPITAL MATURITY TRACKING
+;; ================================================================
+
+() track_policy_coverage(
+  int policy_id,
+  int product_type,
+  int asset_id,
+  int coverage_amount,
+  int expiry_timestamp
+) impure inline {
+  ;; Store policy data
+  cell policy_data = begin_cell()
+    .store_uint(product_type, 8)
+    .store_uint(asset_id, 16)
+    .store_coins(coverage_amount)
+    .store_uint(expiry_timestamp, 32)
+    .store_uint(now(), 32)
+    .end_cell();
+
+  active_policies~udict_set_ref(64, policy_id, policy_data);
+
+  ;; Update active coverage totals
+  total_active_coverage += coverage_amount;
+  active_coverage_capital += coverage_amount;
+
+  ;; Track maturity date
+  (slice existing_maturity, int found) = udict_get?(coverage_maturities, 32, expiry_timestamp);
+  int maturity_amount = 0;
+
+  if (found) {
+    maturity_amount = existing_maturity~load_coins();
+  }
+
+  maturity_amount += coverage_amount;
+
+  coverage_maturities~udict_set(32, expiry_timestamp,
+    begin_cell()
+      .store_coins(maturity_amount)
+      .end_cell()
+      .begin_parse()
+  );
+}
+
+() release_expired_coverage(int expiry_timestamp) impure {
+  ;; Called by OCaml backend when policies expire
+  (slice maturity_data, int found) = udict_get?(coverage_maturities, 32, expiry_timestamp);
+
+  if (found) {
+    int matured_amount = maturity_data~load_coins();
+
+    active_coverage_capital -= matured_amount;
+    expired_coverage_capital += matured_amount;
+
+    coverage_maturities~udict_delete?(32, expiry_timestamp);
+
+    emit_log_event(EVENT_COVERAGE_EXPIRED,
+      begin_cell()
+        .store_uint(expiry_timestamp, 32)
+        .store_coins(matured_amount)
+        .store_coins(expired_coverage_capital)
+        .store_uint(now(), 32)
+        .end_cell()
+    );
+  }
+}
+
+;; ================================================================
+;; SUB-FLOAT MESSAGE SENDING
+;; ================================================================
+
+() send_to_rwa_float(int amount) impure inline {
+  send_internal_msg(
+    rwa_float_address,
+    amount + 50000000,  ;; 0.05 TON gas
+    op::invest_rwa,
+    begin_cell()
+      .store_coins(amount)
+      .end_cell()
+  );
+}
+
+() send_to_btc_float(int amount) impure inline {
+  send_internal_msg(
+    btc_float_address,
+    amount + 50000000,
+    op::stake_btc,
+    begin_cell()
+      .store_coins(amount)
+      .end_cell()
+  );
+}
+
+() send_to_defi_float(int amount) impure inline {
+  send_internal_msg(
+    defi_float_address,
+    amount + 50000000,
+    op::deploy_defi,
+    begin_cell()
+      .store_coins(amount)
+      .end_cell()
+  );
+}
+
+() send_to_hedge_float(int amount, int product_type, int asset_id, int coverage_amount) impure inline {
+  send_internal_msg(
+    hedge_float_address,
+    amount + 100000000,  ;; 0.1 TON gas (hedge execution is more expensive)
+    op::add_hedge_capital,
+    begin_cell()
+      .store_coins(amount)
+      .store_uint(product_type, 8)
+      .store_uint(asset_id, 16)
+      .store_coins(coverage_amount)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; DAILY YIELD AGGREGATION
+;; ================================================================
+
+() aggregate_daily_yield(
+  int rwa_yield,
+  int btc_yield,
+  int defi_yield,
+  int hedge_pnl
+) impure {
+  throw_if(err::vault_not_set, is_valid_address(vault_address) == false);
+
+  int total_yield = rwa_yield + btc_yield + defi_yield + hedge_pnl;
+
+  ;; Distribute to 6 tranches: BTC 15%, SNR 20%, MEZZ 25%, JNR 20%, JNR+ 15%, EQT 5%
+  int btc_tranche_yield = muldiv(total_yield, 1500, 10000);
+  int snr_tranche_yield = muldiv(total_yield, 2000, 10000);
+  int mezz_tranche_yield = muldiv(total_yield, 2500, 10000);
+  int jnr_tranche_yield = muldiv(total_yield, 2000, 10000);
+  int jnr_plus_tranche_yield = muldiv(total_yield, 1500, 10000);
+  int eqt_tranche_yield = muldiv(total_yield, 500, 10000);
+
+  ;; Send to vault for accrual
+  cell yield_data = begin_cell()
+    .store_coins(btc_tranche_yield)
+    .store_coins(snr_tranche_yield)
+    .store_coins(mezz_tranche_yield)
+    .store_coins(jnr_tranche_yield)
+    .store_coins(jnr_plus_tranche_yield)
+    .store_coins(eqt_tranche_yield)
+    .end_cell();
+
+  send_internal_msg(
+    vault_address,
+    100000000,  ;; 0.1 TON gas
+    0x06,  ;; op::accrue_daily_yield from MultiTrancheVault
+    yield_data
+  );
+
+  emit_log_event(EVENT_YIELD_AGGREGATED,
+    begin_cell()
+      .store_coins(total_yield)
+      .store_coins(rwa_yield)
+      .store_coins(btc_yield)
+      .store_coins(defi_yield)
+      .store_coins(hedge_pnl)
+      .store_uint(now(), 32)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; MESSAGE HANDLERS
+;; ================================================================
+
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  if (in_msg_body.slice_empty?()) {
+    return ();  ;; Accept funds
+  }
+
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+  slice sender = cs~load_msg_addr();
+
+  load_data();
+
+  int op = in_msg_body~load_uint(32);
+
+  if (op == op::receive_premium) {
+    require_not_paused(paused);
+
+    ;; Parse premium data from child contract
+    int policy_id = in_msg_body~load_uint(64);
+    int premium_amount = in_msg_body~load_coins();
+    int product_type = in_msg_body~load_uint(8);
+    int asset_id = in_msg_body~load_uint(16);
+    int coverage_amount = in_msg_body~load_coins();
+    int expiry_timestamp = in_msg_body~load_uint(32);
+
+    receive_premium(sender, policy_id, premium_amount, product_type, asset_id, coverage_amount, expiry_timestamp);
+
+    save_data();
+    return ();
+  }
+
+  if (op == op::release_expired_coverage) {
+    require_not_paused(paused);
+
+    ;; Only admin or authorized OCaml backend
+    throw_unless(err::unauthorized, equal_slice_bits(sender, admin_address));
+
+    int expiry_timestamp = in_msg_body~load_uint(32);
+    release_expired_coverage(expiry_timestamp);
+
+    save_data();
+    return ();
+  }
+
+  if (op == op::aggregate_daily_yield) {
+    require_not_paused(paused);
+
+    ;; Only admin or authorized OCaml backend
+    throw_unless(err::unauthorized, equal_slice_bits(sender, admin_address));
+
+    int rwa_yield = in_msg_body~load_coins();
+    int btc_yield = in_msg_body~load_coins();
+    int defi_yield = in_msg_body~load_coins();
+    int hedge_pnl = in_msg_body~load_coins();
+
+    aggregate_daily_yield(rwa_yield, btc_yield, defi_yield, hedge_pnl);
+
+    save_data();
+    return ();
+  }
+
+  if (op == op::set_rwa_float) {
+    throw_unless(err::unauthorized, equal_slice_bits(sender, admin_address));
+    rwa_float_address = in_msg_body~load_msg_addr();
+    save_data();
+    emit_log_simple(EVENT_RWA_FLOAT_SET, 1);
+    return ();
+  }
+
+  if (op == op::set_btc_float) {
+    throw_unless(err::unauthorized, equal_slice_bits(sender, admin_address));
+    btc_float_address = in_msg_body~load_msg_addr();
+    save_data();
+    emit_log_simple(EVENT_BTC_FLOAT_SET, 1);
+    return ();
+  }
+
+  if (op == op::set_defi_float) {
+    throw_unless(err::unauthorized, equal_slice_bits(sender, admin_address));
+    defi_float_address = in_msg_body~load_msg_addr();
+    save_data();
+    emit_log_simple(EVENT_DEFI_FLOAT_SET, 1);
+    return ();
+  }
+
+  if (op == op::set_hedge_float) {
+    throw_unless(err::unauthorized, equal_slice_bits(sender, admin_address));
+    hedge_float_address = in_msg_body~load_msg_addr();
+    save_data();
+    emit_log_simple(EVENT_HEDGE_FLOAT_SET, 1);
+    return ();
+  }
+
+  if (op == op::set_vault) {
+    throw_unless(err::unauthorized, equal_slice_bits(sender, admin_address));
+    vault_address = in_msg_body~load_msg_addr();
+    save_data();
+    emit_log_simple(EVENT_VAULT_SET, 1);
+    return ();
+  }
+
+  if (op == op::pause) {
+    throw_unless(err::unauthorized, equal_slice_bits(sender, admin_address));
+    paused = 1;
+    save_data();
+    emit_log_simple(EVENT_FLOAT_PAUSED, 1);
+    return ();
+  }
+
+  if (op == op::unpause) {
+    throw_unless(err::unauthorized, equal_slice_bits(sender, admin_address));
+    paused = 0;
+    save_data();
+    emit_log_simple(EVENT_FLOAT_UNPAUSED, 1);
+    return ();
+  }
+
+  throw(0xFFFF);
+}
+
+;; ================================================================
+;; GET METHODS
+;; ================================================================
+
+slice get_admin() method_id {
+  load_data();
+  return admin_address;
+}
+
+slice get_vault() method_id {
+  load_data();
+  return vault_address;
+}
+
+slice get_rwa_float() method_id {
+  load_data();
+  return rwa_float_address;
+}
+
+slice get_btc_float() method_id {
+  load_data();
+  return btc_float_address;
+}
+
+slice get_defi_float() method_id {
+  load_data();
+  return defi_float_address;
+}
+
+slice get_hedge_float() method_id {
+  load_data();
+  return hedge_float_address;
+}
+
+int get_total_premiums_collected() method_id {
+  load_data();
+  return total_premiums_collected;
+}
+
+int get_protocol_earned_capital() method_id {
+  load_data();
+  return protocol_earned_capital;
+}
+
+int get_total_active_coverage() method_id {
+  load_data();
+  return total_active_coverage;
+}
+
+int get_active_coverage_capital() method_id {
+  load_data();
+  return active_coverage_capital;
+}
+
+int get_expired_coverage_capital() method_id {
+  load_data();
+  return expired_coverage_capital;
+}
+
+(int, int, int, int) get_float_allocations() method_id {
+  load_data();
+  return (rwa_allocated, btc_allocated, defi_allocated, hedge_allocated);
+}
+
+int get_total_float_balance() method_id {
+  load_data();
+  return rwa_allocated + btc_allocated + defi_allocated + hedge_allocated;
+}
+
+;; Calculate protocol maturity ratio: float / active_coverage
+;; Returns fixed-point with 9 decimals (e.g., 4.5 = 4500000000)
+int get_maturity_ratio() method_id {
+  load_data();
+
+  if (active_coverage_capital == 0) {
+    return 0;  ;; No active coverage, ratio undefined
+  }
+
+  int total_float = rwa_allocated + btc_allocated + defi_allocated + hedge_allocated;
+  ;; ratio = float / active_coverage
+  return muldiv(total_float, 1000000000, active_coverage_capital);
+}
+
+int get_paused() method_id {
+  load_data();
+  return paused;
+}
+
+int get_version() method_id {
+  return 3;
+}
+
+;; ================================================================
+;; END OF FLOATMASTER CONTRACT
+;; ================================================================

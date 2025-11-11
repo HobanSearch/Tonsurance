@@ -411,27 +411,41 @@ export const PolicyPurchase = () => {
           {/* Step 1: Select Coverage Type */}
           <TerminalWindow title="STEP 1: SELECT COVERAGE TYPE">
             <div className="grid grid-cols-5 gap-2">
-              {(Object.entries(COVERAGE_TYPES) as [CoverageType, CoverageTypeInfo][]).map(([type, info]) => (
-                <button
-                  key={type}
-                  onClick={() => {
-                    setSelectedCoverageType(type);
-                    setSelectedBlockchains(new Set());
-                    setSelectedStablecoins(new Set());
-                  }}
-                  className={`p-3 border-2 transition-all ${
-                    selectedCoverageType === type
-                      ? 'border-copper-500 bg-copper-50'
-                      : 'border-cream-400 hover:bg-cream-300'
-                  }`}
-                >
-                  <div className="text-2xl mb-1">{info.icon}</div>
-                  <div className="text-[9px] font-semibold break-words leading-tight">{info.name}</div>
-                  <div className="text-[8px] text-terminal-green font-mono font-bold mt-1">
-                    {info.baseRateApr}% APR
-                  </div>
-                </button>
-              ))}
+              {(Object.entries(COVERAGE_TYPES) as [CoverageType, CoverageTypeInfo][]).map(([type, info]) => {
+                const isComingSoon = type !== 'depeg';
+                return (
+                  <button
+                    key={type}
+                    onClick={() => {
+                      if (isComingSoon) {
+                        alert(`${info.name} coverage is coming soon! Currently only STABLECOIN_DEPEG is available for the hackathon demo.`);
+                        return;
+                      }
+                      setSelectedCoverageType(type);
+                      setSelectedBlockchains(new Set());
+                      setSelectedStablecoins(new Set());
+                    }}
+                    className={`p-3 border-2 transition-all relative ${
+                      selectedCoverageType === type
+                        ? 'border-copper-500 bg-copper-50'
+                        : isComingSoon
+                        ? 'border-cream-400 hover:bg-cream-300 opacity-60'
+                        : 'border-cream-400 hover:bg-cream-300'
+                    }`}
+                  >
+                    {isComingSoon && (
+                      <div className="absolute -top-1 -right-1 bg-yellow-500 text-white text-[7px] font-bold px-1 py-0.5 border border-yellow-600">
+                        SOON
+                      </div>
+                    )}
+                    <div className="text-2xl mb-1">{info.icon}</div>
+                    <div className="text-[9px] font-semibold break-words leading-tight">{info.name}</div>
+                    <div className="text-[8px] text-terminal-green font-mono font-bold mt-1">
+                      {info.baseRateApr}% APR
+                    </div>
+                  </button>
+                );
+              })}
             </div>
             {selectedCoverageType && (
               <div className="mt-3 p-2 bg-copper-50/30 border-2 border-copper-400">

@@ -1,0 +1,172 @@
+{
+  "version": "3.0.0",
+  "network": "testnet",
+  "description": "Tonsurance V3 Contract Addresses and Configuration",
+  "updated": "2025-01-05",
+
+  "core": {
+    "masterFactoryProxy": {
+      "address": "EQ_DEPLOY_MASTER_FACTORY_PROXY_ADDRESS",
+      "description": "Main entry point for policy creation (upgradable via proxy)",
+      "shard": "0x00",
+      "opcodes": {
+        "createPolicy": "0x20",
+        "registerProductFactory": "0x21",
+        "registerPolicy": "0x51",
+        "processClaim": "0x53"
+      },
+      "getMethods": [
+        "get_admin()",
+        "get_vault()",
+        "get_product_factory(int product_type)",
+        "get_policy(int policy_id)",
+        "has_policy(int policy_id)",
+        "get_total_policies_created()",
+        "get_total_claims_processed()"
+      ]
+    },
+
+    "gasWallet": {
+      "address": "EQ_DEPLOY_GAS_WALLET_ADDRESS",
+      "description": "DoS-resistant gas abstraction layer",
+      "shard": "0x00",
+      "rateLimit": {
+        "maxTransactionsPerMinute": 5,
+        "windowSeconds": 60
+      }
+    },
+
+    "sbtVerifier": {
+      "address": "EQ_DEPLOY_SBT_VERIFIER_ADDRESS",
+      "description": "KYC verification via zero-knowledge proofs",
+      "shard": "0x00",
+      "tiers": {
+        "1": { "name": "Basic", "coverageLimit": 5000, "requirements": ["email", "phone"] },
+        "2": { "name": "Standard", "coverageLimit": 50000, "requirements": ["governmentId"] },
+        "3": { "name": "Enhanced", "coverageLimit": 500000, "requirements": ["proofOfAddress"] }
+      }
+    },
+
+    "policyNFTMinter": {
+      "address": "EQ_DEPLOY_POLICY_NFT_MINTER_ADDRESS",
+      "description": "TEP-62 NFT minter for policy certificates",
+      "shard": "0x00",
+      "standard": "TEP-62"
+    }
+  },
+
+  "vault": {
+    "multiTrancheVaultProxy": {
+      "address": "EQ_DEPLOY_VAULT_PROXY_ADDRESS",
+      "description": "6-tranche LP vault with waterfall loss absorption (upgradable)",
+      "shard": "0xF0",
+      "tranches": [
+        { "id": 1, "name": "BTC", "allocation": 15, "risk": "lowest" },
+        { "id": 2, "name": "SNR", "allocation": 20, "risk": "low" },
+        { "id": 3, "name": "MEZZ", "allocation": 25, "risk": "medium" },
+        { "id": 4, "name": "JNR", "allocation": 20, "risk": "high" },
+        { "id": 5, "name": "JNR+", "allocation": 15, "risk": "higher" },
+        { "id": 6, "name": "EQT", "allocation": 5, "risk": "highest" }
+      ],
+      "opcodes": {
+        "deposit": "0x01",
+        "withdraw": "0x02",
+        "withdrawForClaim": "0x60"
+      },
+      "getMethods": [
+        "get_total_value_locked()",
+        "get_all_tranche_allocations()",
+        "get_lp_balance(slice lp_addr)",
+        "get_tranche_allocation(int tranche_id)"
+      ]
+    },
+
+    "floatMaster": {
+      "address": "EQ_DEPLOY_FLOAT_MASTER_ADDRESS",
+      "description": "Premium investment manager - 4 pillar allocation",
+      "shard": "0xF0",
+      "allocation": {
+        "rwa": { "percent": 50, "target_apy": 8.0 },
+        "btc": { "percent": 15, "strategy": "yield_farming" },
+        "defi": { "percent": 15, "protocols": ["Evaa", "DeDust", "STON.fi"] },
+        "hedges": { "percent": 20, "purpose": "reserves" }
+      },
+      "blendedAPY": 8.65,
+      "opcodes": {
+        "investPremium": "0x52",
+        "accrueYield": "0x06"
+      }
+    }
+  },
+
+  "products": {
+    "depeg": {
+      "subFactory": "EQ_DEPLOY_DEPEG_SUBFACTORY_ADDRESS",
+      "description": "Stablecoin depeg insurance",
+      "shard": "0x10",
+      "productType": 1
+    },
+
+    "bridge": {
+      "subFactory": "EQ_DEPLOY_BRIDGE_SUBFACTORY_ADDRESS",
+      "description": "Bridge failure insurance",
+      "shard": "0x20",
+      "productType": 2
+    },
+
+    "oracle": {
+      "subFactory": "EQ_DEPLOY_ORACLE_SUBFACTORY_ADDRESS",
+      "description": "Oracle failure insurance",
+      "shard": "0x30",
+      "productType": 3
+    },
+
+    "contract": {
+      "subFactory": "EQ_DEPLOY_CONTRACT_SUBFACTORY_ADDRESS",
+      "description": "Smart contract exploit insurance",
+      "shard": "0x40",
+      "productType": 4
+    }
+  },
+
+  "utilities": {
+    "priceOracle": {
+      "address": "EQ_DEPLOY_PRICE_ORACLE_ADDRESS",
+      "description": "Multi-oracle price aggregation (Redstone, Pyth, Custom)",
+      "shard": "0xF0",
+      "sources": ["redstone", "pyth", "custom"],
+      "consensusThreshold": 2,
+      "maxStaleness": 300
+    },
+
+    "parametricEscrow": {
+      "description": "Separate product - custom oracle-triggered payments (not used in insurance)",
+      "note": "ParametricEscrow is a standalone product, not part of the insurance flow"
+    }
+  },
+
+  "deployment": {
+    "testnet": {
+      "rpcUrl": "https://testnet.toncenter.com/api/v2/jsonRPC",
+      "explorerUrl": "https://testnet.tonscan.org"
+    },
+    "mainnet": {
+      "rpcUrl": "https://toncenter.com/api/v2/jsonRPC",
+      "explorerUrl": "https://tonscan.org"
+    }
+  },
+
+  "gasEstimates": {
+    "policyCreation": {
+      "optimized": "0.045 TON",
+      "unoptimized": "0.075 TON",
+      "breakdown": {
+        "sameShard": 3,
+        "crossShard": 2
+      }
+    },
+    "claimProcessing": "0.05 TON",
+    "vaultDeposit": "0.15 TON",
+    "vaultWithdraw": "0.20 TON"
+  }
+}

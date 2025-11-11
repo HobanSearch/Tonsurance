@@ -1,0 +1,290 @@
+;; ================================================================
+;; TradFiNatCatFactory Contract - Natural Catastrophe Insurance
+;; ================================================================
+;;
+;; Purpose: Manages natural catastrophe insurance policy creation
+;; Features:
+;; - Deploys NatCatChild contracts for each catastrophe type
+;; - Routes policies to appropriate catastrophe child
+;; - Asset IDs: Hurricane=1, Earthquake=2
+;;
+;; Target Shard: 0x50 (co-located with NatCat children)
+;; Gas Cost: ~0.01 TON per policy routing
+;; ================================================================
+
+#include "../libs/security_helpers.fc";
+#include "../libs/factory_helpers.fc";
+
+;; ================================================================
+;; ASSET IDs (Natural Catastrophe Types)
+;; ================================================================
+
+const int ASSET_HURRICANE = 1;         ;; Hurricane/Tropical Cyclone
+const int ASSET_EARTHQUAKE = 2;        ;; Earthquake/Seismic Event
+;; Expandable to 255 catastrophe types (Flood=3, Wildfire=4, etc.)
+
+;; ================================================================
+;; EVENT TYPES
+;; ================================================================
+
+const int EVENT_CHILD_DEPLOYED = 0x01;
+const int EVENT_POLICY_FORWARDED = 0x02;
+const int EVENT_POLICY_FAILED = 0x03;
+const int EVENT_CHILD_REGISTERED = 0x04;
+const int EVENT_CHILD_CODE_SET = 0x05;
+const int EVENT_FACTORY_PAUSED = 0x06;
+const int EVENT_FACTORY_UNPAUSED = 0x07;
+
+;; ================================================================
+;; STORAGE (Same structure as SubFactories)
+;; ================================================================
+
+global slice master_factory_address;
+global int product_type;               ;; = 5 (PRODUCT_TRADFI_NATCAT)
+global cell children;
+global cell child_codes;
+global int total_children_deployed;
+global int total_policies_created;
+global int paused;
+
+() load_data() impure inline {
+  slice ds = get_data().begin_parse();
+  master_factory_address = ds~load_msg_addr();
+  product_type = ds~load_uint(8);
+  children = ds~load_dict();
+  child_codes = ds~load_dict();
+  total_children_deployed = ds~load_uint(32);
+  total_policies_created = ds~load_uint(64);
+  paused = ds~load_uint(1);
+}
+
+() save_data() impure inline {
+  set_data(
+    begin_cell()
+      .store_slice(master_factory_address)
+      .store_uint(product_type, 8)
+      .store_dict(children)
+      .store_dict(child_codes)
+      .store_uint(total_children_deployed, 32)
+      .store_uint(total_policies_created, 64)
+      .store_uint(paused, 1)
+      .end_cell()
+  );
+}
+
+;; ================================================================
+;; CATASTROPHE-SPECIFIC VALIDATION
+;; ================================================================
+
+;; Validate catastrophe asset ID
+int is_valid_catastrophe(int asset_id) inline {
+  ;; Valid range: 1-255 (currently 1-2 defined, expandable)
+  return (asset_id >= 1) & (asset_id <= 255);
+}
+
+;; ================================================================
+;; POLICY ROUTING (Pre-Deployment Architecture)
+;; ================================================================
+
+() route_to_natcat_child(
+  slice user_addr,
+  int asset_id,
+  cell policy_params
+) impure {
+  throw_unless(403, is_valid_catastrophe(asset_id));
+
+  ;; Get child address (must be pre-deployed)
+  (slice child_addr, int found) = get_child_address(children, asset_id);
+  throw_unless(405, found); ;; Fail if child not registered - children must be pre-deployed
+
+  ;; Forward to child
+  var forward_body = begin_cell()
+    .store_slice(user_addr)
+    .store_ref(policy_params)
+    .end_cell();
+
+  int forward_amount = 300000000; ;; 0.3 TON
+
+  forward_to_child(
+    child_addr,
+    forward_amount,
+    0x40, ;; op::child_create_policy
+    forward_body
+  );
+
+  total_policies_created += 1;
+
+  ;; Emit event
+  var event_data = begin_cell()
+    .store_slice(user_addr)
+    .store_uint(asset_id, 16)
+    .store_uint(now(), 32)
+    .end_cell();
+
+  emit_log_event(EVENT_POLICY_FORWARDED, event_data);
+}
+
+;; ================================================================
+;; MESSAGE HANDLERS
+;; ================================================================
+
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  if (in_msg_body.slice_empty?()) {
+    return ();
+  }
+
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+  slice sender = cs~load_msg_addr();
+
+  if (flags & 1) {
+    ;; Bounced message
+    load_data();
+    (int op, int error_code, cell payload) = parse_bounced_message(in_msg_body);
+
+    if (op == 0x40) {
+      slice user_addr = extract_user_address(payload);
+      int refund_amount = extract_amount(payload);
+
+      if (is_valid_address(user_addr)) {
+        int fee = 10000000;
+        int refund = refund_amount > fee ? refund_amount - fee : 0;
+        if (refund > 0) {
+          send_simple_message(user_addr, refund);
+        }
+      }
+
+      emit_log_event(EVENT_POLICY_FAILED, begin_cell().store_slice(user_addr).store_uint(error_code, 32).end_cell());
+    }
+
+    save_data();
+    return ();
+  }
+
+  load_data();
+
+  int op = in_msg_body~load_uint(32);
+
+  if (op == 0x30) {
+    ;; create_policy_from_master
+    require_not_paused(paused);
+    throw_unless(401, equal_slice_bits(sender, master_factory_address));
+
+    slice user_addr = in_msg_body~load_msg_addr();
+    int asset_id = in_msg_body~load_uint(16);
+    cell policy_params = in_msg_body~load_ref();
+
+    route_to_natcat_child(user_addr, asset_id, policy_params);
+
+    save_data();
+    return ();
+  }
+
+  if (op == 0x31) {
+    ;; register_child
+    throw_unless(401, equal_slice_bits(sender, master_factory_address));
+
+    int asset_id = in_msg_body~load_uint(16);
+    slice child_addr = in_msg_body~load_msg_addr();
+
+    children = register_child(children, asset_id, child_addr);
+    total_children_deployed += 1;
+    save_data();
+
+    emit_log_simple(EVENT_CHILD_REGISTERED, asset_id);
+    return ();
+  }
+
+  if (op == 0x32) {
+    ;; set_child_code
+    throw_unless(401, equal_slice_bits(sender, master_factory_address));
+
+    int asset_id = in_msg_body~load_uint(16);
+    cell child_code = in_msg_body~load_ref();
+
+    child_codes~udict_set_ref(16, asset_id, child_code);
+    save_data();
+
+    emit_log_simple(EVENT_CHILD_CODE_SET, asset_id);
+    return ();
+  }
+
+  if (op == 0x33) {
+    ;; pause
+    throw_unless(401, equal_slice_bits(sender, master_factory_address));
+    paused = 1;
+    save_data();
+    emit_log_simple(EVENT_FACTORY_PAUSED, 1);
+    return ();
+  }
+
+  if (op == 0x34) {
+    ;; unpause
+    throw_unless(401, equal_slice_bits(sender, master_factory_address));
+    paused = 0;
+    save_data();
+    emit_log_simple(EVENT_FACTORY_UNPAUSED, 1);
+    return ();
+  }
+
+  throw(0xFFFF);
+}
+
+;; ================================================================
+;; GET METHODS
+;; ================================================================
+
+slice get_master_factory() method_id {
+  load_data();
+  return master_factory_address;
+}
+
+int get_product_type() method_id {
+  load_data();
+  return product_type;
+}
+
+slice get_child(int asset_id) method_id {
+  load_data();
+  (slice child_addr, int found) = get_child_address(children, asset_id);
+  if (found == 0) {
+    return begin_cell().end_cell().begin_parse(); ;; Return empty slice if not found
+  }
+  return child_addr;
+}
+
+int has_child(int asset_id) method_id {
+  load_data();
+  return is_child_deployed(children, asset_id);
+}
+
+int get_total_children() method_id {
+  load_data();
+  return total_children_deployed;
+}
+
+int get_total_policies() method_id {
+  load_data();
+  return total_policies_created;
+}
+
+int get_paused() method_id {
+  load_data();
+  return paused;
+}
+
+;; Get supported catastrophe types
+;; Returns: bitmap of supported assets (1-255)
+int get_supported_catastrophes() method_id {
+  ;; Return bitmap indicating assets 1-2 are supported
+  ;; Bit 1 set = Hurricane supported, Bit 2 = Earthquake
+  return 0x03; ;; 0b00000011 = assets 1-2 supported
+}
+
+int get_version() method_id {
+  return 3;
+}
+
+;; ================================================================
+;; END OF TRADFINATCATFACTORY
+;; ================================================================
