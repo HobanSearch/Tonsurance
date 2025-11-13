@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Register Factory Codes - Tonsurance</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://unpkg.com/@tonconnect/ui@latest/dist/tonconnect-ui.min.js"></script>
+    <script src="https://unpkg.com/@ton/core@0.56.0/dist/index.js"></script>
+    <style>
+        body {
+            font-family: 'Courier New', monospace;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            border-bottom: 3px solid #0088cc;
+            padding-bottom: 10px;
+        }
+        .status {
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 5px;
+            font-weight: bold;
+        }
+        .info { background: #e3f2fd; color: #1976d2; }
+        .success { background: #e8f5e9; color: #388e3c; }
+        .error { background: #ffebee; color: #c62828; }
+        .warning { background: #fff3e0; color: #f57c00; }
+        button {
+            background: #0088cc;
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            font-size: 16px;
+            cursor: pointer;
+            border-radius: 5px;
+            margin: 10px 5px;
+            font-weight: bold;
+        }
+        button:hover { background: #006699; }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .code-block {
+            background: #f5f5f5;
+            padding: 10px;
+            border-left: 4px solid #0088cc;
+            margin: 10px 0;
+            font-size: 12px;
+            overflow-x: auto;
+        }
+        #walletButton {
+            margin: 20px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔧 Register Factory Codes</h1>
+
+        <div class="status info">
+            <strong>Purpose:</strong> Register DepegSubFactory and TradFiNatCatFactory codes in MasterFactory
+        </div>
+
+        <div id="walletButton"></div>
+
+        <div id="status"></div>
+
+        <div style="margin-top: 20px;">
+            <button id="registerDepeg" disabled>1. Register DepegSubFactory (0.05 TON)</button>
+            <button id="registerTradFi" disabled>2. Register TradFiNatCatFactory (0.05 TON)</button>
+        </div>
+
+        <div class="status warning" style="margin-top: 20px;">
+            <strong>⚠️ Important:</strong> You must be the admin of MasterFactory to send these transactions.
+        </div>
+
+        <div class="code-block">
+            <strong>MasterFactory:</strong> EQACcoHQ5QrxfP8uvOyVdQ3OV54GSC63UWDRpBCRBBwGli6H<br>
+            <strong>Network:</strong> Testnet<br>
+            <strong>Operation:</strong> 0x22 (set_factory_code)
+        </div>
+    </div>
+
+    <script>
+        const MASTER_FACTORY = 'EQACcoHQ5QrxfP8uvOyVdQ3OV54GSC63UWDRpBCRBBwGli6H';
+
+        // Pre-built transaction payloads (built with Node.js, ready to send)
+        const DEPEG_PAYLOAD = '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';
+        const TRADFI_PAYLOAD = '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';
+
+        let tonConnectUI;
+        let wallet;
+
+        // Initialize TON Connect - will auto-detect browser extension
+        tonConnectUI = new TON_CONNECT_UI.TonConnectUI({
+            manifestUrl: 'https://app.tonsurance.com/tonconnect-manifest.json',
+            buttonRootId: 'walletButton'
+        });
+
+        tonConnectUI.onStatusChange((walletInfo) => {
+            if (walletInfo) {
+                wallet = walletInfo;
+                document.getElementById('registerDepeg').disabled = false;
+                document.getElementById('registerTradFi').disabled = false;
+                updateStatus('✓ Wallet connected: ' + wallet.account.address.slice(0, 8) + '...', 'success');
+            } else {
+                wallet = null;
+                document.getElementById('registerDepeg').disabled = true;
+                document.getElementById('registerTradFi').disabled = true;
+                updateStatus('Please connect your wallet', 'info');
+            }
+        });
+
+        function updateStatus(message, type = 'info') {
+            const statusDiv = document.getElementById('status');
+            statusDiv.className = 'status ' + type;
+            statusDiv.innerHTML = message;
+        }
+
+        async function sendTransaction(payloadBase64, factoryName) {
+            try {
+                console.log('=== Starting transaction for', factoryName);
+                console.log('Wallet connected:', wallet ? 'YES' : 'NO');
+                console.log('Wallet address:', wallet?.account?.address);
+
+                updateStatus(`Preparing transaction for ${factoryName}...`, 'info');
+
+                const transaction = {
+                    validUntil: Math.floor(Date.now() / 1000) + 300, // 5 minutes (TON Connect max)
+                    messages: [
+                        {
+                            address: MASTER_FACTORY,
+                            amount: '50000000', // 0.05 TON
+                            payload: payloadBase64  // Pre-built payload, ready to send!
+                        }
+                    ]
+                };
+
+                console.log('Transaction prepared, sending to wallet...');
+
+                updateStatus(`Sending transaction for ${factoryName}... Please confirm in your wallet`, 'warning');
+
+                const result = await tonConnectUI.sendTransaction(transaction);
+
+                updateStatus(`✓ Transaction sent for ${factoryName}! Hash: ${result.boc.slice(0, 16)}...`, 'success');
+
+                return true;
+            } catch (error) {
+                console.error('Full error:', error);
+                console.error('Error stack:', error.stack);
+                updateStatus(`❌ Error sending ${factoryName} transaction: ${error.message}`, 'error');
+                return false;
+            }
+        }
+
+        document.getElementById('registerDepeg').addEventListener('click', async () => {
+            document.getElementById('registerDepeg').disabled = true;
+            const success = await sendTransaction(DEPEG_PAYLOAD, 'DepegSubFactory');
+            if (!success) {
+                document.getElementById('registerDepeg').disabled = false;
+            }
+        });
+
+        document.getElementById('registerTradFi').addEventListener('click', async () => {
+            document.getElementById('registerTradFi').disabled = true;
+            const success = await sendTransaction(TRADFI_PAYLOAD, 'TradFiNatCatFactory');
+            if (!success) {
+                document.getElementById('registerTradFi').disabled = false;
+            }
+        });
+
+        // Load codes from files on page load
+        async function loadCodes() {
+            try {
+                // If running locally, codes are already embedded above
+                // If you want to load from JSON files, uncomment below:
+                /*
+                const depegResponse = await fetch('build/DepegSubFactory.deployed.json');
+                const depegData = await depegResponse.json();
+                DEPEG_CODE_BASE64 = depegData.codeBase64;
+
+                const tradFiResponse = await fetch('build/TradFiNatCatFactory.deployed.json');
+                const tradFiData = await tradFiResponse.json();
+                TRADFI_CODE_BASE64 = tradFiData.codeBase64;
+                */
+
+                updateStatus('Ready! Connect your wallet to continue.', 'info');
+            } catch (error) {
+                updateStatus('Error loading factory codes: ' + error.message, 'error');
+            }
+        }
+
+        loadCodes();
+    </script>
+</body>
+</html>

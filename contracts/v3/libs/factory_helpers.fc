@@ -161,12 +161,15 @@ slice deploy_child_with_shard_target(
 
   ;; Send deployment message
   var msg = begin_cell()
-    .store_uint(0x18, 6) ;; Internal message, bounce
-    .store_slice(target_addr)
-    .store_coins(deployment_value)
-    .store_uint(4 + 2 + 1, 1 + 4 + 4 + 64 + 32 + 1 + 1) ;; state_init in message
-    .store_ref(state_init)
-    .store_uint(0, 1) ;; No message body (empty body)
+    .store_uint(0x18, 6)       ;; Internal message, bounce enabled
+    .store_slice(target_addr)  ;; Destination address
+    .store_coins(deployment_value)  ;; Value to send
+    .store_uint(0, 1 + 4 + 4 + 64 + 32)  ;; Extra-currency + IHR fee + fwd fee + created_lt + created_at (all zeros)
+    .store_uint(1, 1)          ;; Init present = true
+    .store_uint(1, 1)          ;; Init as reference = true
+    .store_ref(state_init)     ;; StateInit reference
+    .store_uint(0, 1)          ;; Body inline (not reference)
+    ;; Empty body
     .end_cell();
 
   send_raw_message(msg, SEND_MODE_PAY_FEE_SEPARATELY);
@@ -284,12 +287,15 @@ slice deploy_child_with_init(
 
   ;; Send deployment message with body
   var msg = begin_cell()
-    .store_uint(0x18, 6)
-    .store_slice(target_addr)
-    .store_coins(deployment_value)
-    .store_uint(4 + 2 + 0, 1 + 4 + 4 + 64 + 32 + 1 + 1) ;; state_init + body
-    .store_ref(state_init)
-    .store_ref(body)
+    .store_uint(0x18, 6)       ;; Internal message, bounce enabled
+    .store_slice(target_addr)  ;; Destination address
+    .store_coins(deployment_value)  ;; Value to send
+    .store_uint(0, 1 + 4 + 4 + 64 + 32)  ;; Extra-currency + IHR fee + fwd fee + created_lt + created_at (all zeros)
+    .store_uint(1, 1)          ;; Init present = true
+    .store_uint(1, 1)          ;; Init as reference = true
+    .store_ref(state_init)     ;; StateInit reference
+    .store_uint(1, 1)          ;; Body as reference = true
+    .store_ref(body)           ;; Initialization message body
     .end_cell();
 
   send_raw_message(msg, SEND_MODE_PAY_FEE_SEPARATELY);
