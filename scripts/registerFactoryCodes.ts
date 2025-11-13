@@ -25,7 +25,7 @@ export async function run(provider: NetworkProvider) {
     console.log('📍 Network: TESTNET\n');
 
     // MasterFactory address from deployment
-    const masterFactoryAddress = 'EQACcoHQ5QrxfP8uvOyVdQ3OV54GSC63UWDRpBCRBBwGli6H';
+    const masterFactoryAddress = 'EQDsE9sylBzHemAHY1x6D7UO2wk27mjTgM6v6f4j2T2Z3TzG';
 
     console.log(`MasterFactory: ${masterFactoryAddress}\n`);
 

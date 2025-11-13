@@ -7,7 +7,7 @@ export async function run(provider: NetworkProvider) {
         endpoint: 'https://testnet.toncenter.com/api/v2/jsonRPC',
     });
 
-    const MASTER_FACTORY = 'EQACcoHQ5QrxfP8uvOyVdQ3OV54GSC63UWDRpBCRBBwGli6H';
+    const MASTER_FACTORY = 'EQDsE9sylBzHemAHY1x6D7UO2wk27mjTgM6v6f4j2T2Z3TzG';
     const masterFactoryAddress = Address.parse(MASTER_FACTORY);
 
     console.log('\n=== Verifying MasterFactory Configuration ===\n');

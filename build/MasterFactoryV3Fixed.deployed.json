@@ -1,0 +1,14 @@
+{
+  "address": "EQDsE9sylBzHemAHY1x6D7UO2wk27mjTgM6v6f4j2T2Z3TzG",
+  "deployedAt": "2025-11-13T06:16:32Z",
+  "network": "testnet",
+  "admin": "EQBkg6JGZ3m_JCyJy0DBKcR8A_fo8wel-NqWKlIBg6yi7GI5",
+  "version": "v3-fixed",
+  "fixes": [
+    "Fixed action phase error 34 in factory_helpers.fc",
+    "Corrected message format for StateInit deployment",
+    "Fixed deploy_child_with_shard_target() message construction",
+    "Fixed deploy_child_with_init() message construction"
+  ],
+  "explorer": "https://testnet.tonviewer.com/EQDsE9sylBzHemAHY1x6D7UO2wk27mjTgM6v6f4j2T2Z3TzG"
+}
