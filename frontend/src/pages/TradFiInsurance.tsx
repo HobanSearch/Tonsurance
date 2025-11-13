@@ -1,11 +1,12 @@
 import { useState } from 'react';
 import { useTonAddress } from '@tonconnect/ui-react';
-import { toNano } from '@ton/core';
+import { toNano, beginCell } from '@ton/core';
 import { TerminalWindow, TerminalOutput, RetroButton } from '../components/terminal';
 import { LocationPicker } from '../components/LocationPicker';
 import { RadiusSelector } from '../components/RadiusSelector';
 import { LiveEventFeed } from '../components/LiveEventFeed';
-import { CONTRACTS, getAssetId } from '../config/contracts';
+import { CONTRACTS, PRODUCT_TYPES, getAssetId } from '../config/contracts';
+import { useContracts } from '../hooks/useContracts';
 
 type CatastropheType = 'hurricane' | 'earthquake';
 
@@ -21,6 +22,7 @@ interface PolicyDetails {
 
 export const TradFiInsurance = () => {
   const userAddress = useTonAddress();
+  const { contracts, sender, isConfigured } = useContracts();
   const [isLoading, setIsLoading] = useState(false);
 
   // Policy configuration
@@ -89,42 +91,65 @@ export const TradFiInsurance = () => {
   const handlePurchase = async () => {
     if (!isFormValid || !userAddress) return;
 
+    if (!isConfigured || !contracts.masterFactory) {
+      alert('Contracts not configured. MasterFactory address missing.');
+      return;
+    }
+
     setIsLoading(true);
 
     try {
-      // TODO: Implement actual contract interaction
-      // For now, just show a success message
+      // Get asset ID (1=Hurricane, 2=Earthquake)
+      const assetId = selectedType === 'hurricane' ? 1 : 2;
 
-      const contractAddress =
-        selectedType === 'hurricane'
-          ? CONTRACTS.tradfi.children.hurricane
-          : CONTRACTS.tradfi.children.earthquake;
+      // Convert duration to hours
+      const durationHours = durationUnit === 'hours'
+        ? parseInt(durationValue)
+        : Math.floor(parseFloat(durationValue) * 24);
+
+      // Convert lat/lon to microdegrees (degrees * 1000000)
+      const latMicro = Math.floor((latitude || 0) * 1000000);
+      const lonMicro = Math.floor((longitude || 0) * 1000000);
+
+      // Build policy params cell for natural catastrophe insurance
+      const policyParams = beginCell()
+        .storeCoins(toNano(coverageAmount))
+        .storeUint(durationHours, 16)
+        .storeInt(latMicro, 32)
+        .storeInt(lonMicro, 32)
+        .storeUint(radiusKm, 16)
+        .endCell();
+
+      // Gas: 1.5 TON for first policy of each type (deploys sub-factory), 0.5 TON after
+      const gasAmount = toNano('1.5');
+      const premiumNano = toNano(premium.toString());
+
+      // Call MasterFactory with v3 architecture
+      await contracts.masterFactory.sendCreatePolicy(sender, {
+        value: gasAmount + premiumNano,
+        productType: PRODUCT_TYPES.TRADFI_NATCAT, // = 5
+        assetId: assetId,
+        policyParams: policyParams
+      });
 
       const durationDisplay = durationUnit === 'hours'
         ? `${durationValue} hours`
         : `${durationValue} days`;
 
-      console.log('Creating policy:', {
-        type: selectedType,
-        contract: contractAddress,
-        coverageAmount,
-        duration: durationDisplay,
-        durationDays: getDurationInDays(),
-        latitude,
-        longitude,
-        radiusKm,
-        premium: premium.toFixed(2),
-      });
-
-      // Simulate transaction
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-
-      alert(`✓ Policy Created Successfully!\n\nType: ${selectedType}\nCoverage: $${coverageAmount}\nDuration: ${durationDisplay}\nPremium: $${premium.toFixed(2)}\nLocation: ${locationAddress || `${latitude?.toFixed(4)}°, ${longitude?.toFixed(4)}°`}`);
+      alert(`✓ Policy Created Successfully!\n\nType: ${selectedType}\nCoverage: $${coverageAmount}\nDuration: ${durationDisplay}\nPremium: ${premium.toFixed(2)} TON\nLocation: ${locationAddress || `${latitude?.toFixed(4)}°, ${longitude?.toFixed(4)}°`}`);
 
       setIsLoading(false);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Policy creation failed:', error);
-      alert('❌ Policy creation failed. Please try again.');
+
+      if (error.message?.includes('User rejected')) {
+        alert('Transaction was rejected');
+      } else if (error.message?.includes('Insufficient balance')) {
+        alert('Insufficient balance for transaction');
+      } else {
+        alert(`Failed to create policy: ${error.message || 'Unknown error'}`);
+      }
+
       setIsLoading(false);
     }
   };
@@ -327,7 +352,7 @@ export const TradFiInsurance = () => {
                     <div className="flex justify-between font-mono text-lg">
                       <span className="text-green-700 font-bold">TOTAL PREMIUM:</span>
                       <span className="text-green-700 font-bold">
-                        ${premium.toFixed(2)} USD
+                        {premium.toFixed(2)} TON
                       </span>
                     </div>
                   </div>

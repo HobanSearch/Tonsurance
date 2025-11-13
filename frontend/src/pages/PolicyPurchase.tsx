@@ -4,6 +4,8 @@ import { toNano } from '@ton/core';
 import { useContracts } from '../hooks/useContracts';
 import { TerminalWindow, TerminalOutput, RetroButton, InfoPanel } from '../components/terminal';
 import { BeneficiarySelector } from '../components/BeneficiarySelector';
+import { createPolicyParams } from '../../../wrappers/v3/StablecoinChild';
+import { PRODUCT_TYPES, getAssetId } from '../config/contracts';
 
 type CoverageType = 'depeg' | 'smart_contract' | 'oracle' | 'bridge' | 'cex_liquidation';
 
@@ -12,7 +14,7 @@ interface CoverageItem {
   coverageType: CoverageType;
   blockchain: string;        // Source blockchain (or 'CEX' for CEX liquidation)
   stablecoin: string;        // Stablecoin being insured
-  payoutAsset: 'USDT';       // Always USDT
+  payoutAsset: 'TON';        // All claims paid in TON
   payoutChain: 'TON';        // Always TON
   coverageAmount: string;
   durationDays: string;
@@ -240,7 +242,7 @@ export const PolicyPurchase = () => {
           coverageType: selectedCoverageType,
           blockchain: 'CEX', // CEX positions don't have a blockchain
           stablecoin,
-          payoutAsset: 'USDT',
+          payoutAsset: 'TON',
           payoutChain: 'TON',
           coverageAmount: newItemAmount,
           durationDays: newItemDuration,
@@ -286,7 +288,7 @@ export const PolicyPurchase = () => {
           coverageType: selectedCoverageType,
           blockchain,
           stablecoin,
-          payoutAsset: 'USDT',
+          payoutAsset: 'TON',
           payoutChain: 'TON',
           coverageAmount: newItemAmount,
           durationDays: newItemDuration,
@@ -326,8 +328,8 @@ export const PolicyPurchase = () => {
       return;
     }
 
-    if (!isConfigured || !contracts.policyFactory) {
-      alert('Contracts not configured. Please deploy contracts and update .env file.');
+    if (!isConfigured || !contracts.masterFactory) {
+      alert('Contracts not configured. MasterFactory address missing.');
       return;
     }
 
@@ -344,28 +346,43 @@ export const PolicyPurchase = () => {
 
     setIsLoading(true);
     try {
-      const coverageTypeMapping: Record<string, number> = {
-        depeg: 0,
-        smart_contract: 1,
-        oracle: 2,
-        bridge: 3,
-        cex_liquidation: 4
-      };
-
-      // Purchase each coverage item
+      // Purchase each coverage item using v3 MasterFactory
       for (const item of coverageItems) {
-        const coverageAmountNano = toNano(item.coverageAmount);
-        const premium = calculatePremium(item);
-        const premiumNano = toNano(premium.toString());
-        const gasAmount = toNano('0.5');
+        // Ensure clean number strings (remove any commas, validate)
+        const cleanAmount = item.coverageAmount.replace(/,/g, '');
+        console.log('Coverage amount:', cleanAmount);
 
-        await contracts.policyFactory.sendCreatePolicy(sender, {
+        const coverageAmountNano = toNano(cleanAmount);
+        const premium = calculatePremium(item);
+        console.log('Calculated premium:', premium);
+
+        // Format premium to max 9 decimal places (TON precision)
+        const premiumFormatted = premium.toFixed(9);
+        console.log('Premium formatted:', premiumFormatted);
+
+        const premiumNano = toNano(premiumFormatted);
+        // Gas: 1.5 TON for first policy of each type (deploys sub-factory), 0.5 TON after
+        const gasAmount = toNano('1.5');
+
+        // Get asset ID from stablecoin symbol
+        const assetId = getAssetId('defi', item.stablecoin);
+        if (!assetId) {
+          console.error(`Unknown stablecoin: ${item.stablecoin}`);
+          continue;
+        }
+
+        // Create policy params cell for depeg insurance
+        const policyParams = createPolicyParams(
+          coverageAmountNano,
+          parseInt(item.durationDays)
+        );
+
+        // Call MasterFactory with v3 architecture
+        await contracts.masterFactory.sendCreatePolicy(sender, {
           value: gasAmount + premiumNano,
-          coverageType: coverageTypeMapping[item.coverageType],
-          chainId: 0, // Default to TON chain
-          stablecoinId: 0, // Default to USDT
-          coverageAmount: coverageAmountNano,
-          duration: parseInt(item.durationDays),
+          productType: PRODUCT_TYPES.DEPEG, // = 1
+          assetId: assetId,
+          policyParams: policyParams
         });
       }
 
@@ -461,16 +478,16 @@ export const PolicyPurchase = () => {
             <TerminalWindow title="💰 PAYOUT INFORMATION">
               <div className="p-3 bg-terminal-green/10 border-2 border-terminal-green">
                 <div className="text-xs space-y-1">
-                  <div className="font-bold text-terminal-green">✓ ALL CLAIMS PAID IN USDT ON TON BLOCKCHAIN</div>
+                  <div className="font-bold text-terminal-green">✓ ALL CLAIMS PAID IN TON</div>
                   <div className="text-text-secondary">
                     {selectedCoverageType === 'cex_liquidation' && (
                       <>• Your {Array.from(selectedStablecoins).join(', ')} position on {newItemCexVenue} will be covered</>
                     )}
                     {selectedCoverageType === 'depeg' && (
-                      <>• If selected stablecoins depeg, you receive USDT on TON</>
+                      <>• If selected stablecoins depeg, you receive TON</>
                     )}
                     {['smart_contract', 'oracle', 'bridge'].includes(selectedCoverageType) && (
-                      <>• If a covered event occurs, you receive USDT on TON</>
+                      <>• If a covered event occurs, you receive TON</>
                     )}
                   </div>
                   <div className="text-text-secondary">• Fast payouts: Claims processed within minutes</div>
@@ -634,7 +651,7 @@ export const PolicyPurchase = () => {
             <TerminalWindow title="STEP 3: SELECT STABLECOINS (Multi-select)">
               <div className="mb-2 text-[10px] text-text-secondary">
                 &gt; Select one or more stablecoins you want liquidation protection for
-                <br />&gt; All payouts will be in USDT on TON blockchain
+                <br />&gt; All payouts will be in TON
               </div>
               <div className="grid grid-cols-8 gap-2">
                 {STABLECOINS.map(stable => (
@@ -669,10 +686,10 @@ export const PolicyPurchase = () => {
               <div className="space-y-4">
                 <div className="p-3 bg-terminal-green/10 border-2 border-terminal-green text-xs">
                   {selectedCoverageType === 'cex_liquidation' ? (
-                    <>✓ Will create <span className="font-bold">{selectedStablecoins.size}</span> coverage item(s) for {newItemCexVenue} (Payout: USDT on TON)</>
+                    <>✓ Will create <span className="font-bold">{selectedStablecoins.size}</span> coverage item(s) for {newItemCexVenue} (Payout: TON)</>
                   ) : (
                     <>✓ Will create <span className="font-bold">{selectedBlockchains.size * selectedStablecoins.size}</span> coverage item(s)
-                    ({selectedBlockchains.size} blockchain(s) × {selectedStablecoins.size} stablecoin(s)) (Payout: USDT on TON)</>
+                    ({selectedBlockchains.size} blockchain(s) × {selectedStablecoins.size} stablecoin(s)) (Payout: TON)</>
                   )}
                 </div>
 
@@ -765,8 +782,8 @@ export const PolicyPurchase = () => {
                           <div className="text-[10px] space-y-0.5 text-text-secondary">
                             <div>• <span className="font-semibold">Coverage:</span> {item.blockchain.toUpperCase()}{item.stablecoin !== 'N/A' && ` / ${item.stablecoin}`}</div>
                             <div>• <span className="font-semibold">Amount:</span> ${parseFloat(item.coverageAmount).toLocaleString()} for {item.durationDays} days</div>
-                            <div>• <span className="font-semibold">Payout:</span> <span className="text-copper-600 font-bold">USDT on TON</span></div>
-                            <div className="text-terminal-green font-bold mt-1">Premium: ${premium.toFixed(2)}</div>
+                            <div>• <span className="font-semibold">Payout:</span> <span className="text-copper-600 font-bold">TON</span></div>
+                            <div className="text-terminal-green font-bold mt-1">Premium: {premium.toFixed(2)} TON</div>
                           </div>
                         </div>
                         <button
